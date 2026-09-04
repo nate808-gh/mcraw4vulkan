@@ -1,0 +1,26 @@
+[package]
+name = "mcraw4vulkan-display-sound"
+description = "Synchronized display audio for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+mcraw4vulkan-audio = { path = "../mcraw4vulkan-audio" }
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false, features = ["use_mac_framework"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false }

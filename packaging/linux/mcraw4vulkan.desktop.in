@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=mcraw4vulkan
+Comment=Display and process MotionCam .mcraw files
+TryExec=@MC4V_LIBEXECDIR@/mcraw4vulkan-preflight-check
+Exec=@MC4V_LIBEXECDIR@/mcraw4vulkan-preflight-check --gui @MC4V_LIBEXECDIR@/mcraw4vulkan-gui
+Icon=mcraw4vulkan
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=MotionCam;MCRAW;RAW;DNG;Vulkan;
+StartupNotify=true

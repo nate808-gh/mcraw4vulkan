@@ -1,0 +1,23 @@
+[package]
+name = "mcraw4vulkan-render"
+description = "Color conversion and packed-to-planar rendering for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
+thiserror.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

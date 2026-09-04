@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "crates/mcraw4vulkan",
+    "crates/mcraw4vulkan-audio",
+    "crates/mcraw4vulkan-audiowriter",
+    "crates/mcraw4vulkan-core",
+    "crates/mcraw4vulkan-cpu",
+    "crates/mcraw4vulkan-display",
+    "crates/mcraw4vulkan-display-sound",
+    "crates/mcraw4vulkan-dngwriter",
+    "crates/mcraw4vulkan-fuse",
+    "crates/mcraw4vulkan-gpu",
+    "crates/mcraw4vulkan-gui",
+    "crates/mcraw4vulkan-mcrawcontainer",
+    "crates/mcraw4vulkan-optimizer",
+    "crates/mcraw4vulkan-preflight",
+    "crates/mcraw4vulkan-projfs-ffi",
+    "crates/mcraw4vulkan-rawcodec",
+    "crates/mcraw4vulkan-render",
+    "crates/mcraw4vulkan-sdl2-wgpu-surface",
+    "crates/mcraw4vulkan-vignette",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+homepage = "https://github.com/nate808-gh/mcraw4vulkan"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/nate808-gh/mcraw4vulkan"
+rust-version = "1.87"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+camino = "1.1"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+blake3 = "1.5"
+wgpu = { version = "=24.0.5", default-features = false, features = ["vulkan-portability", "wgsl"] }
+pollster = "0.4.0"

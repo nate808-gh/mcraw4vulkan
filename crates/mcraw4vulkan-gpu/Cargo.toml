@@ -1,0 +1,19 @@
+[package]
+name = "mcraw4vulkan-gpu"
+description = "wgpu raw-frame decoding for mcraw4vulkan."
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-rawcodec = { path = "../mcraw4vulkan-rawcodec" }
+mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
+pollster.workspace = true
+wgpu.workspace = true

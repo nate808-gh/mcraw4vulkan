@@ -1,0 +1,34 @@
+[package]
+name = "mcraw4vulkan-gui"
+description = "SDL2, egui, and wgpu graphical interface for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+egui = "=0.31.1"
+egui-wgpu = { version = "=0.31.1", default-features = false }
+mcraw4vulkan = { path = "../mcraw4vulkan" }
+mcraw4vulkan-display-sound = { path = "../mcraw4vulkan-display-sound" }
+mcraw4vulkan-preflight = { path = "../mcraw4vulkan-preflight" }
+mcraw4vulkan-sdl2-wgpu-surface = { path = "../mcraw4vulkan-sdl2-wgpu-surface" }
+png = "0.18.1"
+serde_json.workspace = true
+wgpu = { version = "=24.0.5", default-features = false, features = ["vulkan-portability"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false, features = ["use_mac_framework"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

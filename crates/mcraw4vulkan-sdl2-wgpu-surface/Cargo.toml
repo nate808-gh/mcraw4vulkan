@@ -1,0 +1,22 @@
+[package]
+name = "mcraw4vulkan-sdl2-wgpu-surface"
+description = "SDL2 window and wgpu surface integration for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+pollster.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false, features = ["raw-window-handle", "use_mac_framework"] }
+wgpu = { version = "=24.0.5", default-features = false, features = ["metal", "vulkan-portability"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sdl2 = { version = "=0.38.0", default-features = false, features = ["raw-window-handle"] }
+wgpu = { version = "=24.0.5", default-features = false, features = ["vulkan-portability"] }

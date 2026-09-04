@@ -1,0 +1,46 @@
+[package]
+name = "mcraw4vulkan"
+description = "Tools for displaying and processing MotionCam .mcraw files."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+autobins = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mcraw4vulkan"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mcraw4vulkan-audio = { path = "../mcraw4vulkan-audio" }
+mcraw4vulkan-audiowriter = { path = "../mcraw4vulkan-audiowriter" }
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-cpu = { path = "../mcraw4vulkan-cpu" }
+mcraw4vulkan-dngwriter = { path = "../mcraw4vulkan-dngwriter" }
+mcraw4vulkan-display = { path = "../mcraw4vulkan-display" }
+mcraw4vulkan-display-sound = { path = "../mcraw4vulkan-display-sound" }
+mcraw4vulkan-fuse = { path = "../mcraw4vulkan-fuse" }
+mcraw4vulkan-gpu = { path = "../mcraw4vulkan-gpu" }
+mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
+mcraw4vulkan-optimizer = { path = "../mcraw4vulkan-optimizer" }
+mcraw4vulkan-preflight = { path = "../mcraw4vulkan-preflight" }
+mcraw4vulkan-rawcodec = { path = "../mcraw4vulkan-rawcodec" }
+mcraw4vulkan-render = { path = "../mcraw4vulkan-render" }
+mcraw4vulkan-sdl2-wgpu-surface = { path = "../mcraw4vulkan-sdl2-wgpu-surface" }
+mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
+blake3.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+sdl2 = { version = "=0.38.0", default-features = false }
+

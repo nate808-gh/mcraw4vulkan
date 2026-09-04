@@ -1,0 +1,18 @@
+[package]
+name = "mcraw4vulkan-optimizer"
+description = "Payload-profile measurement and selection for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
+serde_json.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "mcraw4vulkan-core"
+description = "Shared domain types and contracts for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+camino.workspace = true
+xxhash-rust.workspace = true

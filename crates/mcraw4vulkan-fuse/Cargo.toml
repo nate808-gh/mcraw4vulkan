@@ -1,0 +1,38 @@
+[package]
+name = "mcraw4vulkan-fuse"
+description = "Cross-platform virtual DNG filesystem adapters for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+jiff = { version = "0.2", default-features = true }
+
+mcraw4vulkan-audiowriter = { path = "../mcraw4vulkan-audiowriter" }
+mcraw4vulkan-audio = { path = "../mcraw4vulkan-audio" }
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-cpu = { path = "../mcraw4vulkan-cpu" }
+mcraw4vulkan-dngwriter = { path = "../mcraw4vulkan-dngwriter" }
+mcraw4vulkan-gpu = { path = "../mcraw4vulkan-gpu" }
+mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
+mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+fuser = "0.17"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mcraw4vulkan-projfs-ffi = { path = "../mcraw4vulkan-projfs-ffi" }
