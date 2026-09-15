@@ -1,0 +1,18 @@
+[package]
+name = "mcraw4vulkan-macfuse-ffi"
+description = "Safe macFUSE session boundary for mcraw4vulkan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", default-features = false, features = ["macos-no-mount", "macfuse-4-compat"] }
+libc = "0.2"

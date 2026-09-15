@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440" role="img" aria-labelledby="diagram-title diagram-description">
+  <title id="diagram-title">mcraw4vulkan — from RAW recording to output</title>
+  <desc id="diagram-description">A left-to-right diagram of the main production image and audio pathways. The .mcraw file has separate metadata, image payload, and audio payload rectangles. The CPU reads camera and frame settings, reads frame data, and prepares decoding. The GPU decodes raw sensor pixels, then the selected workflow follows one of three branches. Display optionally corrects lens shading, rebuilds color, and presents the image on the GPU. DNG optionally corrects lens shading while retaining the raw sensor mosaic, transfers the pixels to the CPU, and packages raw pixels with camera metadata as virtual DNG frames on demand. PIPE prepares linear raw values, optionally corrects lens shading, reconstructs color, converts and packs 12-bit scene-linear YUV on the GPU, then transfers frames to the CPU for writing to a stream or file. Blue outlines and arrows represent CPU image work; green represents GPU work. Dashed blue arrows carry image settings and metadata. Gray outlines and arrows represent CPU audio work. When audio is present, the CPU reads recorded samples and track details. Display aligns the sound to video timing and plays it when sound is enabled. DNG and PIPE package the original recorded samples as WAV: a virtual audio file beside the DNG images or a separate audio file beside PIPE video. Audio is not embedded in DNG images or in the raw video stream. Solid arrows carry image or audio data, with arrow color following the stage supplying it. Each output is a separate workflow, not a simultaneous fan-out. CPU image decoding and small supporting operations are omitted.</desc>
+
+  <!--
+    Source-checked against the current production code, 2026-09-04.
+    Conceptual call graph: boxes group operations, not individual functions.
+    Independent workflows share the decode concept, not one running decoder.
+
+    Metadata and payload:
+      crates/mcraw4vulkan-mcrawcontainer/src/container.rs — open_inner
+      crates/mcraw4vulkan-mcrawcontainer/src/payload_reader.rs — PayloadFeeder
+      crates/mcraw4vulkan-gpu/src/work_plan.rs — build_vulkan_work_plan_into
+    Display:
+      crates/mcraw4vulkan/src/display_window.rs — frame_facts, preview_config,
+        render_gpu_frame, render_gpu_frame_with_vignette, present_preview_to
+      crates/mcraw4vulkan-render/src/shaders/display_rgb.wgsl
+      crates/mcraw4vulkan-display/src/lib.rs — DisplayTexturePresenter
+    DNG:
+      crates/mcraw4vulkan-fuse/src/virtual_fs/dng_generator.rs —
+        generate_frame_gpu_canonical_dng, generate_frames_gpu_canonical_dng_in_flight
+      crates/mcraw4vulkan-fuse/src/virtual_fs/dng_cache.rs
+      crates/mcraw4vulkan-dngwriter/src/writer.rs
+    PIPE:
+      crates/mcraw4vulkan/src/pipe_cli.rs — preflight_pipe_frames,
+        resolve_pipe_frame_context, stream_pipe_frames
+      crates/mcraw4vulkan/src/direct_yuv12_pipeline.rs —
+        submit_frame_inner_with_scratch, complete_slot, DirectYuv12WriteSink
+      crates/mcraw4vulkan-vignette/src/shaders/pipe_correct_bayer_f32.wgsl
+      crates/mcraw4vulkan-render/src/shaders/signed_bayer_demosaic.wgsl
+      crates/mcraw4vulkan-render/src/shaders/direct_yuv12_terminal.wgsl
+    Audio:
+      crates/mcraw4vulkan-audio/src/lib.rs — RawAudioRangeDecoder,
+        read_timeline_aligned_audio
+      crates/mcraw4vulkan-display-sound/src/lib.rs — DisplaySoundPlan,
+        DisplaySoundSession
+      crates/mcraw4vulkan-fuse/src/virtual_fs/lazy_audio_wav.rs — LazyAudioWav
+      crates/mcraw4vulkan-fuse/src/virtual_fs/virtual_metadata.rs — read_audio_range
+      crates/mcraw4vulkan/src/pipe_cli.rs — prepare_pipe_audio,
+        write_audio_sidecar_part
+
+    Accuracy notes for future edits:
+      DNG correction is distinct from PIPE's signed floating-point RAW path.
+      DNG retains the Bayer mosaic; white balance and color stay in metadata.
+      Display correction also uses GPU histogram statistics and a small CPU
+      brightness calculation; those supporting operations are omitted here.
+      PIPE's CPU-resolved color transform includes recorded white balance.
+      GPU PIPE packs yuv444p12le: BT.2020, linear, TV range, fixed 1/2 signal
+      scale. There is no display exposure, OETF, or tone mapping on this branch.
+      CPU decoding is a manual selection, not an automatic GPU failure fallback.
+      Defaults: Display lens correction off; DNG and PIPE correction on.
+      Audio is CPU work, drawn gray to distinguish it from the image pathway.
+      Supported audio is already PCM; reading it is not decompression.
+      Playback trims or pads audio to the video timeline. WAV exports preserve
+      the raw recorded sample span and use track / source frame-rate metadata.
+      DNG serves WAV on demand; PIPE writes a separate WAV beside the video.
+      Audio source and timing metadata preparation are grouped in Read sound.
+
+    Presentation: native 16:9, editable text, no external assets or fonts.
+    Semantic group IDs support selection and animation in a video workflow.
+  -->
+
+  <defs>
+    <style>
+      text { font-family: "DejaVu Sans", "Arial", sans-serif; }
+      .title { fill: #17212f; font-size: 48px; font-weight: 700; letter-spacing: -1.2px; }
+      .subtitle { fill: #526176; font-size: 27px; }
+      .column { fill: #526176; font-size: 21px; font-weight: 700; letter-spacing: 2.5px; }
+      .heading { fill: #17212f; font-size: 30px; font-weight: 700; }
+      .body { fill: #344256; font-size: 23px; }
+      .small { fill: #526176; font-size: 21px; }
+      .cpu-text { fill: #2167ae; }
+      .gpu-text { fill: #187649; }
+      .audio-text { fill: #59616b; }
+      .tag { font-size: 17px; font-weight: 700; letter-spacing: 1.5px; }
+      .cpu-box { fill: #f3f8ff; stroke: #2167ae; stroke-width: 3; }
+      .gpu-box { fill: #f2faf5; stroke: #187649; stroke-width: 3; }
+      .audio-box { fill: #f5f5f5; stroke: #69717b; stroke-width: 3; }
+      .audio-line { fill: none; stroke: #69717b; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; }
+      .audio-heading { fill: #29313b; font-size: 21px; font-weight: 700; }
+      .audio-body { fill: #4b535d; font-size: 19px; }
+      .cpu-line { fill: none; stroke: #2167ae; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+      .gpu-line { fill: none; stroke: #187649; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+      .settings-line { fill: none; stroke: #2167ae; stroke-width: 3; stroke-dasharray: 9 9; stroke-linecap: round; stroke-linejoin: round; }
+      .crossing-clearance { fill: none; stroke: #ffffff; stroke-width: 15; }
+    </style>
+    <marker id="cpu-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="11" markerHeight="11" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#2167ae"/>
+    </marker>
+    <marker id="gpu-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="11" markerHeight="11" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#187649"/>
+    </marker>
+    <marker id="audio-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="11" markerHeight="11" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M 1 1 L 11 6 L 1 11 Z" fill="#69717b"/>
+    </marker>
+  </defs>
+
+  <rect id="background" width="2560" height="1440" fill="#ffffff"/>
+
+  <g id="header">
+    <text x="75" y="94" class="title">mcraw4vulkan</text>
+    <text x="75" y="146" class="subtitle">From a RAW recording to playback, RAW frames, or an editing stream</text>
+    <g id="legend" transform="translate(1805 60)">
+      <rect x="0" y="0" width="30" height="24" rx="5" class="cpu-box"/>
+      <path d="M 43 12 H 88" class="cpu-line" marker-end="url(#cpu-arrow)"/>
+      <text x="103" y="20" class="body cpu-text">CPU</text>
+      <rect x="240" y="0" width="30" height="24" rx="5" class="gpu-box"/>
+      <path d="M 283 12 H 328" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+      <text x="343" y="20" class="body gpu-text">GPU</text>
+      <rect x="470" y="0" width="30" height="24" rx="5" class="audio-box"/>
+      <path d="M 513 12 H 558" class="audio-line" marker-end="url(#audio-arrow)"/>
+      <text x="573" y="20" class="body audio-text">Audio</text>
+      <path d="M 0 66 H 85" class="settings-line" marker-end="url(#cpu-arrow)"/>
+      <text x="103" y="74" class="small">Settings &amp; metadata</text>
+    </g>
+    <path d="M 75 195 H 2485" stroke="#d7dfe8" stroke-width="2"/>
+    <text x="75" y="247" class="column">THE RECORDING</text>
+    <text x="460" y="247" class="column">READ &amp; PREPARE</text>
+    <text x="855" y="247" class="column">DECODE</text>
+    <text x="1310" y="247" class="column">PROCESS FOR THE SELECTED OUTPUT</text>
+    <text x="2230" y="247" class="column">OUTPUT</text>
+  </g>
+
+  <!-- CPU metadata travels separately from image pixels. -->
+  <g id="metadata-connections">
+    <path d="M 355 650 H 393 Q 410 650 410 633 V 477 Q 410 460 427 460 H 460" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <path d="M 770 460 H 798 Q 815 460 815 443 V 327 Q 815 310 832 310 H 1243 Q 1260 310 1260 327 V 1075" class="settings-line"/>
+    <text x="858" y="293" class="small cpu-text">Camera, frame &amp; lens settings</text>
+    <path d="M 1260 395 H 1310" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <path d="M 1260 735 H 1310" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <path d="M 1260 1075 H 1310" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <!-- Frame size and payload layout also guide CPU decode preparation. -->
+    <path d="M 615 555 V 705" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <text x="638" y="619" class="small cpu-text">Frame size</text>
+    <text x="638" y="650" class="small cpu-text">&amp; layout</text>
+    <!-- DNG packaging receives source metadata independently of raw pixels. -->
+    <path d="M 1260 650 H 1908 Q 1925 650 1925 667 V 700" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <rect x="1658" y="629" width="218" height="39" rx="8" fill="#ffffff"/>
+    <text x="1670" y="656" class="small cpu-text">Camera metadata</text>
+    <!-- PIPE's color transform is prepared on the CPU and applied on the GPU. -->
+    <path d="M 1260 990 H 1908 Q 1925 990 1925 1007 V 1040" class="settings-line" marker-end="url(#cpu-arrow)"/>
+    <rect x="1682" y="969" width="189" height="39" rx="8" fill="#ffffff"/>
+    <text x="1694" y="996" class="small cpu-text">Color settings</text>
+  </g>
+
+  <!-- Audio bypasses image decoding. Playback sync and WAV export are separate. -->
+  <g id="audio-connections">
+    <path d="M 355 1120 H 393 Q 410 1120 410 1137 V 1163 Q 410 1180 427 1180 H 460" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <path d="M 770 1180 H 810 M 810 1065 V 1255" class="audio-line"/>
+    <circle cx="810" cy="1180" r="6" fill="#69717b"/>
+    <path d="M 810 1065 H 855" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <path d="M 810 1255 H 855" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <path d="M 1155 1065 H 1168 Q 1185 1065 1185 1082 V 1330 Q 1185 1347 1202 1347 H 2178 Q 2195 1347 2195 1330 V 640 Q 2195 623 2212 623 H 2230" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <path d="M 1155 1255 H 1157 Q 1165 1255 1165 1263 V 1348 Q 1165 1365 1182 1365 H 2203 Q 2220 1365 2220 1348 V 975 Q 2220 963 2230 963" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <path d="M 2220 1303 H 2230" class="audio-line" marker-end="url(#audio-arrow)"/>
+    <circle cx="2220" cy="1303" r="5" fill="#69717b"/>
+  </g>
+
+  <g id="image-connections">
+    <path d="M 355 867 H 393 Q 410 867 410 850 V 817 Q 410 800 427 800 H 460" class="cpu-line" marker-end="url(#cpu-arrow)"/>
+    <path d="M 770 800 H 855" class="cpu-line" marker-end="url(#cpu-arrow)"/>
+    <text x="779" y="776" class="small cpu-text">Upload</text>
+    <!-- Green image arrows pass over the blue metadata line without joining. -->
+    <path d="M 1165 800 H 1310 M 1205 460 H 1310 M 1205 1140 H 1310" class="crossing-clearance"/>
+    <path d="M 2183 800 H 2230 M 2183 1140 H 2230" class="crossing-clearance"/>
+    <path d="M 1205 460 V 1140" class="gpu-line"/>
+    <path d="M 1165 800 H 1310" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <path d="M 1205 460 H 1310" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <path d="M 1205 1140 H 1310" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <circle cx="1205" cy="800" r="7" fill="#187649"/>
+    <path d="M 1640 460 H 1760" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <path d="M 2090 460 H 2230" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <path d="M 1640 800 H 1760" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <text x="1700" y="752" text-anchor="middle" class="small gpu-text">Read back</text>
+    <text x="1700" y="778" text-anchor="middle" class="small gpu-text">to CPU</text>
+    <path d="M 2090 800 H 2230" class="cpu-line" marker-end="url(#cpu-arrow)"/>
+    <path d="M 1640 1140 H 1760" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <path d="M 2090 1140 H 2230" class="gpu-line" marker-end="url(#gpu-arrow)"/>
+    <text x="2140" y="1092" text-anchor="middle" class="small gpu-text">Copy</text>
+    <text x="2140" y="1118" text-anchor="middle" class="small gpu-text">to CPU</text>
+  </g>
+
+  <g id="mcraw-file">
+    <rect x="75" y="480" width="310" height="770" rx="24" fill="#f4f6f8" stroke="#78879a" stroke-width="3"/>
+    <path d="M 328 480 V 522 H 385" fill="none" stroke="#78879a" stroke-width="3"/>
+    <text x="103" y="536" class="heading">.mcraw</text>
+    <g id="mcraw-metadata">
+      <rect x="100" y="575" width="255" height="150" rx="12" fill="#ffffff" stroke="#78879a" stroke-width="2"/>
+      <text x="123" y="618" class="heading" style="font-size:28px">Metadata</text>
+      <text x="123" y="660" class="body">Camera settings</text>
+      <text x="123" y="693" class="body">&amp; frame details</text>
+    </g>
+    <path d="M 355 650 H 385" class="settings-line"/>
+    <g id="mcraw-payload">
+      <rect x="100" y="790" width="255" height="155" rx="12" fill="#ffffff" stroke="#78879a" stroke-width="2"/>
+      <text x="123" y="834" class="heading" style="font-size:28px">Payload</text>
+      <text x="123" y="877" class="body">Encoded RAW</text>
+      <text x="123" y="910" class="body">image data</text>
+    </g>
+    <path d="M 355 867 H 385" class="cpu-line"/>
+    <g id="mcraw-audio-payload">
+      <rect x="100" y="1045" width="255" height="155" rx="12" class="audio-box"/>
+      <text x="123" y="1089" class="heading" style="font-size:26px">Audio payload</text>
+      <text x="123" y="1132" class="body">Recorded sound</text>
+      <text x="123" y="1165" class="body">When present</text>
+    </g>
+    <path d="M 355 1120 H 385" class="audio-line"/>
+  </g>
+
+  <g id="cpu-read-metadata">
+    <rect x="460" y="365" width="310" height="190" rx="19" class="cpu-box"/>
+    <text x="486" y="398" class="tag cpu-text">CPU</text>
+    <text x="486" y="443" class="heading">Read settings</text>
+    <text x="486" y="487" class="body">Interpret camera data</text>
+    <text x="486" y="521" class="body">&amp; frame settings</text>
+  </g>
+  <g id="cpu-prepare-payload">
+    <rect x="460" y="705" width="310" height="190" rx="19" class="cpu-box"/>
+    <text x="486" y="738" class="tag cpu-text">CPU</text>
+    <text x="486" y="783" class="heading">Prepare frames</text>
+    <text x="486" y="827" class="body">Read image data</text>
+    <text x="486" y="861" class="body">&amp; plan the decoding</text>
+  </g>
+  <g id="gpu-decode">
+    <rect x="855" y="705" width="310" height="190" rx="19" class="gpu-box"/>
+    <text x="881" y="738" class="tag gpu-text">GPU</text>
+    <text x="881" y="783" class="heading">Decode RAW</text>
+    <text x="881" y="827" class="body">Unpack the recorded</text>
+    <text x="881" y="861" class="body">sensor pixels</text>
+    <text x="1010" y="938" text-anchor="middle" class="small">Still RAW sensor data</text>
+  </g>
+
+  <g id="display-path">
+    <g id="gpu-display-raw-preparation">
+      <rect x="1310" y="360" width="330" height="200" rx="19" class="gpu-box"/>
+      <text x="1336" y="393" class="tag gpu-text">GPU</text>
+      <text x="1336" y="438" class="heading">Develop image</text>
+      <text x="1336" y="482" class="body">Optional lens correction</text>
+      <text x="1336" y="516" class="body">Rebuild full color</text>
+    </g>
+    <g id="gpu-display-color">
+      <rect x="1760" y="360" width="330" height="200" rx="19" class="gpu-box"/>
+      <text x="1786" y="393" class="tag gpu-text">GPU</text>
+      <text x="1786" y="438" class="heading">Set screen color</text>
+      <text x="1786" y="482" class="body">White balance</text>
+      <text x="1786" y="516" class="body">&amp; screen color</text>
+    </g>
+    <g id="display-sink">
+      <rect x="2230" y="360" width="255" height="200" rx="19" class="gpu-box"/>
+      <text x="2256" y="393" class="tag gpu-text">GPU</text>
+      <text x="2256" y="445" class="heading" style="font-size:37px">Display</text>
+      <text x="2256" y="491" class="body">Fit &amp; present</text>
+      <text x="2256" y="525" class="body">Live playback</text>
+    </g>
+    <text x="1310" y="606" class="small">Image pixels stay on the GPU through playback.</text>
+  </g>
+
+  <g id="dng-path">
+    <g id="gpu-dng-raw-preparation">
+      <rect x="1310" y="700" width="330" height="200" rx="19" class="gpu-box"/>
+      <text x="1336" y="733" class="tag gpu-text">GPU</text>
+      <text x="1336" y="778" class="heading">Prepare RAW</text>
+      <text x="1336" y="822" class="body">Optional lens correction</text>
+      <text x="1336" y="856" class="body">Keep RAW sensor data</text>
+    </g>
+    <g id="cpu-package-dng">
+      <rect x="1760" y="700" width="330" height="200" rx="19" class="cpu-box"/>
+      <text x="1786" y="733" class="tag cpu-text">CPU</text>
+      <text x="1786" y="778" class="heading">Build each DNG</text>
+      <text x="1786" y="822" class="body">Package RAW pixels</text>
+      <text x="1786" y="856" class="body">with camera metadata</text>
+    </g>
+    <g id="dng-sink">
+      <rect x="2230" y="700" width="255" height="200" rx="19" class="cpu-box"/>
+      <text x="2256" y="733" class="tag cpu-text">CPU</text>
+      <text x="2256" y="785" class="heading" style="font-size:37px">DNG</text>
+      <text x="2256" y="831" class="body">Virtual RAW files</text>
+      <text x="2256" y="865" class="body">On demand</text>
+    </g>
+    <text x="1310" y="946" class="small">RAW sensor data stays available for development in your editor.</text>
+  </g>
+
+  <g id="pipe-path">
+    <g id="gpu-pipe-linear-preparation">
+      <rect x="1310" y="1040" width="330" height="200" rx="19" class="gpu-box"/>
+      <text x="1336" y="1073" class="tag gpu-text">GPU</text>
+      <text x="1336" y="1118" class="heading">Set RAW levels</text>
+      <text x="1336" y="1162" class="body">Subtract black level</text>
+      <text x="1336" y="1196" class="body">Optional lens correction</text>
+    </g>
+    <g id="gpu-pipe-color-and-pack">
+      <rect x="1760" y="1040" width="330" height="200" rx="19" class="gpu-box"/>
+      <text x="1786" y="1073" class="tag gpu-text">GPU</text>
+      <text x="1786" y="1118" class="heading">Build video</text>
+      <text x="1786" y="1162" class="body">Rebuild &amp; balance color</text>
+      <text x="1786" y="1196" class="body">Pack 12-bit YUV video</text>
+    </g>
+    <g id="pipe-sink">
+      <rect x="2230" y="1040" width="255" height="200" rx="19" class="cpu-box"/>
+      <text x="2256" y="1073" class="tag cpu-text">CPU</text>
+      <text x="2256" y="1125" class="heading" style="font-size:37px">PIPE</text>
+      <text x="2256" y="1171" class="body">Write video</text>
+      <text x="2256" y="1205" class="body">Stream or file</text>
+    </g>
+    <text x="1310" y="1286" class="small">Scene-linear video for grading; add exposure and a viewing transform.</text>
+  </g>
+
+  <g id="audio-path">
+    <g id="cpu-read-audio">
+      <rect x="460" y="1090" width="310" height="180" rx="19" class="audio-box"/>
+      <text x="486" y="1123" class="tag audio-text">AUDIO · CPU</text>
+      <text x="486" y="1168" class="heading">Read sound</text>
+      <text x="486" y="1212" class="body">Read audio samples</text>
+      <text x="486" y="1246" class="body">Use track details</text>
+    </g>
+    <g id="cpu-align-playback-audio">
+      <rect x="855" y="990" width="300" height="150" rx="19" class="audio-box"/>
+      <text x="881" y="1023" class="tag audio-text">AUDIO · CPU</text>
+      <text x="881" y="1068" class="heading">Sync playback</text>
+      <text x="881" y="1112" class="body">Match video timing</text>
+    </g>
+    <g id="cpu-package-wav">
+      <rect x="855" y="1180" width="300" height="150" rx="19" class="audio-box"/>
+      <text x="881" y="1213" class="tag audio-text">AUDIO · CPU</text>
+      <text x="881" y="1258" class="heading">Create WAV</text>
+      <text x="881" y="1302" class="body">Keep recorded sound</text>
+    </g>
+    <g id="display-audio-sink">
+      <rect x="2230" y="585" width="255" height="76" rx="13" class="audio-box"/>
+      <text x="2248" y="615" class="audio-heading">Play synced sound</text>
+      <text x="2248" y="644" class="audio-body">When enabled</text>
+    </g>
+    <g id="dng-audio-sink">
+      <rect x="2230" y="925" width="255" height="76" rx="13" class="audio-box"/>
+      <text x="2248" y="955" class="audio-heading">Virtual WAV</text>
+      <text x="2248" y="984" class="audio-body">Beside the RAW files</text>
+    </g>
+    <g id="pipe-audio-sink">
+      <rect x="2230" y="1265" width="255" height="76" rx="13" class="audio-box"/>
+      <text x="2248" y="1295" class="audio-heading">WAV audio file</text>
+      <text x="2248" y="1324" class="audio-body">Beside the video</text>
+    </g>
+  </g>
+
+  <g id="footer">
+    <path d="M 75 1388 H 2485" stroke="#d7dfe8" stroke-width="2"/>
+    <text x="75" y="1420" class="small">Main production path · Each workflow follows its own branch · CPU decoding omitted</text>
+    <text x="2485" y="1420" text-anchor="end" class="small">Lens correction defaults: Display off · DNG / PIPE on</text>
+  </g>
+</svg>

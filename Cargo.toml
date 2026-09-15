@@ -11,6 +11,7 @@ members = [
     "crates/mcraw4vulkan-fuse",
     "crates/mcraw4vulkan-gpu",
     "crates/mcraw4vulkan-gui",
+    "crates/mcraw4vulkan-macfuse-ffi",
     "crates/mcraw4vulkan-mcrawcontainer",
     "crates/mcraw4vulkan-optimizer",
     "crates/mcraw4vulkan-preflight",
@@ -23,13 +24,16 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 homepage = "https://github.com/nate808-gh/mcraw4vulkan"
 license = "GPL-3.0-or-later"
 readme = "README.md"
 repository = "https://github.com/nate808-gh/mcraw4vulkan"
 rust-version = "1.87"
+
+[workspace.metadata.mcraw4vulkan]
+release_channel = "beta"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

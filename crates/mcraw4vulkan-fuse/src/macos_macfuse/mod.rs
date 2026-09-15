@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use mcraw4vulkan_dngwriter::DngSinkVignetteMode;
+use mcraw4vulkan_macfuse_ffi::{MacFuseSession, UnmountOutcome};
 
 #[path = "../linux_fuse3/fuser_fs.rs"]
 mod fuser_fs;
@@ -158,8 +159,9 @@ pub struct SharedRootMountedClip {
     pub already_mounted: bool,
 }
 
-// Each returned handle owns the background macFUSE session and its VFS
-// allocation. Consuming unmount joins callbacks before those resources drop.
+// Each returned handle owns the composite macFUSE/fuser session and its VFS
+// allocation. A refused borrowed unmount keeps both available for retry;
+// successful teardown joins callbacks before releasing native state.
 pub struct MountManager;
 
 impl MountManager {
@@ -192,10 +194,10 @@ impl MountManager {
             fuser_fs::LinuxSingleClipRootFuse3FileSystem::new_single_clip_root_with_owner(
                 root_view, attr_owner,
             );
-        let session = fuser::spawn_mount2(
+        let session = spawn_macos_fuser_session(
             filesystem,
             &request.mount_point,
-            &macos_fuser_config(&request.mount_name, attr_owner),
+            macos_fuser_config(&request.mount_name),
         )
         .with_context(|| {
             format!(
@@ -256,10 +258,10 @@ impl MountManager {
             fs.clone(),
             attr_owner,
         );
-        let session = fuser::spawn_mount2(
+        let session = spawn_macos_fuser_session(
             filesystem,
             &request.mount_point,
-            &macos_fuser_config(&request.mount_name, attr_owner),
+            macos_fuser_config(&request.mount_name),
         )
         .with_context(|| {
             format!(
@@ -278,6 +280,38 @@ impl MountManager {
     }
 }
 
+fn spawn_macos_fuser_session<FS>(
+    filesystem: FS,
+    mount_point: &Path,
+    config: fuser::Config,
+) -> Result<MacFuseSession>
+where
+    FS: fuser::Filesystem + Send + 'static,
+{
+    let native_options = macos_native_mount_options(&config);
+    MacFuseSession::mount(filesystem, mount_point, &native_options, config).with_context(|| {
+        format!(
+            "safe macFUSE wrapper failed to mount {}",
+            mount_point.display()
+        )
+    })
+}
+
+fn platform_status_from_mount_observation<E>(observation: Result<bool, E>) -> PlatformMountStatus {
+    match observation {
+        Ok(true) => PlatformMountStatus::Mounted,
+        Ok(false) => PlatformMountStatus::Unmounted,
+        Err(_) => PlatformMountStatus::Failed,
+    }
+}
+
+fn platform_unmount_outcome(outcome: UnmountOutcome) -> PlatformUnmountOutcome {
+    match outcome {
+        UnmountOutcome::Unmounted => PlatformUnmountOutcome::Unmounted,
+        UnmountOutcome::AlreadyUnmounted => PlatformUnmountOutcome::NotMounted,
+    }
+}
+
 impl Default for MountManager {
     fn default() -> Self {
         Self::new()
@@ -288,7 +322,7 @@ pub struct MountHandle {
     pub mount_name: String,
     pub mount_point: PathBuf,
     fs: Arc<VirtualFileSystem>,
-    session: fuser::BackgroundSession,
+    session: MacFuseSession,
 }
 
 impl MountHandle {
@@ -313,12 +347,14 @@ impl MountHandle {
     }
 
     pub fn status(&self) -> PlatformMountStatus {
-        PlatformMountStatus::Mounted
+        platform_status_from_mount_observation(self.session.is_mounted())
     }
 
-    pub fn request_unmount(self) -> Result<PlatformUnmountOutcome> {
-        self.unmount()?;
-        Ok(PlatformUnmountOutcome::Unmounted)
+    pub fn request_unmount(&mut self) -> Result<PlatformUnmountOutcome> {
+        self.session
+            .try_unmount()
+            .map(platform_unmount_outcome)
+            .with_context(|| format!("failed to unmount {}", self.mount_point.display()))
     }
 
     pub fn wait_until_unmounted_status(self) -> Result<PlatformMountStatus> {
@@ -326,14 +362,12 @@ impl MountHandle {
         Ok(PlatformMountStatus::Unmounted)
     }
 
-    pub fn unmount(self) -> Result<()> {
-        self.session
-            .umount_and_join()
-            .with_context(|| format!("failed to unmount {}", self.mount_point.display()))
+    pub fn unmount(&mut self) -> Result<()> {
+        self.request_unmount().map(|_| ())
     }
 
     pub fn wait_until_unmounted(self) -> Result<()> {
-        self.session.join().with_context(|| {
+        self.session.wait_until_unmounted().with_context(|| {
             format!(
                 "mount session ended with an error for {}",
                 self.mount_point.display()
@@ -351,7 +385,7 @@ impl PlatformMountHandle for MountHandle {
         &self.mount_point
     }
 
-    fn request_unmount(self) -> Result<PlatformUnmountOutcome> {
+    fn request_unmount(&mut self) -> Result<PlatformUnmountOutcome> {
         MountHandle::request_unmount(self)
     }
 
@@ -360,7 +394,7 @@ impl PlatformMountHandle for MountHandle {
     }
 
     fn status(&self) -> PlatformMountStatus {
-        PlatformMountStatus::Mounted
+        MountHandle::status(self)
     }
 
     fn stats_snapshot(&self) -> Result<Option<VirtualFileSystemStatsSnapshot>> {
@@ -377,7 +411,7 @@ pub struct SharedRootMountHandle {
     pub mount_point: PathBuf,
     mounted_clips: Vec<SharedRootMountedClip>,
     fs: Arc<SharedRootVirtualFileSystem>,
-    session: fuser::BackgroundSession,
+    session: MacFuseSession,
 }
 
 impl SharedRootMountHandle {
@@ -402,12 +436,14 @@ impl SharedRootMountHandle {
     }
 
     pub fn status(&self) -> PlatformMountStatus {
-        PlatformMountStatus::Mounted
+        platform_status_from_mount_observation(self.session.is_mounted())
     }
 
-    pub fn request_unmount(self) -> Result<PlatformUnmountOutcome> {
-        self.unmount()?;
-        Ok(PlatformUnmountOutcome::Unmounted)
+    pub fn request_unmount(&mut self) -> Result<PlatformUnmountOutcome> {
+        self.session
+            .try_unmount()
+            .map(platform_unmount_outcome)
+            .with_context(|| format!("failed to unmount {}", self.mount_point.display()))
     }
 
     pub fn wait_until_unmounted_status(self) -> Result<PlatformMountStatus> {
@@ -415,14 +451,12 @@ impl SharedRootMountHandle {
         Ok(PlatformMountStatus::Unmounted)
     }
 
-    pub fn unmount(self) -> Result<()> {
-        self.session
-            .umount_and_join()
-            .with_context(|| format!("failed to unmount {}", self.mount_point.display()))
+    pub fn unmount(&mut self) -> Result<()> {
+        self.request_unmount().map(|_| ())
     }
 
     pub fn wait_until_unmounted(self) -> Result<()> {
-        self.session.join().with_context(|| {
+        self.session.wait_until_unmounted().with_context(|| {
             format!(
                 "mount session ended with an error for {}",
                 self.mount_point.display()
@@ -528,7 +562,7 @@ pub fn unmount_owned_mountpoint(mount_point: &Path) -> Result<MountpointUnmountS
     )
 }
 
-fn macos_fuser_config(mount_name: &str, attr_owner: fuser_fs::FuserFileAttrOwner) -> fuser::Config {
+fn macos_fuser_config(mount_name: &str) -> fuser::Config {
     use fuser::MountOption;
 
     let volume_name = macos_mount_option_value(mount_name);
@@ -537,10 +571,14 @@ fn macos_fuser_config(mount_name: &str, attr_owner: fuser_fs::FuserFileAttrOwner
         MountOption::FSName(format!("mcraw4vulkan:{volume_name}")),
         MountOption::RO,
         MountOption::CUSTOM("rdonly".to_string()),
-        MountOption::CUSTOM(format!("user_id={}", attr_owner.uid)),
-        MountOption::CUSTOM(format!("group_id={}", attr_owner.gid)),
         MountOption::CUSTOM("defer_permissions".to_string()),
+        // Bound macFUSE's synchronous FUSE_INIT handshake. Readiness after
+        // INIT remains a separate wrapper-side observation.
+        MountOption::CUSTOM("init_timeout=5".to_string()),
         MountOption::CUSTOM("noappledouble".to_string()),
+        // Current macOS can reject client opens under privacy policy before a
+        // request reaches the provider unless this source-media volume is local.
+        MountOption::CUSTOM("local".to_string()),
         MountOption::CUSTOM(format!("volname={volume_name}")),
         MountOption::NoDev,
         MountOption::NoSuid,
@@ -548,6 +586,45 @@ fn macos_fuser_config(mount_name: &str, attr_owner: fuser_fs::FuserFileAttrOwner
     ];
     config.n_threads = Some(1);
     config
+}
+
+fn macos_native_mount_options(config: &fuser::Config) -> Vec<String> {
+    use fuser::MountOption;
+
+    // fuser's direct mount path synthesizes user_id/group_id as kernel mount
+    // data; they are not libfuse3 session options. The accepted filesystem
+    // adapter continues to put the prepared mountpoint owner in every FileAttr.
+    let mut options = config
+        .mount_options
+        .iter()
+        .map(|option| match option {
+            MountOption::FSName(value) => format!("fsname={value}"),
+            MountOption::Subtype(value) => format!("subtype={value}"),
+            MountOption::CUSTOM(value) => value.clone(),
+            MountOption::AutoUnmount => "auto_unmount".to_string(),
+            MountOption::DefaultPermissions => "default_permissions".to_string(),
+            MountOption::Dev => "dev".to_string(),
+            MountOption::NoDev => "nodev".to_string(),
+            MountOption::Suid => "suid".to_string(),
+            MountOption::NoSuid => "nosuid".to_string(),
+            MountOption::RO => "ro".to_string(),
+            MountOption::RW => "rw".to_string(),
+            MountOption::Exec => "exec".to_string(),
+            MountOption::NoExec => "noexec".to_string(),
+            MountOption::Atime => "atime".to_string(),
+            MountOption::NoAtime => "noatime".to_string(),
+            MountOption::DirSync => "dirsync".to_string(),
+            MountOption::Sync => "sync".to_string(),
+            MountOption::Async => "async".to_string(),
+        })
+        .collect::<Vec<_>>();
+    if matches!(
+        config.acl,
+        fuser::SessionACL::All | fuser::SessionACL::RootAndOwner
+    ) {
+        options.push("allow_other".to_string());
+    }
+    options
 }
 
 fn fuser_file_attr_owner_for_mountpoint(path: &Path) -> Result<fuser_fs::FuserFileAttrOwner> {
@@ -641,6 +718,49 @@ fn is_not_mounted_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_NATIVE_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn mount_observation_failure_maps_to_failed_status() {
+        assert_eq!(
+            platform_status_from_mount_observation(Err::<bool, ()>(())),
+            PlatformMountStatus::Failed
+        );
+        assert_eq!(
+            platform_status_from_mount_observation(Ok::<bool, ()>(false)),
+            PlatformMountStatus::Unmounted
+        );
+        assert_eq!(
+            platform_unmount_outcome(UnmountOutcome::AlreadyUnmounted),
+            PlatformUnmountOutcome::NotMounted
+        );
+    }
+
+    struct TestMountpoint(PathBuf);
+
+    impl TestMountpoint {
+        fn new(label: &str) -> Self {
+            let parent = fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize native-test temporary directory");
+            let id = NEXT_NATIVE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".mcraw4vulkan-h05-{label}-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create native-test mountpoint");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestMountpoint {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    // The private real-fixture GPU/mount regression is not part of public source.
 
     #[test]
     fn platform_request_converts_to_macos_mount_request() {
@@ -704,10 +824,7 @@ mod tests {
 
     #[test]
     fn macos_fuser_config_uses_conservative_mount_options() {
-        let config = macos_fuser_config(
-            "clip__1234567890",
-            fuser_fs::FuserFileAttrOwner::new(501, 20),
-        );
+        let config = macos_fuser_config("clip__1234567890");
         let custom_options = config
             .mount_options
             .iter()
@@ -725,18 +842,40 @@ mod tests {
         );
         assert!(config.mount_options.contains(&fuser::MountOption::NoExec));
         assert!(custom_options.contains(&"rdonly"));
-        assert!(custom_options.contains(&"user_id=501"));
-        assert!(custom_options.contains(&"group_id=20"));
         assert!(custom_options.contains(&"defer_permissions"));
+        assert!(custom_options.contains(&"init_timeout=5"));
         assert!(custom_options.contains(&"noappledouble"));
+        assert!(custom_options.contains(&"local"));
         assert!(custom_options.contains(&"volname=clip__1234567890"));
         assert!(!custom_options.contains(&"noapplexattr"));
+
+        let native_options = macos_native_mount_options(&config);
+        for expected in [
+            "fsname=mcraw4vulkan:clip__1234567890",
+            "ro",
+            "rdonly",
+            "defer_permissions",
+            "init_timeout=5",
+            "noappledouble",
+            "local",
+            "volname=clip__1234567890",
+            "nodev",
+            "nosuid",
+            "noexec",
+        ] {
+            assert!(native_options.iter().any(|option| option == expected));
+        }
+        assert!(!native_options.iter().any(|option| option == "allow_other"));
+        assert!(
+            !native_options
+                .iter()
+                .any(|option| option.starts_with("user_id=") || option.starts_with("group_id="))
+        );
 
         for forbidden in [
             "allow_other",
             "allow_root",
             "allow_recursion",
-            "local",
             "backend=fskit",
             "nobrowse",
         ] {
@@ -749,10 +888,7 @@ mod tests {
 
     #[test]
     fn macos_fuser_config_sanitizes_mount_option_values() {
-        let config = macos_fuser_config(
-            "clip,bad\u{0007}name",
-            fuser_fs::FuserFileAttrOwner::new(1, 2),
-        );
+        let config = macos_fuser_config("clip,bad\u{0007}name");
         let custom_options = config
             .mount_options
             .iter()

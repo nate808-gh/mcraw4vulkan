@@ -1,3 +1,5 @@
+![icon-1024.svg](packaging/icon-1024.svg)
+
 # mcraw4vulkan
 
 mcraw4vulkan is a Rust application for displaying and processing MotionCam RAW
@@ -42,6 +44,8 @@ optimizer workflows.
 
 The adapters share the virtual-filesystem model, but native mount lifecycle and
 runtime requirements differ by operating system.
+
+![mcraw-production-pathway.svg](docs/mcraw-production-pathway.svg)
 
 ## Runtime requirements
 
@@ -145,15 +149,11 @@ not require regenerating or resealing a distribution manifest, and
 `cargo build --release` is also the normal optimized build used for direct
 testing.
 
-The public macOS source workflow continues with:
-
-```sh
-./packaging/macos/package-cli.sh
-```
-
-That intentionally public script derives the current project version from
-Cargo metadata and packages the current build without fixed project-source,
-legal-manifest, RNA-export, or package-version identity constants.
+Platform distribution packages are assembled by the maintainer's native-host
+packagers from this public source. Those convenience tools and their selected
+SDK, signing, and output settings are not part of the public application
+source. See `packaging/macos/README.txt` for macOS source-build and runtime
+requirements.
 
 ## Beta limitations
 
@@ -168,9 +168,9 @@ legal-manifest, RNA-export, or package-version identity constants.
 
 ## macOS signing status
 
-The initial macOS Beta packages use ad-hoc code signing and are not notarized
-with an Apple Developer ID. macOS may require explicit user approval before
-the first launch.
+Signing and notarization are properties of a particular packaged artifact.
+Consult the metadata shipped with that artifact; macOS may require explicit
+user approval before the first launch.
 
 ## Reporting bugs and support
 

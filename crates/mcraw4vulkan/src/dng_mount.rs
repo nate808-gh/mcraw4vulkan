@@ -234,6 +234,8 @@ pub fn run_dng_mount_with_registry(
                 return Err(error);
             }
         };
+        #[cfg(target_os = "macos")]
+        let mut handle = handle;
 
         let mount_index_start = registry.load_records()?.len().saturating_add(1);
         #[cfg(target_os = "windows")]

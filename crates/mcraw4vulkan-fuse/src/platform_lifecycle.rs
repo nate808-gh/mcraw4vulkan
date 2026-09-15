@@ -289,6 +289,9 @@ impl std::error::Error for PlatformMountError {}
 pub trait PlatformMountHandle {
     fn kind(&self) -> PlatformMountKind;
     fn mountpoint(&self) -> &Path;
+    #[cfg(target_os = "macos")]
+    fn request_unmount(&mut self) -> Result<PlatformUnmountOutcome>;
+    #[cfg(not(target_os = "macos"))]
     fn request_unmount(self) -> Result<PlatformUnmountOutcome>
     where
         Self: Sized;

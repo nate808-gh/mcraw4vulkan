@@ -18,14 +18,14 @@ pub(crate) fn collect() -> (PlatformSummary, HardwareSummary) {
         });
     let macfuse_root = absolute_path(&["Library", "Filesystems", "macfuse.fs"]);
     let helper = macfuse_root.join("Contents/Resources/mount_macfuse");
-    let libfuse = absolute_path(&["usr", "local", "lib", "libfuse.2.dylib"]);
+    let libfuse3 = absolute_path(&["usr", "local", "lib", "libfuse3.4.dylib"]);
     // This checks installation artifacts rather than attempting a mount. The
-    // macFUSE bundle requires its helper; libfuse.2.dylib is an alternative signal.
-    let available = (macfuse_root.exists() && helper.exists()) || libfuse.exists();
+    // FUSE3 application path needs the bundle, mount helper, and ABI dylib.
+    let available = macfuse_root.exists() && helper.exists() && libfuse3.exists();
     let (mount_backend_status, mount_backend_detail) = availability_detail(
         available,
-        "macFUSE is present without loading libfuse",
-        "macFUSE bundle, mount helper, or libfuse.2.dylib was not found",
+        "macFUSE FUSE3 installation artifacts are present without attempting a mount",
+        "macFUSE bundle, mount helper, or libfuse3.4.dylib was not found",
     );
 
     (

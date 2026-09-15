@@ -28,11 +28,13 @@ mcraw4vulkan-gpu = { path = "../mcraw4vulkan-gpu" }
 mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
 mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-fuser = "0.17"
-
 [target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.17"
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", default-features = false, features = ["macos-no-mount", "macfuse-4-compat"] }
+mcraw4vulkan-macfuse-ffi = { path = "../mcraw4vulkan-macfuse-ffi" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mcraw4vulkan-projfs-ffi = { path = "../mcraw4vulkan-projfs-ffi" }
