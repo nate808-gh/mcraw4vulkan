@@ -1176,14 +1176,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcraw4vulkan-macfuse-ffi"
-version = "0.8.1"
-dependencies = [
- "fuser",
- "libc",
-]
-
-[[package]]
 name = "mcraw4vulkan-gpu"
 version = "0.1.0"
 dependencies = [
@@ -1210,6 +1202,14 @@ dependencies = [
  "serde_json",
  "wgpu",
  "winresource",
+]
+
+[[package]]
+name = "mcraw4vulkan-macfuse-ffi"
+version = "0.8.1"
+dependencies = [
+ "fuser",
+ "libc",
 ]
 
 [[package]]
