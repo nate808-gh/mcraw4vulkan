@@ -45,6 +45,9 @@ pub struct DngFrameDescription {
     pub color_matrix2: Option<ColorMatrix>,
     pub forward_matrix1: Option<ColorMatrix>,
     pub forward_matrix2: Option<ColorMatrix>,
+    pub camera_calibration1: Option<ColorMatrix>,
+    pub camera_calibration2: Option<ColorMatrix>,
+    pub analog_balance: Option<[f64; 3]>,
     pub calibration_illuminant1: u16,
     pub calibration_illuminant2: u16,
     pub dng_version: [u8; 4],
@@ -116,6 +119,39 @@ impl DngFrameDescription {
         frame_number: FrameNumber,
         timestamp_us: u64,
     ) -> Result<Self, DngDescriptionError> {
+        let effective = container_metadata.with_frame_color(frame_metadata);
+        let container_metadata = &effective;
+        // Retain the accepted legacy ForwardMatrix writer policy. Profiles
+        // without ForwardMatrices use source-associated DNG calibration facts.
+        let source_calibration = container_metadata.forward_matrix1.is_none()
+            && container_metadata.forward_matrix2.is_none()
+            && (container_metadata.color_matrix1.is_some()
+                || container_metadata.color_matrix2.is_some());
+        let source_illuminant = |matrix: Option<ColorMatrix>,
+                                 light: &Option<mcraw4vulkan_mcrawcontainer::ColorIlluminant>,
+                                 default| {
+            if !source_calibration {
+                return Ok(default);
+            }
+            if matrix.is_none() {
+                return Ok(0);
+            }
+            light.as_ref().and_then(|v| v.dng_code()).ok_or_else(|| {
+                DngDescriptionError::UnsupportedMetadata(
+                    "ColorMatrix requires its known source illuminant".to_owned(),
+                )
+            })
+        };
+        let calibration_illuminant1 = source_illuminant(
+            container_metadata.color_matrix1,
+            &container_metadata.color_illuminant1,
+            DEFAULT_CALIBRATION_ILLUMINANT1,
+        )?;
+        let calibration_illuminant2 = source_illuminant(
+            container_metadata.color_matrix2,
+            &container_metadata.color_illuminant2,
+            DEFAULT_CALIBRATION_ILLUMINANT2,
+        )?;
         let container_black_level = container_metadata.black_level.ok_or_else(|| {
             DngDescriptionError::UnsupportedMetadata(
                 "container metadata missing blackLevel".to_string(),
@@ -162,8 +198,17 @@ impl DngFrameDescription {
             color_matrix2: container_metadata.color_matrix2,
             forward_matrix1: container_metadata.forward_matrix1,
             forward_matrix2: container_metadata.forward_matrix2,
-            calibration_illuminant1: DEFAULT_CALIBRATION_ILLUMINANT1,
-            calibration_illuminant2: DEFAULT_CALIBRATION_ILLUMINANT2,
+            camera_calibration1: source_calibration
+                .then_some(container_metadata.calibration_matrix1)
+                .flatten(),
+            camera_calibration2: source_calibration
+                .then_some(container_metadata.calibration_matrix2)
+                .flatten(),
+            analog_balance: source_calibration
+                .then_some(container_metadata.analog_balance)
+                .flatten(),
+            calibration_illuminant1,
+            calibration_illuminant2,
             dng_version: DEFAULT_DNG_VERSION,
             dng_backward_version: DEFAULT_DNG_BACKWARD_VERSION,
             unique_camera_model: DEFAULT_UNIQUE_CAMERA_MODEL.to_string(),
@@ -492,6 +537,7 @@ mod tests {
         dynamic_black_level: Option<[f64; 4]>,
     ) -> DngFrameDescription {
         let container_metadata = ContainerMetadata {
+            analog_balance: None,
             black_level: Some(BlackLevel { values: [256.0; 4] }),
             white_level: Some(WhiteLevel {
                 values: [4095.0; 4],
@@ -512,6 +558,7 @@ mod tests {
             calibration_matrix2: None,
         };
         let frame_metadata = FrameMetadata {
+            color_overrides: Default::default(),
             dimensions,
             original_width,
             original_height,

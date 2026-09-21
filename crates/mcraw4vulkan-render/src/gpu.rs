@@ -561,6 +561,7 @@ pub enum GpuRenderColorMatrixSource {
     ForwardMatrix2,
     InverseColorMatrix1,
     InverseColorMatrix2,
+    ColorMatrixAdapted,
     IdentityFallback,
 }
 
@@ -572,6 +573,7 @@ impl GpuRenderColorMatrixSource {
             Self::InverseColorMatrix1 => "inverse-color-matrix-1",
             Self::InverseColorMatrix2 => "inverse-color-matrix-2",
             Self::IdentityFallback => "identity-fallback",
+            Self::ColorMatrixAdapted => "colormatrix-adapted-d50",
         }
     }
 }
@@ -598,6 +600,32 @@ pub struct GpuRenderColorParams {
 }
 
 impl GpuRenderColorParams {
+    /// Validated DNG ColorMatrix-only transform, including white adaptation.
+    /// The shader receives unbalanced camera RGB, so no second neutral division.
+    pub fn from_camera_to_xyz_d50(camera_to_xyz_d50: [f64; 9]) -> Result<Self, DisplayRenderError> {
+        let matrix = multiply_3x3(
+            XYZ_D65_TO_LINEAR_SRGB,
+            multiply_3x3(BRADFORD_D50_TO_D65, camera_to_xyz_d50),
+        );
+        if matrix
+            .iter()
+            .any(|v| !v.is_finite() || !(*v as f32).is_finite())
+        {
+            return Err(DisplayRenderError::InvalidParams(
+                "camera to sRGB matrix must be finite".to_owned(),
+            ));
+        }
+        Ok(Self {
+            mode: GpuRenderColorMode::MetadataSrgb,
+            white_balance_rgb: [1.0; 3],
+            camera_to_srgb: f64_matrix_to_f32(matrix),
+            apply_srgb_transfer: true,
+            matrix_source: GpuRenderColorMatrixSource::ColorMatrixAdapted,
+            selected_illuminant: None,
+            camera_to_xyz_d50,
+        })
+    }
+
     pub fn from_metadata(
         mode: GpuRenderColorMode,
         as_shot_neutral: Option<[f64; 3]>,

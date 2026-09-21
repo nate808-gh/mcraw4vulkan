@@ -23,6 +23,7 @@ pub struct ContainerMetadata {
     pub color_illuminant2: Option<ColorIlluminant>,
     pub calibration_matrix1: Option<ColorMatrix>,
     pub calibration_matrix2: Option<ColorMatrix>,
+    pub analog_balance: Option<[f64; 3]>,
 }
 
 // Black-level metadata normalized to the four positions of a 2x2 Bayer pattern.
@@ -56,14 +57,37 @@ pub struct ColorMatrix {
 pub enum ColorIlluminant {
     StandardA,
     D65,
+    D50,
     Other(String),
 }
 
 impl ColorIlluminant {
+    pub fn from_source_token(token: &crate::RawIlluminantToken) -> Self {
+        match token.dng_code() {
+            Some(17) => Self::StandardA,
+            Some(21) => Self::D65,
+            Some(23) => Self::D50,
+            _ => Self::Other(match token {
+                crate::RawIlluminantToken::String(s) => s.clone(),
+                crate::RawIlluminantToken::Integer(n) => format!("code:{n}"),
+            }),
+        }
+    }
+
+    pub const fn dng_code(&self) -> Option<u16> {
+        match self {
+            Self::StandardA => Some(17),
+            Self::D65 => Some(21),
+            Self::D50 => Some(23),
+            Self::Other(_) => None,
+        }
+    }
+
     pub fn label(&self) -> &str {
         match self {
             Self::StandardA => "standard-a",
             Self::D65 => "d65",
+            Self::D50 => "d50",
             Self::Other(value) => value.as_str(),
         }
     }
@@ -109,6 +133,43 @@ impl SensorArrangement {
 }
 
 impl ContainerMetadata {
+    pub fn with_frame_color(&self, frame: &crate::FrameMetadata) -> Self {
+        let mut out = self.clone();
+        for (i, over) in frame.color_overrides.slots.iter().enumerate() {
+            let (cm, fm, cc, light) = if i == 0 {
+                (
+                    &mut out.color_matrix1,
+                    &mut out.forward_matrix1,
+                    &mut out.calibration_matrix1,
+                    &mut out.color_illuminant1,
+                )
+            } else {
+                (
+                    &mut out.color_matrix2,
+                    &mut out.forward_matrix2,
+                    &mut out.calibration_matrix2,
+                    &mut out.color_illuminant2,
+                )
+            };
+            if let Some(v) = over.color_matrix {
+                *cm = Some(ColorMatrix { values: v.values });
+            }
+            if let Some(v) = over.forward_matrix {
+                *fm = v.map(|v| ColorMatrix { values: v.values });
+            }
+            if let Some(v) = over.camera_calibration {
+                *cc = v.map(|v| ColorMatrix { values: v.values });
+            }
+            if let Some(v) = &over.illuminant {
+                *light = Some(ColorIlluminant::from_source_token(v));
+            }
+        }
+        if let Some(v) = frame.color_overrides.analog_balance {
+            out.analog_balance = Some(v);
+        }
+        out
+    }
+
     // Parse the container-level JSON stored near the beginning of a .mcraw file.
     //
     // Missing optional fields remain absent rather than receiving policy defaults;
@@ -137,6 +198,9 @@ impl ContainerMetadata {
             color_illuminant2: parse_optional_illuminant(&value, "colorIlluminant2")?,
             calibration_matrix1: parse_optional_matrix(&value, "calibrationMatrix1")?,
             calibration_matrix2: parse_optional_matrix(&value, "calibrationMatrix2")?,
+            analog_balance: crate::ColorMetadataOverrides::parse(&value)
+                .map_err(|e| DecodeError::UnsupportedFormat(e.to_string()))?
+                .analog_balance,
         })
     }
 }
@@ -237,9 +301,13 @@ fn parse_optional_matrix(value: &Value, key: &str) -> Result<Option<ColorMatrix>
         return Ok(None);
     };
 
-    let values = parse_matrix_values(raw, key)?;
-
-    Ok(Some(ColorMatrix { values }))
+    let optional_calibration = matches!(
+        key,
+        "forwardMatrix1" | "forwardMatrix2" | "calibrationMatrix1" | "calibrationMatrix2"
+    );
+    crate::strict_color::parse_source_matrix(raw, optional_calibration)
+        .map(|values| values.map(|values| ColorMatrix { values }))
+        .map_err(|detail| DecodeError::UnsupportedFormat(format!("{key}: {detail}")))
 }
 
 fn parse_optional_illuminant(
@@ -249,84 +317,16 @@ fn parse_optional_illuminant(
     let Some(raw) = value.get(key) else {
         return Ok(None);
     };
-
-    if let Some(code) = raw.as_u64() {
-        return Ok(Some(match code {
-            17 => ColorIlluminant::D65,
-            21 => ColorIlluminant::StandardA,
-            other => ColorIlluminant::Other(format!("code:{other}")),
-        }));
-    }
-
-    let Some(name) = raw.as_str() else {
+    let token = if let Some(s) = raw.as_str() {
+        crate::RawIlluminantToken::String(s.to_owned())
+    } else if let Some(n) = raw.as_i64() {
+        crate::RawIlluminantToken::Integer(n)
+    } else {
         return Err(DecodeError::UnsupportedFormat(format!(
-            "{key} must be a string or non-negative integer"
+            "{key} must be a string or integer"
         )));
     };
-
-    let normalized = name.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    Ok(Some(match normalized.as_str() {
-        "d65" => ColorIlluminant::D65,
-        "standard-a" | "standard-light-a" | "std-a" | "a" => ColorIlluminant::StandardA,
-        other => ColorIlluminant::Other(other.to_string()),
-    }))
-}
-
-// Convert a matrix JSON value into a flat row-major [f64; 9] array.
-fn parse_matrix_values(raw: &Value, key: &str) -> Result<[f64; 9], DecodeError> {
-    let Some(items) = raw.as_array() else {
-        return Err(DecodeError::UnsupportedFormat(format!(
-            "{key} must be an array"
-        )));
-    };
-
-    if items.len() == 9 {
-        return parse_flat_matrix(items, key);
-    }
-
-    if items.len() == 3 && items.iter().all(Value::is_array) {
-        return parse_nested_matrix(items, key);
-    }
-
-    Err(DecodeError::UnsupportedFormat(format!(
-        "{key} must contain either 9 values or a 3x3 nested array"
-    )))
-}
-
-// Parse a flat [m00, m01, ..., m22] matrix.
-fn parse_flat_matrix(items: &[Value], key: &str) -> Result<[f64; 9], DecodeError> {
-    let mut values = [0.0_f64; 9];
-
-    for (index, item) in items.iter().enumerate() {
-        values[index] = parse_required_f64_value(item, key)?;
-    }
-
-    Ok(values)
-}
-
-// Parse a nested [[m00, m01, m02], ..., [m20, m21, m22]] matrix.
-fn parse_nested_matrix(items: &[Value], key: &str) -> Result<[f64; 9], DecodeError> {
-    let mut values = [0.0_f64; 9];
-
-    for row in 0..3 {
-        let Some(row_items) = items[row].as_array() else {
-            return Err(DecodeError::UnsupportedFormat(format!(
-                "{key} contains a non-array row"
-            )));
-        };
-
-        if row_items.len() != 3 {
-            return Err(DecodeError::UnsupportedFormat(format!(
-                "{key} nested rows must contain exactly 3 values"
-            )));
-        }
-
-        for col in 0..3 {
-            values[row * 3 + col] = parse_required_f64_value(&row_items[col], key)?;
-        }
-    }
-
-    Ok(values)
+    Ok(Some(ColorIlluminant::from_source_token(&token)))
 }
 
 // Parse one JSON numeric value into f64.
@@ -455,7 +455,7 @@ mod tests {
         let metadata = ContainerMetadata::parse(
             r#"{
                 "colorIlluminant1": "Standard A",
-                "colorIlluminant2": 17
+                "colorIlluminant2": 21
             }"#,
         )
         .expect("metadata parses");

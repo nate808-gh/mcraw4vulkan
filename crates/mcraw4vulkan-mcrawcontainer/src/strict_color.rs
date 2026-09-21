@@ -31,6 +31,135 @@ pub enum RawIlluminantToken {
     Integer(i64),
 }
 
+impl RawIlluminantToken {
+    /// DNG/Exif light-source codes. Source tokens themselves remain unchanged.
+    pub fn dng_code(&self) -> Option<u16> {
+        match self {
+            Self::Integer(17) => Some(17),
+            Self::Integer(21) => Some(21),
+            Self::Integer(23) => Some(23),
+            Self::String(s) => match s
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['_', ' '], "-")
+                .as_str()
+            {
+                "standarda" | "standard-a" | "standard-light-a" | "std-a" | "a" => Some(17),
+                "d65" => Some(21),
+                "d50" => Some(23),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// Frame overrides retain the difference between an unspecified optional matrix
+/// and an explicitly unavailable one. No mathematical defaults enter source facts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColorSlotOverrides {
+    pub illuminant: Option<RawIlluminantToken>,
+    pub color_matrix: Option<RawCamera2Matrix>,
+    pub camera_calibration: Option<Option<RawCamera2Matrix>>,
+    pub forward_matrix: Option<Option<RawCamera2Matrix>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColorMetadataOverrides {
+    pub slots: [ColorSlotOverrides; 2],
+    pub analog_balance: Option<[f64; 3]>,
+}
+
+impl ColorMetadataOverrides {
+    pub(crate) fn parse(value: &Value) -> Result<Self, RawCamera2ColorSourceError> {
+        let mut result = Self::default();
+        for (i, slot) in result.slots.iter_mut().enumerate() {
+            let n = (i + 1) as u8;
+            let key = format!("colorIlluminant{n}");
+            slot.illuminant = value
+                .get(&key)
+                .map(|v| parse_illuminant(v, n))
+                .transpose()?;
+            slot.color_matrix = parse_optional_matrix(
+                value,
+                &format!("colorMatrix{n}"),
+                n,
+                RawCamera2MatrixKind::ColorMatrix,
+            )?;
+            let key = format!("calibrationMatrix{n}");
+            if value.get(&key).is_some() {
+                slot.camera_calibration = Some(parse_optional_matrix(
+                    value,
+                    &key,
+                    n,
+                    RawCamera2MatrixKind::CameraCalibration,
+                )?);
+            }
+            let key = format!("forwardMatrix{n}");
+            if value.get(&key).is_some() {
+                slot.forward_matrix = Some(parse_optional_matrix(
+                    value,
+                    &key,
+                    n,
+                    RawCamera2MatrixKind::ForwardMatrix,
+                )?);
+            }
+        }
+        result.analog_balance = parse_optional_positive_triplet(
+            value,
+            "analogBalance",
+            RawCamera2ColorSourceError::InvalidAnalogBalance,
+        )?;
+        Ok(result)
+    }
+
+    pub fn apply_to_profile(&self, source: &RawCamera2ColorProfile) -> RawCamera2ColorProfile {
+        let mut profile = source.clone();
+        for (i, over) in self.slots.iter().enumerate() {
+            if *over == ColorSlotOverrides::default() {
+                continue;
+            }
+            let source_slot = if i == 0 {
+                RawColorCalibrationSlotIndex::Slot1
+            } else {
+                RawColorCalibrationSlotIndex::Slot2
+            };
+            if !profile.slots.iter().any(|s| s.source_slot == source_slot) {
+                profile.slots.push(RawColorCalibrationSlot {
+                    source_slot,
+                    illuminant: None,
+                    color_matrix: None,
+                    camera_calibration: None,
+                    forward_matrix: None,
+                    provenance: source.provenance,
+                });
+            }
+            let slot = profile
+                .slots
+                .iter_mut()
+                .find(|s| s.source_slot == source_slot)
+                .expect("slot inserted");
+            if let Some(v) = &over.illuminant {
+                slot.illuminant = Some(v.clone());
+            }
+            if let Some(v) = over.color_matrix {
+                slot.color_matrix = Some(v);
+            }
+            if let Some(v) = over.camera_calibration {
+                slot.camera_calibration = v;
+            }
+            if let Some(v) = over.forward_matrix {
+                slot.forward_matrix = v;
+            }
+        }
+        profile.slots.sort_by_key(|s| s.source_slot.number());
+        if let Some(v) = self.analog_balance {
+            profile.analog_balance = Some(v);
+        }
+        profile
+    }
+}
+
 /// A raw row-major Camera2 3x3 matrix.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RawCamera2Matrix {
@@ -254,12 +383,22 @@ fn parse_optional_matrix(
     let Some(raw) = object.get(key) else {
         return Ok(None);
     };
-    parse_matrix(raw)
-        .map(|values| Some(RawCamera2Matrix { values }))
+    parse_source_matrix(raw, kind != RawCamera2MatrixKind::ColorMatrix)
+        .map(|values| values.map(|values| RawCamera2Matrix { values }))
         .map_err(|detail| RawCamera2ColorSourceError::InvalidMatrix { slot, kind, detail })
 }
 
-fn parse_matrix(raw: &Value) -> Result<[f64; 9], String> {
+pub(crate) fn parse_source_matrix(
+    raw: &Value,
+    optional_calibration: bool,
+) -> Result<Option<[f64; 9]>, String> {
+    if optional_calibration && raw.as_array().is_some_and(Vec::is_empty) {
+        return Ok(None);
+    }
+    parse_matrix(raw).map(Some)
+}
+
+pub(crate) fn parse_matrix(raw: &Value) -> Result<[f64; 9], String> {
     let rows = raw
         .as_array()
         .ok_or_else(|| "value is not an array".to_owned())?;
@@ -389,5 +528,95 @@ mod tests {
         assert_eq!(frame.source_frame_index, 123);
         assert_eq!(frame.as_shot_neutral, Some([0.5, 1.0, 0.75]));
         assert_eq!(frame.provenance, PROVENANCE);
+    }
+}
+
+#[cfg(test)]
+mod shared_contract_tests {
+    use super::*;
+    use crate::{ContainerMetadata, FrameMetadata};
+    use serde_json::json;
+    const P: StrictColorProfileProvenance =
+        StrictColorProfileProvenance::from_source_sha256([1; 32]);
+
+    #[test]
+    fn only_empty_optional_calibration_is_absent_in_both_parsers() {
+        for key in [
+            "forwardMatrix1",
+            "forwardMatrix2",
+            "calibrationMatrix1",
+            "calibrationMatrix2",
+        ] {
+            let j = json!({key: []}).to_string();
+            assert!(ContainerMetadata::parse(&j).is_ok(), "{key}");
+            let p = RawCamera2ColorProfile::parse(&j, P).unwrap();
+            assert!(
+                p.slots
+                    .iter()
+                    .all(|s| s.forward_matrix.is_none() && s.camera_calibration.is_none())
+            );
+            for value in [
+                json!(null),
+                json!(""),
+                json!([[], [], []]),
+                json!([1, 2]),
+                json!([[1, 2, 3], [], [1, 2, 3]]),
+            ] {
+                let j = json!({key: value}).to_string();
+                assert!(ContainerMetadata::parse(&j).is_err());
+                assert!(RawCamera2ColorProfile::parse(&j, P).is_err());
+            }
+        }
+        for key in ["colorMatrix1", "colorMatrix2"] {
+            let j = json!({key: []}).to_string();
+            assert!(ContainerMetadata::parse(&j).is_err());
+            assert!(RawCamera2ColorProfile::parse(&j, P).is_err());
+        }
+    }
+
+    #[test]
+    fn source_slots_and_explicit_absence_survive_frame_precedence() {
+        let j = json!({"colorIlluminant1":17,"colorMatrix1":[1,0,0,0,1,0,0,0,1],"forwardMatrix1":[1,0,0,0,1,0,0,0,1]});
+        let clip = ContainerMetadata::parse(&j.to_string()).unwrap();
+        let source = RawCamera2ColorProfile::parse(&j.to_string(), P).unwrap();
+        let frame = FrameMetadata::parse(&json!({"width":64,"height":4,"forwardMatrix1":[],"colorMatrix1":[2,0,0,0,1,0,0,0,1],"colorIlluminant1":"d50","asShotNeutral":[0.5,1,0.7]}).to_string()).unwrap();
+        let raw = frame.color_overrides.apply_to_profile(&source);
+        let typed = clip.with_frame_color(&frame);
+        assert!(raw.slots[0].forward_matrix.is_none());
+        assert!(typed.forward_matrix1.is_none());
+        assert_eq!(
+            raw.slots[0].color_matrix.unwrap().values,
+            typed.color_matrix1.unwrap().values
+        );
+        assert_eq!(
+            raw.slots[0].illuminant.as_ref().unwrap().dng_code(),
+            Some(23)
+        );
+        assert_eq!(typed.color_illuminant1.unwrap().dng_code(), Some(23));
+        assert_eq!(raw.provenance, P);
+        assert!(source.slots[0].forward_matrix.is_some());
+    }
+
+    #[test]
+    fn normative_numeric_and_string_illuminants_agree() {
+        for (code, name) in [(17, "standarda"), (21, "d65"), (23, "d50")] {
+            assert_eq!(
+                RawIlluminantToken::Integer(code).dng_code(),
+                Some(code as u16)
+            );
+            assert_eq!(
+                RawIlluminantToken::String(name.into()).dng_code(),
+                Some(code as u16)
+            );
+            let c = ContainerMetadata::parse(
+                &json!({"colorIlluminant1":code,"colorIlluminant2":name}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(c.color_illuminant1, c.color_illuminant2);
+        }
+        assert_eq!(
+            RawIlluminantToken::String("unknown".into()).dng_code(),
+            None
+        );
     }
 }

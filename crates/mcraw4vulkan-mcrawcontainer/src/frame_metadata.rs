@@ -28,6 +28,7 @@ pub struct FrameMetadata {
     pub dynamic_black_level: Option<[f64; 4]>,
     pub lens_shading_map: Option<LensShadingMap>,
     pub as_shot_neutral: Option<[f64; 3]>,
+    pub color_overrides: crate::ColorMetadataOverrides,
 }
 
 // Finite known compression categories from the frame metadata.
@@ -116,6 +117,8 @@ impl FrameMetadata {
             dynamic_black_level,
             lens_shading_map,
             as_shot_neutral,
+            color_overrides: crate::ColorMetadataOverrides::parse(&value)
+                .map_err(|e| DecodeError::UnsupportedFormat(e.to_string()))?,
         })
     }
 

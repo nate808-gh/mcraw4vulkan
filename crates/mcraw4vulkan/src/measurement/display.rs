@@ -960,6 +960,6 @@ fn render_illuminant_from_container(
     match illuminant {
         ColorIlluminant::StandardA => GpuRenderCalibrationIlluminant::StandardA,
         ColorIlluminant::D65 => GpuRenderCalibrationIlluminant::D65,
-        ColorIlluminant::Other(_) => GpuRenderCalibrationIlluminant::Other,
+        ColorIlluminant::D50 | ColorIlluminant::Other(_) => GpuRenderCalibrationIlluminant::Other,
     }
 }

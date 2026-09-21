@@ -34,8 +34,9 @@ use mcraw4vulkan_sdl2_wgpu_surface::{
 };
 use mcraw4vulkan_vignette::{
     FixedPointVignetteInputFacts, GpuUploadedFullResolutionGainMap, GpuVignetteCorrectionParams,
-    GpuVignetteCorrector, PreparedFixedLensShadingMap, VignetteCoordinateMapping,
-    VignetteCorrectionInputFacts, VignetteCorrectionMode, VignetteGainMapFingerprint,
+    GpuVignetteCorrector, GpuVignettePackedU16DispatchInput, PreparedFixedLensShadingMap,
+    VignetteCoordinateMapping, VignetteCorrectionInputFacts, VignetteCorrectionMode,
+    VignetteGainMapFingerprint,
 };
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
@@ -123,14 +124,6 @@ impl DisplayCliRunConfig {
     }
 
     pub fn validate_before_open(&self) -> Result<()> {
-        if self.backend == DisplayCliBackend::Cpu
-            && self.vignette == DisplayCliVignette::WithCorrection
-        {
-            bail!(
-                "Vignette correction using CPU is too slow; use `--gpu --with-vig-correction` or `--cpu --no-vig-correction`"
-            );
-        }
-
         if self.sound.enabled() && self.vsync == DisplayCliVsync::NoVsync {
             bail!("--with-sound requires Vsync display and cannot be used with --no-vsync");
         }
@@ -1571,9 +1564,6 @@ impl DisplayWindowState {
         facts: &DisplayFrameFacts,
         frame: &PayloadFrame,
     ) -> Result<()> {
-        let tone_policy =
-            DisplayPreviewTonePolicy::for_vignette(DisplayCliVignette::WithCorrection);
-        let render_params = facts.p999_histogram_params(DisplayCliVignette::WithCorrection)?;
         let (uploaded_gain_map, params) = self.ensure_uploaded_gain_map(facts)?;
         let corrector = self
             .vignette_corrector
@@ -1613,6 +1603,20 @@ impl DisplayWindowState {
                     },
                 )?,
         };
+        self.render_corrected_frame(facts, &decode_output.stage)
+    }
+
+    // Both RAW backends feed the same corrected camera-domain buffer and the
+    // same histogram/tone/preview path. CPU RAW decoding still uses GPU spatial
+    // correction after its existing upload; it does not run a scalar corrector.
+    fn render_corrected_frame(
+        &mut self,
+        facts: &DisplayFrameFacts,
+        decoded: &DecodedDisplayStage,
+    ) -> Result<()> {
+        let tone_policy =
+            DisplayPreviewTonePolicy::for_vignette(DisplayCliVignette::WithCorrection);
+        let render_params = facts.p999_histogram_params(DisplayCliVignette::WithCorrection)?;
         let display_histogram = self
             .display_histogram
             .as_mut()
@@ -1621,8 +1625,8 @@ impl DisplayWindowState {
             .compute_p999_luminance_histogram(GpuP999HistogramInput {
                 device: self.backend.device(),
                 queue: self.backend.queue(),
-                input_buffer: &decode_output.stage.buffer,
-                input_buffer_bytes: decode_output.stage.byte_len,
+                input_buffer: &decoded.buffer,
+                input_buffer_bytes: decoded.byte_len,
                 params: render_params,
                 config: tone_policy.histogram_config,
                 extra_scale: tone_policy.histogram_extra_scale,
@@ -1648,8 +1652,8 @@ impl DisplayWindowState {
                 self.backend.device(),
                 self.backend.queue(),
                 &mut encoder,
-                &decode_output.stage.buffer,
-                decode_output.stage.byte_len,
+                &decoded.buffer,
+                decoded.byte_len,
                 preview_config,
                 preview_rgb_sink_policy,
             )
@@ -1723,8 +1727,36 @@ impl DisplayWindowState {
             .preview_uploader
             .as_mut()
             .context("CPU display upload buffer missing")?;
-        let buffer = uploader.ensure(self.backend.device(), byte_len);
-        self.backend.queue().write_buffer(buffer, 0, &bytes);
+        let buffer = uploader.ensure(self.backend.device(), byte_len).clone();
+        self.backend.queue().write_buffer(&buffer, 0, &bytes);
+        if self.config.vignette == DisplayCliVignette::WithCorrection {
+            let (uploaded_gain_map, params) = self.ensure_uploaded_gain_map(facts)?;
+            let mut encoder =
+                self.backend
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("mcraw4vulkan CPU RAW GPU vignette encoder"),
+                    });
+            let corrected = self
+                .vignette_corrector
+                .as_mut()
+                .context("display vignette corrector missing")?
+                .dispatch_packed_u16(GpuVignettePackedU16DispatchInput {
+                    device: self.backend.device(),
+                    queue: self.backend.queue(),
+                    encoder: &mut encoder,
+                    input_buffer: &buffer,
+                    input_buffer_bytes: byte_len,
+                    uploaded_gain_map: &uploaded_gain_map,
+                    params,
+                })?;
+            let decoded = DecodedDisplayStage {
+                buffer: corrected.output.buffer().clone(),
+                byte_len,
+            };
+            self.backend.queue().submit([encoder.finish()]);
+            return self.render_corrected_frame(facts, &decoded);
+        }
         let mut encoder =
             self.backend
                 .device()
@@ -1735,7 +1767,7 @@ impl DisplayWindowState {
             self.backend.device(),
             self.backend.queue(),
             &mut encoder,
-            buffer,
+            &buffer,
             byte_len,
             facts.preview_config(
                 DisplayCliVignette::NoCorrection,
@@ -2155,7 +2187,41 @@ impl DisplayWindowSource {
         let white_level =
             frame_white_level(frame_metadata, container_metadata).context("missing white level")?;
         let source_bits = source_bits_from_white_level(white_level);
-        let color_metadata = color_metadata_from_container(container_metadata);
+        let effective = container_metadata.with_frame_color(frame_metadata);
+        let color_metadata = color_metadata_from_container(&effective);
+        let adapted_color = if effective.forward_matrix1.is_none()
+            && effective.forward_matrix2.is_none()
+            && (effective.color_matrix1.is_some() || effective.color_matrix2.is_some())
+        {
+            use crate::strict_motioncam_color::{
+                ClipSourceSha256, StrictMotionCamForwardMatrixColorV2,
+                StrictMotionCamFrameColorInput,
+            };
+            use mcraw4vulkan_mcrawcontainer::{RawCamera2FrameColor, StrictColorProfileProvenance};
+            let provenance = StrictColorProfileProvenance::from_source_sha256(
+                ClipSourceSha256::deferred_stream_identity().bytes(),
+            );
+            let resolver = StrictMotionCamForwardMatrixColorV2::new()?;
+            let profile = resolver
+                .parse_supported_profile(self.container.container_metadata_json(), provenance)?;
+            let profile = resolver.effective_profile(&profile, &frame_metadata.color_overrides)?;
+            let input = StrictMotionCamFrameColorInput::from_raw(RawCamera2FrameColor {
+                source_frame_index: u64::from(frame_number.0),
+                as_shot_neutral: frame_metadata.as_shot_neutral,
+                provenance,
+            });
+            Some(GpuRenderColorParams::from_camera_to_xyz_d50(
+                resolver.resolve(&profile, &input)?.t50(),
+            )?)
+        } else {
+            if effective.forward_matrix1.is_some() != effective.forward_matrix2.is_some()
+                && effective.color_matrix1.is_some()
+                && effective.color_matrix2.is_some()
+            {
+                bail!("incomplete ForwardMatrix calibration set");
+            }
+            None
+        };
         let payload_layout = frame_metadata.payload_layout()?;
         Ok(DisplayFrameFacts {
             dimensions,
@@ -2167,6 +2233,7 @@ impl DisplayWindowSource {
             lens_shading_map: frame_metadata.lens_shading_map.clone(),
             as_shot_neutral: frame_metadata.as_shot_neutral,
             color_metadata,
+            adapted_color,
         })
     }
 }
@@ -2181,6 +2248,7 @@ struct DisplayFrameFacts {
     lens_shading_map: Option<LensShadingMap>,
     as_shot_neutral: Option<[f64; 3]>,
     color_metadata: GpuRenderColorMetadata,
+    adapted_color: Option<GpuRenderColorParams>,
 }
 
 impl DisplayFrameFacts {
@@ -2209,12 +2277,19 @@ impl DisplayFrameFacts {
         scale_mode: PreviewScaleMode,
     ) -> Result<PreviewRenderConfig> {
         let vignette_applied = vignette == DisplayCliVignette::WithCorrection;
-        let color = GpuRenderColorParams::from_metadata(
-            GpuRenderColorMode::MetadataSrgb,
-            self.as_shot_neutral,
-            self.color_metadata,
-        )
-        .map_err(|error| anyhow!("failed to build display preview color params: {error}"))?;
+        let color = self
+            .adapted_color
+            .map_or_else(
+                || {
+                    GpuRenderColorParams::from_metadata(
+                        GpuRenderColorMode::MetadataSrgb,
+                        self.as_shot_neutral,
+                        self.color_metadata,
+                    )
+                },
+                Ok,
+            )
+            .map_err(|error| anyhow!("failed to build display preview color params: {error}"))?;
         Ok(PreviewRenderConfig {
             dimensions: self.dimensions,
             bayer_pattern: self.bayer_pattern,
@@ -2242,12 +2317,19 @@ impl DisplayFrameFacts {
         vignette: DisplayCliVignette,
     ) -> Result<GpuP999HistogramParams> {
         let vignette_applied = vignette == DisplayCliVignette::WithCorrection;
-        let color = GpuRenderColorParams::from_metadata(
-            GpuRenderColorMode::MetadataSrgb,
-            self.as_shot_neutral,
-            self.color_metadata,
-        )
-        .map_err(|error| anyhow!("failed to build display p999 color params: {error}"))?;
+        let color = self
+            .adapted_color
+            .map_or_else(
+                || {
+                    GpuRenderColorParams::from_metadata(
+                        GpuRenderColorMode::MetadataSrgb,
+                        self.as_shot_neutral,
+                        self.color_metadata,
+                    )
+                },
+                Ok,
+            )
+            .map_err(|error| anyhow!("failed to build display p999 color params: {error}"))?;
         Ok(GpuP999HistogramParams {
             dimensions: self.dimensions,
             bayer_pattern: self.bayer_pattern,
@@ -2337,7 +2419,7 @@ fn render_illuminant_from_container(
     match illuminant {
         ColorIlluminant::StandardA => GpuRenderCalibrationIlluminant::StandardA,
         ColorIlluminant::D65 => GpuRenderCalibrationIlluminant::D65,
-        ColorIlluminant::Other(_) => GpuRenderCalibrationIlluminant::Other,
+        ColorIlluminant::D50 | ColorIlluminant::Other(_) => GpuRenderCalibrationIlluminant::Other,
     }
 }
 
@@ -2420,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn display_cpu_vignette_reports_unsupported_combination() {
+    fn display_cpu_raw_with_gpu_vignette_is_supported() {
         for settings in [DisplayCliSettings::Default, DisplayCliSettings::Optimized] {
             let config = DisplayCliRunConfig {
                 input_path: PathBuf::from("clip.mcraw"),
@@ -2433,11 +2515,7 @@ mod tests {
                 payload_feeder_options: PayloadFeederOptions::production_default(),
                 startup_timing: false,
             };
-            let error = config.validate_before_open().unwrap_err().to_string();
-            assert!(error.contains("Vignette correction"), "{error}");
-            assert!(error.contains("CPU"), "{error}");
-            assert!(error.contains("--gpu --with-vig-correction"), "{error}");
-            assert!(error.contains("--cpu --no-vig-correction"), "{error}");
+            config.validate_before_open().unwrap();
         }
     }
 
@@ -2455,6 +2533,7 @@ mod tests {
 
     fn synthetic_display_frame_facts() -> DisplayFrameFacts {
         DisplayFrameFacts {
+            adapted_color: None,
             dimensions: FrameDimensions {
                 width: 640,
                 height: 360,

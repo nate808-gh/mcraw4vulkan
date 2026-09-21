@@ -365,9 +365,12 @@ impl PipeStreamContextCollector {
         let mut ordered_color = blake3::Hasher::new();
         ordered_color.update(b"mcraw4vulkan:public-pipe-color-context-sequence:v1\0");
         let mut color_contexts = BTreeSet::<String>::new();
+        let mut color_policies = std::collections::BTreeMap::new();
         let mut first_color = None;
         let mut last_color = None;
         for (index, deferred) in self.deferred_color_fingerprints.into_iter().enumerate() {
+            let (name, digest) = deferred.policy_identity();
+            color_policies.insert(name, hex_bytes(&digest));
             let fingerprint = deferred.finalize(source_sha256).with_context(|| {
                 format!("PIPE strict color identity finalization failed at logical frame {index}")
             })?;
@@ -400,10 +403,18 @@ impl PipeStreamContextCollector {
             "payload_max_bytes": preflight.payload_plan.max_payload_bytes,
             "payload_spans_validated_without_decode": true,
         });
-        let resolver = StrictMotionCamForwardMatrixColorV2::new()?;
+        let (policy_name, policy_digest) = if color_policies.len() == 1 {
+            let (&name, digest) = color_policies.first_key_value().expect("one color policy");
+            (name, Value::String(digest.clone()))
+        } else {
+            (
+                "MixedMotionCamColorProfilesV1",
+                serde_json::to_value(&color_policies)?,
+            )
+        };
         let strict_color_context_identity = json!({
-            "policy_id": crate::pipe_contract::PIPE_COLOR_POLICY_ID,
-            "policy_digest_sha256": hex_bytes(&resolver.policy_digest().bytes()),
+            "policy_id": policy_name,
+            "policy_digest_sha256": policy_digest,
             "source_sha256": source_sha_hex,
             "context_count": self.frame_count,
             "unique_context_count": color_contexts.len(),
@@ -840,7 +851,7 @@ pub(crate) fn preflight_pipe_frames(
         StrictColorProfileProvenance::from_source_sha256(runtime_source_identity.bytes());
     let resolver = StrictMotionCamForwardMatrixColorV2::new()?;
     let color_profile = resolver
-        .parse_and_validate_profile(container.container_metadata_json(), provenance)
+        .parse_supported_profile(container.container_metadata_json(), provenance)
         .context("strict PIPE color-profile preflight failed")?;
     let sensor = &container.container_metadata().sensor_arrangement;
     let bayer = sensor
@@ -953,9 +964,11 @@ fn resolve_pipe_frame_context<'a>(
     let frame_input = resolver
         .parse_frame_input(&frame_json, u64::try_from(index)?, provenance)
         .with_context(|| format!("PIPE strict color input failed at logical frame {index}"))?;
+    let effective_profile =
+        resolver.effective_profile(&preflight.color_profile, &metadata.color_overrides)?;
     let (verified_color, deferred_color_fingerprint) = resolver
         .resolve_stream_context(
-            &preflight.color_profile,
+            &effective_profile,
             &frame_input,
             ColorContextFingerprintFacts {
                 numeric_domain: PipeF32BayerNumericDomain::RelativeLinearCorrectedCodeV1,

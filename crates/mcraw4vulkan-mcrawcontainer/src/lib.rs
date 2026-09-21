@@ -29,8 +29,8 @@ pub use lens_shading_map::{LensShadingMap, LensShadingMapValidationError};
 pub use parser::{ParsedAudioChunk, ParsedAudioIndex, ParsedClip, ParsedFrame, parse_clip};
 pub use payload::PayloadSpan;
 pub use strict_color::{
-    RawCamera2ColorProfile, RawCamera2ColorSourceError, RawCamera2FrameColor, RawCamera2Matrix,
-    RawCamera2MatrixKind, RawColorCalibrationSlot, RawColorCalibrationSlotIndex,
-    RawIlluminantToken, StrictColorProfileProvenance,
+    ColorMetadataOverrides, ColorSlotOverrides, RawCamera2ColorProfile, RawCamera2ColorSourceError,
+    RawCamera2FrameColor, RawCamera2Matrix, RawCamera2MatrixKind, RawColorCalibrationSlot,
+    RawColorCalibrationSlotIndex, RawIlluminantToken, StrictColorProfileProvenance,
 };
 pub use timing::{AudioChunkTimingInfo, AudioSyncInfo, VideoFrameRateInfo};

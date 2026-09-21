@@ -1,7 +1,7 @@
 //! Rendered-PIPE strict MotionCam Camera2 color resolver.
 //!
-//! This module is isolated from the DNG metadata path and implements only
-//! StrictMotionCamForwardMatrixColorV2 for the direct-YUV PIPE renderer.
+//! Shared validated camera-color calculation for DISPLAY and direct-YUV PIPE.
+//! Source DNG metadata remains independent of these derived rendering transforms.
 
 mod fingerprint;
 mod matrix;
@@ -43,6 +43,7 @@ impl StrictColorPolicyDigestV2 {
 enum Illuminant {
     StandardA,
     D65,
+    D50,
 }
 
 impl Illuminant {
@@ -50,6 +51,7 @@ impl Illuminant {
         match self {
             Self::StandardA => STANDARD_A_TEMPERATURE,
             Self::D65 => D65_TEMPERATURE,
+            Self::D50 => 5000.0,
         }
     }
 }
@@ -59,7 +61,7 @@ struct ValidatedSlot {
     temperature: f64,
     color_matrix: Matrix3,
     camera_calibration: Matrix3,
-    normalized_forward_matrix: Matrix3,
+    normalized_forward_matrix: Option<Matrix3>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,20 @@ pub struct StrictMotionCamColorProfile {
 }
 
 impl StrictMotionCamColorProfile {
+    pub fn is_color_matrix_only(&self) -> bool {
+        self.slots_by_temperature[0]
+            .normalized_forward_matrix
+            .is_none()
+    }
+
+    pub fn policy_name(&self) -> &'static str {
+        if self.is_color_matrix_only() {
+            "StrictMotionCamColorMatrixColorV1"
+        } else {
+            "StrictMotionCamForwardMatrixColorV2"
+        }
+    }
+
     pub const fn provenance(&self) -> StrictColorProfileProvenance {
         self.raw.provenance
     }
@@ -347,7 +363,7 @@ struct InterpolatedFacts {
     weight_low: f64,
     color_matrix: Matrix3,
     camera_calibration: Matrix3,
-    forward_matrix: Matrix3,
+    forward_matrix: Option<Matrix3>,
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +399,51 @@ impl StrictMotionCamForwardMatrixColorV2 {
         self.validate_profile(raw)
     }
 
+    /// Select a validated profile by source calibration availability. The V2
+    /// entry points retain their frozen ForwardMatrix-only acceptance contract.
+    pub fn parse_supported_profile(
+        &self,
+        json: &str,
+        provenance: StrictColorProfileProvenance,
+    ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
+        self.validate_supported_profile(RawCamera2ColorProfile::parse(json, provenance)?)
+    }
+
+    pub fn validate_supported_profile(
+        &self,
+        raw: RawCamera2ColorProfile,
+    ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
+        self.validate_profile_inner(raw, true)
+    }
+
+    pub fn effective_profile<'a>(
+        &self,
+        profile: &'a StrictMotionCamColorProfile,
+        overrides: &mcraw4vulkan_mcrawcontainer::ColorMetadataOverrides,
+    ) -> Result<std::borrow::Cow<'a, StrictMotionCamColorProfile>, StrictMotionCamColorError> {
+        let raw = overrides.apply_to_profile(&profile.raw);
+        if raw == profile.raw {
+            Ok(std::borrow::Cow::Borrowed(profile))
+        } else {
+            Ok(std::borrow::Cow::Owned(
+                self.validate_supported_profile(raw)?,
+            ))
+        }
+    }
+
+    pub fn policy_digest_for(
+        &self,
+        profile: &StrictMotionCamColorProfile,
+    ) -> StrictColorPolicyDigestV2 {
+        if profile.is_color_matrix_only() {
+            let mut record = policy_record();
+            record.extend_from_slice(b"StrictMotionCamColorMatrixColorV1:inverse(AB*CC*CM);Bradford-white-to-D50;D50=5000K");
+            StrictColorPolicyDigestV2(Sha256::digest(&record))
+        } else {
+            self.policy_digest()
+        }
+    }
+
     pub fn parse_frame_input(
         &self,
         frame_metadata_json: &str,
@@ -397,6 +458,14 @@ impl StrictMotionCamForwardMatrixColorV2 {
     pub fn validate_profile(
         &self,
         raw: RawCamera2ColorProfile,
+    ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
+        self.validate_profile_inner(raw, false)
+    }
+
+    fn validate_profile_inner(
+        &self,
+        raw: RawCamera2ColorProfile,
+        allow_color_matrix_only: bool,
     ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
         let analog_balance = raw.analog_balance.unwrap_or([1.0; 3]);
         if analog_balance
@@ -419,7 +488,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
                 return Err(StrictMotionCamColorError::ColorProvenanceMismatch);
             }
             let source_slot = slot.source_slot.number();
-            let illuminant = parse_illuminant(slot)?;
+            let illuminant = parse_illuminant(slot, allow_color_matrix_only)?;
             let Some(raw_cm) = slot.color_matrix else {
                 return Err(StrictMotionCamColorError::IncompleteColorSlot { source_slot });
             };
@@ -443,7 +512,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
         {
             return Err(StrictMotionCamColorError::IncompleteForwardMatrixSet);
         }
-        if !forward_presence.iter().all(|present| *present) {
+        if !allow_color_matrix_only && !forward_presence.iter().all(|present| *present) {
             return Err(StrictMotionCamColorError::UnsupportedColorMetadata);
         }
 
@@ -454,8 +523,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
                     temperature: illuminant.temperature(),
                     color_matrix,
                     camera_calibration,
-                    normalized_forward_matrix: forward_matrix
-                        .expect("all ForwardMatrix slots were checked above"),
+                    normalized_forward_matrix: forward_matrix,
                 },
             )
             .collect::<Vec<_>>();
@@ -520,22 +588,35 @@ impl StrictMotionCamForwardMatrixColorV2 {
             })?;
         let facts = interpolate_for_xy(&profile.slots_by_temperature, white_xy)?;
         let ab_cc = analog_balance_matrix.multiply(facts.camera_calibration);
-        let inverse_ab_cc = ab_cc.inverse("AB*CC")?;
-        let reference_neutral = inverse_ab_cc.apply(camera_neutral);
-        if reference_neutral
-            .iter()
-            .any(|value| !value.is_finite() || *value <= 0.0)
-        {
-            return Err(StrictMotionCamColorError::NumericallyInvalid {
-                stage: "ReferenceNeutral",
-            });
-        }
-        let white_balance = diagonal(reference_neutral.map(|value| 1.0 / value));
-        let t50 = facts
-            .forward_matrix
-            .multiply(white_balance)
-            .multiply(inverse_ab_cc)
-            .validate_composite("T50")?;
+        let t50 = if profile.is_color_matrix_only() {
+            // DNG 1.7.1.0 pp. 101–103: unbalanced camera RGB -> XYZ at the
+            // solved white -> Bradford adaptation to D50. Preserve luminance;
+            // this is a rendering transform, never a source ForwardMatrix.
+            let xyz_to_camera = ab_cc
+                .multiply(facts.color_matrix)
+                .validate_input("XYZtoCamera")?;
+            chromatic_adaptation(white_xy, D50_XY)?
+                .multiply(xyz_to_camera.inverse("XYZtoCamera")?)
+                .validate_composite("ColorMatrix-only T50")?
+        } else {
+            let inverse_ab_cc = ab_cc.inverse("AB*CC")?;
+            let reference_neutral = inverse_ab_cc.apply(camera_neutral);
+            if reference_neutral
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                return Err(StrictMotionCamColorError::NumericallyInvalid {
+                    stage: "ReferenceNeutral",
+                });
+            }
+            let white_balance = diagonal(reference_neutral.map(|value| 1.0 / value));
+            facts
+                .forward_matrix
+                .expect("complete ForwardMatrix profile")
+                .multiply(white_balance)
+                .multiply(inverse_ab_cc)
+                .validate_composite("T50")?
+        };
         let camera_to_linear_bt2020 = Matrix3(XYZ_D65_TO_LINEAR_BT2020)
             .multiply(Matrix3(BRADFORD_D50_TO_D65))
             .multiply(t50)
@@ -572,18 +653,50 @@ impl StrictMotionCamForwardMatrixColorV2 {
 
 fn parse_illuminant(
     slot: &RawColorCalibrationSlot,
+    extended: bool,
 ) -> Result<Illuminant, StrictMotionCamColorError> {
     let source_slot = slot.source_slot.number();
-    match slot.illuminant.as_ref() {
-        Some(RawIlluminantToken::String(value)) if value == "standarda" => {
-            Ok(Illuminant::StandardA)
+    if !extended {
+        match slot.illuminant.as_ref() {
+            Some(RawIlluminantToken::String(v)) if v == "standarda" || v == "d65" => {}
+            Some(RawIlluminantToken::Integer(17 | 21)) => {}
+            None => return Err(StrictMotionCamColorError::IncompleteColorSlot { source_slot }),
+            _ => return Err(StrictMotionCamColorError::UnknownIlluminant { source_slot }),
         }
-        Some(RawIlluminantToken::String(value)) if value == "d65" => Ok(Illuminant::D65),
-        Some(RawIlluminantToken::Integer(17)) => Ok(Illuminant::StandardA),
-        Some(RawIlluminantToken::Integer(21)) => Ok(Illuminant::D65),
+    }
+    match slot.illuminant.as_ref().map(RawIlluminantToken::dng_code) {
+        Some(Some(17)) => Ok(Illuminant::StandardA),
+        Some(Some(21)) => Ok(Illuminant::D65),
+        Some(Some(23)) => Ok(Illuminant::D50),
         Some(_) => Err(StrictMotionCamColorError::UnknownIlluminant { source_slot }),
         None => Err(StrictMotionCamColorError::IncompleteColorSlot { source_slot }),
     }
+}
+
+fn chromatic_adaptation(
+    source: [f64; 2],
+    target: [f64; 2],
+) -> Result<Matrix3, StrictMotionCamColorError> {
+    let cone = Matrix3(policy::BRADFORD_CONE);
+    let source_lms = cone.apply(xy_to_xyz(source)?);
+    let target_lms = cone.apply(xy_to_xyz(target)?);
+    if source_lms
+        .iter()
+        .chain(target_lms.iter())
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return Err(StrictMotionCamColorError::NumericallyInvalid {
+            stage: "Bradford white response",
+        });
+    }
+    cone.inverse("Bradford cone")?
+        .multiply(diagonal([
+            target_lms[0] / source_lms[0],
+            target_lms[1] / source_lms[1],
+            target_lms[2] / source_lms[2],
+        ]))
+        .multiply(cone)
+        .validate_composite("Bradford adaptation")
 }
 
 fn normalize_forward(matrix: Matrix3) -> Result<Matrix3, StrictMotionCamColorError> {
@@ -636,11 +749,10 @@ fn interpolate_for_xy(
             weight_low,
             color_matrix: lerp(low.color_matrix, high.color_matrix, weight_low),
             camera_calibration: lerp(low.camera_calibration, high.camera_calibration, weight_low),
-            forward_matrix: lerp(
-                low.normalized_forward_matrix,
-                high.normalized_forward_matrix,
-                weight_low,
-            ),
+            forward_matrix: low
+                .normalized_forward_matrix
+                .zip(high.normalized_forward_matrix)
+                .map(|(low, high)| lerp(low, high, weight_low)),
         }
     };
     facts
@@ -649,9 +761,9 @@ fn interpolate_for_xy(
     facts
         .camera_calibration
         .validate_input("interpolated CameraCalibration")?;
-    facts
-        .forward_matrix
-        .validate_input("interpolated ForwardMatrix")?;
+    if let Some(matrix) = facts.forward_matrix {
+        matrix.validate_input("interpolated ForwardMatrix")?;
+    }
     Ok(facts)
 }
 

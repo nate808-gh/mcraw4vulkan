@@ -919,3 +919,143 @@ mod independent_reference {
         root + ((sum - square) + (low - square_error)) / (2.0 * root)
     }
 }
+
+#[test]
+fn color_matrix_only_portable_independent_vector_and_policy_identity() {
+    let resolver = StrictMotionCamForwardMatrixColorV2::new().unwrap();
+    let provenance = StrictColorProfileProvenance::from_source_sha256([7; 32]);
+    let json = r#"{"colorIlluminant1": 17, "colorIlluminant2": 23, "colorMatrix1": [0.9, -0.1, 0.03, -0.2, 1.2, 0.02, 0.01, 0.05, 0.7], "colorMatrix2": [0.7, -0.03, 0.01, -0.1, 1.1, 0.05, 0.02, 0.02, 0.6], "calibrationMatrix1": [1.02, 0.01, 0, 0, 0.98, 0.01, 0.01, 0, 1.04], "calibrationMatrix2": [0.99, 0, 0.01, 0.01, 1.01, 0, 0, 0.01, 0.97], "analogBalance": [1.1, 0.9, 1.05]}"#;
+    let raw = RawCamera2ColorProfile::parse(json, provenance).unwrap();
+    assert!(resolver.validate_profile(raw.clone()).is_err()); // frozen V2 boundary
+    let profile = resolver.validate_supported_profile(raw).unwrap();
+    let frame = resolver
+        .parse_frame_input(r#"{"asShotNeutral":[0.55,1.0,0.65]}"#, 0, provenance)
+        .unwrap();
+    let result = resolver.resolve(&profile, &frame).unwrap();
+    // Independent NumPy inversion/Bradford calculation, DNG 1.7.1 pp.101–103.
+    let expected: [f64; 9] = [
+        1.6685445711439357,
+        0.18035267117239714,
+        -0.1787188577727042,
+        0.33760925154575727,
+        0.9168286441445735,
+        -0.12965110133422164,
+        -0.045141131906192955,
+        -0.04779068694401624,
+        1.404266532652921,
+    ];
+    for (a, b) in result.t50().into_iter().zip(expected) {
+        assert!((a - b).abs() < 2e-11);
+    }
+    assert_eq!(profile.policy_name(), "StrictMotionCamColorMatrixColorV1");
+    assert_ne!(
+        resolver.policy_digest_for(&profile),
+        resolver.policy_digest()
+    );
+    let source = ClipSourceSha256::from_frozen_digest([7; 32]);
+    let context = resolver
+        .resolve_context(
+            &profile,
+            &frame,
+            ColorContextFingerprintFacts {
+                numeric_domain: PipeF32BayerNumericDomain::RelativeLinearCorrectedCodeV1,
+                dimensions: FrameDimensions {
+                    width: 64,
+                    height: 4,
+                },
+                bayer_pattern: BayerPattern::Rggb,
+                correction_mode: PipeF32BayerCorrectionMode::IdentitySpatialGain,
+                source_sha256: source,
+                source_frame_index: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(context.resolved().t50(), result.t50());
+
+    let params =
+        mcraw4vulkan_render::GpuRenderColorParams::from_camera_to_xyz_d50(result.t50()).unwrap();
+    assert_eq!(params.white_balance_rgb, [1.0; 3]);
+    // A caller that already divided by the neutral must undo that division
+    // before applying the unbalanced-input transform. DISPLAY passes unbalanced
+    // RGB and disables its independent WB multiplier; PIPE has no WB stage.
+    let neutral = [0.55, 1.0, 0.65];
+    let rgb = [0.2, 0.3, 0.7];
+    let balanced = [
+        rgb[0] / neutral[0],
+        rgb[1] / neutral[1],
+        rgb[2] / neutral[2],
+    ];
+    let m = Matrix3(result.t50());
+    let adapted = m.multiply(diagonal(neutral)).apply(balanced);
+    for (a, b) in adapted.into_iter().zip(m.apply(rgb)) {
+        assert!((a - b).abs() < 1e-14);
+    }
+}
+
+#[test]
+fn supported_color_profiles_reject_invalid_presence_and_conditioning() {
+    let resolver = StrictMotionCamForwardMatrixColorV2::new().unwrap();
+    let p = StrictColorProfileProvenance::from_source_sha256([7; 32]);
+    let base = serde_json::json!({"colorIlluminant1":17,"colorIlluminant2":23,
+        "colorMatrix1":[1,0,0,0,1,0,0,0,1],"colorMatrix2":[1,0,0,0,1,0,0,0,1],
+        "forwardMatrix1":[],"forwardMatrix2":[]});
+    for (key, value) in [
+        (
+            "forwardMatrix1",
+            serde_json::json!([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+        ),
+        ("forwardMatrix1", serde_json::json!(null)),
+        (
+            "forwardMatrix1",
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        (
+            "colorMatrix1",
+            serde_json::json!([1, 0, 0, 0, 1, 0, 0, 0, 0]),
+        ),
+        (
+            "colorMatrix1",
+            serde_json::json!([1, 0, 0, 0, 1, 0, 0, 0, 0.000001]),
+        ),
+        ("colorIlluminant1", serde_json::json!("unknown")),
+    ] {
+        let mut json = base.clone();
+        json[key] = value;
+        assert!(
+            resolver
+                .parse_supported_profile(&json.to_string(), p)
+                .is_err(),
+            "{key}"
+        );
+    }
+    let profile = resolver
+        .parse_supported_profile(&base.to_string(), p)
+        .unwrap();
+    for neutral in [[0.0, 1.0, 1.0], [-1.0, 1.0, 1.0], [f64::NAN, 1.0, 1.0]] {
+        let f = StrictMotionCamFrameColorInput::from_raw(RawCamera2FrameColor {
+            source_frame_index: 0,
+            as_shot_neutral: Some(neutral),
+            provenance: p,
+        });
+        assert!(resolver.resolve(&profile, &f).is_err());
+    }
+}
+
+#[test]
+fn color_matrix_only_nonconvergence_retains_iteration_limit() {
+    let row = parse_tsv(F64_VECTORS)
+        .into_iter()
+        .find(|row| row.get("expected_failure") == "WHITE_SOLVE_NONCONVERGENT")
+        .unwrap();
+    let p = StrictColorProfileProvenance::from_source_sha256([7; 32]);
+    let (mut raw, frame) = input_from_row(&row, p, 0);
+    for slot in &mut raw.slots {
+        slot.forward_matrix = None;
+    }
+    let resolver = StrictMotionCamForwardMatrixColorV2::new().unwrap();
+    let profile = resolver.validate_supported_profile(raw).unwrap();
+    assert!(matches!(
+        resolver.resolve(&profile, &frame),
+        Err(StrictMotionCamColorError::WhiteSolveNonconvergent { iterations: 64 })
+    ));
+}

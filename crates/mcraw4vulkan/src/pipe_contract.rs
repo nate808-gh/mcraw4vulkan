@@ -636,7 +636,7 @@ impl PipeSidecarV3 {
             "correction_policy_id": PIPE_CORRECTION_POLICY_ID,
             "correction_terminal_id": PIPE_CORRECTION_TERMINAL_ID,
             "correction_mode": self.correction_mode,
-            "color_policy_id": PIPE_COLOR_POLICY_ID,
+            "color_policy_id": self.strict_color_context_identity.get("policy_id").and_then(Value::as_str).unwrap_or(PIPE_COLOR_POLICY_ID),
             "scene_normalization_id": PIPE_SCENE_NORMALIZATION_ID,
             "source_payload_geometry_identity": self.source_payload_geometry_identity,
             "strict_color_context_identity": self.strict_color_context_identity,
@@ -762,7 +762,14 @@ impl PipeSidecarV3 {
             "correction_terminal_id",
             PIPE_CORRECTION_TERMINAL_ID,
         )?;
-        require_string_equal(object, "color_policy_id", PIPE_COLOR_POLICY_ID)?;
+        match object.get("color_policy_id").and_then(Value::as_str) {
+            Some(
+                PIPE_COLOR_POLICY_ID
+                | "StrictMotionCamColorMatrixColorV1"
+                | "MixedMotionCamColorProfilesV1",
+            ) => {}
+            _ => return Err(PipeContractError::new("unsupported PIPE color policy")),
+        }
         require_string_equal(
             object,
             "scene_normalization_id",

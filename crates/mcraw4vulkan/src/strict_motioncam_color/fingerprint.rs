@@ -109,11 +109,16 @@ impl ColorContextFingerprintV2 {
 /// fingerprint record and does not rerun the color solve.
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredColorContextFingerprintV2 {
+    policy_name: &'static str,
+    policy_digest: [u8; 32],
     record: Vec<u8>,
     source_sha256_offset: usize,
 }
 
 impl DeferredColorContextFingerprintV2 {
+    pub(crate) fn policy_identity(&self) -> (&'static str, [u8; 32]) {
+        (self.policy_name, self.policy_digest)
+    }
     pub(crate) fn finalize(
         mut self,
         source_sha256: ClipSourceSha256,
@@ -189,6 +194,8 @@ impl StrictMotionCamForwardMatrixColorV2 {
                 facts,
             },
             DeferredColorContextFingerprintV2 {
+                policy_name: profile.policy_name(),
+                policy_digest: self.policy_digest_for(profile).bytes(),
                 record,
                 source_sha256_offset,
             },
@@ -228,9 +235,13 @@ impl StrictMotionCamForwardMatrixColorV2 {
         }
 
         let mut output = Vec::with_capacity(801);
-        output.extend_from_slice(CONTEXT_MAGIC);
+        output.extend_from_slice(if profile.is_color_matrix_only() {
+            b"mcraw4vulkan:StrictMotionCamColorMatrixColorV1:context\0".as_slice()
+        } else {
+            CONTEXT_MAGIC
+        });
         push_u32(&mut output, CONTEXT_SCHEMA);
-        output.extend_from_slice(&self.policy_digest().bytes());
+        output.extend_from_slice(&self.policy_digest_for(profile).bytes());
         output.push(match facts.numeric_domain {
             PipeF32BayerNumericDomain::RelativeLinearCorrectedCodeV1 => 1,
         });
@@ -275,7 +286,12 @@ impl StrictMotionCamForwardMatrixColorV2 {
                     push_i64(&mut output, *value);
                 }
             }
-            let presence = 0b101
+            let presence = 0b001
+                | if slot.forward_matrix.is_some() {
+                    0b100
+                } else {
+                    0
+                }
                 | if slot.camera_calibration.is_some() {
                     0b010
                 } else {
@@ -291,12 +307,9 @@ impl StrictMotionCamForwardMatrixColorV2 {
             if let Some(camera_calibration) = slot.camera_calibration {
                 append_matrix(&mut output, camera_calibration.values);
             }
-            append_matrix(
-                &mut output,
-                slot.forward_matrix
-                    .ok_or(StrictMotionCamColorError::ContextIdentityMismatch)?
-                    .values,
-            );
+            if let Some(forward_matrix) = slot.forward_matrix {
+                append_matrix(&mut output, forward_matrix.values);
+            }
         }
         match profile.raw.analog_balance {
             None => output.push(0),
@@ -375,6 +388,8 @@ mod tests {
         deferred_record.extend_from_slice(&ClipSourceSha256::deferred_stream_identity().bytes());
         deferred_record.extend_from_slice(b"suffix");
         let deferred = DeferredColorContextFingerprintV2 {
+            policy_name: "StrictMotionCamForwardMatrixColorV2",
+            policy_digest: super::super::policy::EXPECTED_POLICY_DIGEST,
             record: deferred_record,
             source_sha256_offset,
         };

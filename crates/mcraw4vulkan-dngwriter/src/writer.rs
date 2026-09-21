@@ -353,6 +353,16 @@ fn build_ifd_entries(
         entry_long(TAG_ACTIVE_AREA, &[0, 0, height, width])?,
     ];
 
+    if let Some(matrix) = description.camera_calibration1 {
+        entries.push(entry_srational_f64(50723, &matrix.values)?);
+    }
+    if let Some(matrix) = description.camera_calibration2 {
+        entries.push(entry_srational_f64(50724, &matrix.values)?);
+    }
+    if let Some(balance) = description.analog_balance {
+        entries.push(entry_rational_f64(50727, &balance)?);
+    }
+
     if let Some(as_shot_neutral) = description.as_shot_neutral {
         entries.push(entry_rational_f64(TAG_AS_SHOT_NEUTRAL, &as_shot_neutral)?);
     }
@@ -930,6 +940,66 @@ mod tests {
     };
 
     #[test]
+    fn source_calibration_tags_preserve_frame_slots_and_optional_presence() {
+        use mcraw4vulkan_mcrawcontainer::{ContainerMetadata, FrameMetadata};
+        let container = ContainerMetadata::parse(
+            r#"{
+            "sensorArrangment":"rggb", "blackLevel":16, "whiteLevel":4095,
+            "colorIlluminant1":"standarda", "colorIlluminant2":"d50",
+            "colorMatrix1":[1,0,0,0,1,0,0,0,1],
+            "colorMatrix2":[2,0,0,0,2,0,0,0,2],
+            "forwardMatrix1":[], "forwardMatrix2":[],
+            "calibrationMatrix1":[], "calibrationMatrix2":[]
+        }"#,
+        )
+        .unwrap();
+        let frame = FrameMetadata::parse(
+            r#"{
+            "width":2, "height":2, "asShotNeutral":[0.5,1,0.75],
+            "colorIlluminant1":"d50", "colorIlluminant2":"standarda",
+            "colorMatrix1":[3,0,0,0,3,0,0,0,3],
+            "calibrationMatrix1":[1.1,-0.1,0,0,1,0,0,0,0.9],
+            "analogBalance":[1.25,1,0.8]
+        }"#,
+        )
+        .unwrap();
+        let description =
+            DngFrameDescription::from_metadata(&container, &frame, FrameNumber(0), 0).unwrap();
+        assert_eq!(description.calibration_illuminant1, 23);
+        assert_eq!(description.calibration_illuminant2, 17);
+        assert_eq!(description.color_matrix1.unwrap().values[0], 3.0);
+        assert_eq!(description.color_matrix2.unwrap().values[0], 2.0);
+        assert!(description.forward_matrix1.is_none());
+        assert!(description.forward_matrix2.is_none());
+        assert!(description.camera_calibration2.is_none());
+        let writer = DngWriter::new(DngWriterConfig::default());
+        let bytes = write_samples_to_vec(&writer, &description, &[0, 16, 4095, 4096]).unwrap();
+        assert_eq!(
+            srational_tag_values(&bytes, 50723),
+            vec![
+                (11, 10),
+                (-1, 10),
+                (0, 1),
+                (0, 1),
+                (1, 1),
+                (0, 1),
+                (0, 1),
+                (0, 1),
+                (9, 10)
+            ]
+        );
+        assert_eq!(
+            rational_tag_values(&bytes, 50727),
+            vec![(5, 4), (1, 1), (4, 5)]
+        );
+        let count = usize::from(read_u16(&bytes, 8));
+        let tags: Vec<_> = (0..count).map(|i| read_u16(&bytes, 10 + i * 12)).collect();
+        assert!(!tags.contains(&50724));
+        assert!(!tags.contains(&50964));
+        assert!(!tags.contains(&50965));
+    }
+
+    #[test]
     fn le_byte_path_without_sample_shift_remains_byte_for_byte_identical() {
         let samples = [0_u16, 1, 1023, 4095];
         let pixel_bytes = le_bytes(&samples);
@@ -1147,6 +1217,9 @@ mod tests {
         dng_sample_left_shift: u8,
     ) -> DngFrameDescription {
         DngFrameDescription {
+            camera_calibration1: None,
+            camera_calibration2: None,
+            analog_balance: None,
             frame_number: FrameNumber(0),
             timestamp_us: 0,
             dimensions: FrameDimensions {
