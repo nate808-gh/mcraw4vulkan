@@ -3193,3 +3193,340 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod display_consumer_tests {
+    use super::*;
+    use crate::strict_motioncam_color::{
+        StrictMotionCamForwardMatrixColorV2, StrictMotionCamFrameColorInput,
+    };
+    use mcraw4vulkan_mcrawcontainer::{RawCamera2FrameColor, StrictColorProfileProvenance};
+
+    fn read_preview(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Result<Vec<u8>> {
+        let row = (texture.width() * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DISPLAY test readback"),
+            size: u64::from(row * texture.height()),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(texture.height()),
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()??;
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut result = Vec::new();
+        for y in 0..texture.height() as usize {
+            result.extend_from_slice(
+                &mapped[y * row as usize..y * row as usize + texture.width() as usize * 4],
+            );
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok(result)
+    }
+
+    fn color_site(pattern: BayerPattern, x: usize, y: usize) -> usize {
+        let order = match pattern {
+            BayerPattern::Rggb => [0, 1, 1, 2],
+            BayerPattern::Bggr => [2, 1, 1, 0],
+            BayerPattern::Grbg => [1, 0, 2, 1],
+            BayerPattern::Gbrg => [1, 2, 0, 1],
+        };
+        order[(y % 2) * 2 + x % 2]
+    }
+
+    // Independent f64 expected matrix coefficients: DNG 1.7.1 pp101-103,
+    // Bradford to D50, then the accepted DISPLAY D50/D65/sRGB constants.
+    // The oracle below never obtains its expected coefficients from the resolver.
+    #[test]
+    #[ignore = "requires native Vulkan; run explicitly with --ignored"]
+    fn native_display_texture_levels_color_and_transitions() -> Result<()> {
+        let gpu = GpuDecodeBackend::new_blocking(GpuDecodeConfig {
+            backend_preference: GpuBackendPreference::VulkanOnly,
+            ..Default::default()
+        })?;
+        let device = gpu.device();
+        let queue = gpu.queue();
+        let mut renderer = GpuPreviewTextureRenderer::new(device)?;
+        let mut corrector = gpu.create_vignette_corrector()?;
+        let input = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("DISPLAY test synthetic Bayer"),
+            size: 64 * 32 * 2,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cases = [
+            (
+                serde_json::json!({"calibrationMatrix1": [], "calibrationMatrix2": [], "colorIlluminant1": "standarda", "colorIlluminant2": "d50", "colorMatrix1": [1.2998528480529783, -0.6473193764686584, -0.23189862072467804, -0.4558799862861634, 1.5135526657104492, -0.026957394555211067, -0.0401490218937397, 0.14424245059490204, 0.639920711517334], "colorMatrix2": [0.9567329287528992, -0.37969985604286194, -0.12928318977355957, -0.42201220989227295, 1.3089888095855713, 0.08943350613117218, -0.09921766817569733, 0.21017061173915863, 0.4672312140464782], "forwardMatrix1": [], "forwardMatrix2": []}),
+                [0.49558377265930176, 1.0, 0.4800187647342682],
+                16.0,
+                4095.0,
+                [
+                    2.826976521308058,
+                    -0.33835951141355763,
+                    -0.06829279811937394,
+                    -0.4230202226258615,
+                    1.356214247515617,
+                    -0.2439219874916806,
+                    0.09830488885552437,
+                    -0.6409585797412846,
+                    3.378322797712671,
+                ],
+            ),
+            (
+                serde_json::json!({"calibrationMatrix1": [], "calibrationMatrix2": [], "colorIlluminant1": "standarda", "colorIlluminant2": "d50", "colorMatrix1": [1.0871776342391968, -0.45682844519615173, -0.14677995443344116, -0.4628916084766388, 1.416070818901062, 0.281456857919693, -0.025839736685156826, 0.0994599387049675, 0.7301111817359924], "colorMatrix2": [0.7368335127830505, -0.21727709472179413, -0.0872536152601242, -0.4603245258331299, 1.224907636642456, 0.19741053879261017, -0.08208777010440826, 0.1363314390182495, 0.47301334142684937], "forwardMatrix1": [], "forwardMatrix2": []}),
+                [0.44931986927986145, 1.0, 0.4794568717479706],
+                132.0,
+                1024.0,
+                [
+                    3.8436917024517583,
+                    -0.6395545526492326,
+                    -0.05764906825777083,
+                    -0.42598597354258066,
+                    1.5678191768239316,
+                    -0.6610628202969209,
+                    0.12738483447532722,
+                    -0.5159776708607066,
+                    3.1663666175247083,
+                ],
+            ),
+        ];
+        let mut first_outputs = Vec::new();
+        let mut restored_outputs = Vec::new();
+        for (visit, case_index) in [0, 1, 0].into_iter().enumerate() {
+            let (profile, neutral, black, white, expected_matrix) = &cases[case_index];
+            let provenance = StrictColorProfileProvenance::from_source_sha256([0; 32]);
+            let resolver = StrictMotionCamForwardMatrixColorV2::new()?;
+            let profile = resolver.parse_supported_profile(&profile.to_string(), provenance)?;
+            let context = StrictMotionCamFrameColorInput::from_raw(RawCamera2FrameColor {
+                source_frame_index: 0,
+                as_shot_neutral: Some(*neutral),
+                provenance,
+            });
+            let adapted = GpuRenderColorParams::from_camera_to_xyz_d50(
+                resolver.resolve(&profile, &context)?.t50(),
+            )?;
+            assert_eq!(adapted.white_balance_rgb, [1.0; 3]);
+            for pattern in [
+                BayerPattern::Rggb,
+                BayerPattern::Bggr,
+                BayerPattern::Grbg,
+                BayerPattern::Gbrg,
+            ] {
+                let facts = DisplayFrameFacts {
+                    dimensions: FrameDimensions {
+                        width: 64,
+                        height: 32,
+                    },
+                    payload_layout: FramePayloadLayout::CompressedRawcodecType7,
+                    bayer_pattern: pattern,
+                    black_level: [*black; 4],
+                    white_level: *white,
+                    source_bits: source_bits_from_white_level(*white),
+                    lens_shading_map: Some(LensShadingMap::new(2, 2, vec![vec![1.0; 4]; 4])?),
+                    as_shot_neutral: Some(*neutral),
+                    color_metadata: GpuRenderColorMetadata::default(),
+                    adapted_color: Some(adapted),
+                };
+                // Black, several neutrals, nonneutral color, gradient, and raw boundaries.
+                for case in 0..10 {
+                    let mut samples = vec![0u16; 64 * 32];
+                    for y in 0..32 {
+                        for x in 0..64 {
+                            let channel = color_site(pattern, x, y);
+                            let signal = match case {
+                                0 => 0.0,
+                                1 => 0.01 * neutral[channel],
+                                2 => 0.1 * neutral[channel],
+                                3 => 0.5 * neutral[channel],
+                                4 => [0.11, 0.16, 0.21][channel],
+                                5 => (0.02 + 0.4 * x as f64 / 63.0) * neutral[channel],
+                                _ => 0.0,
+                            };
+                            samples[y * 64 + x] = match case {
+                                6 => (*black as u16).saturating_sub(1),
+                                7 => *black as u16 + 1,
+                                8 => *white as u16 - 1,
+                                9 => *white as u16 + 1,
+                                _ => (f64::from(*black) + signal * f64::from(*white - *black))
+                                    .round() as u16,
+                            };
+                        }
+                    }
+                    let bytes: Vec<_> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    queue.write_buffer(&input, 0, &bytes);
+                    for mode in [
+                        DisplayCliVignette::NoCorrection,
+                        DisplayCliVignette::WithCorrection,
+                    ] {
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        let mut config =
+                            facts.preview_config(mode, PreviewScaleMode::FullResolution)?;
+                        let mut expected_samples: Vec<f64> =
+                            samples.iter().map(|v| f64::from(*v)).collect();
+                        let render_input = if mode == DisplayCliVignette::WithCorrection {
+                            let fixed = facts.fixed_facts_enabled()?;
+                            let map = corrector
+                                .ensure_compact_gain_map_from_fixed_facts(device, queue, &fixed)?;
+                            let params = GpuVignetteCorrectionParams::from_fixed_facts(&fixed)?;
+                            let output = corrector.dispatch_packed_u16(
+                                GpuVignettePackedU16DispatchInput {
+                                    device,
+                                    queue,
+                                    encoder: &mut encoder,
+                                    input_buffer: &input,
+                                    input_buffer_bytes: 4096,
+                                    uploaded_gain_map: &map,
+                                    params,
+                                },
+                            )?;
+                            // Unity map: independently evaluate accepted source-range expansion
+                            // and its Q16 gain rounding, without invoking a CPU corrector.
+                            let limit = f64::from((*white as u16) * 4 + 3);
+                            let scale = (limit as f32 / (*white - *black)) as f64;
+                            let q = (scale * 65536.0).round();
+                            for v in &mut expected_samples {
+                                *v = (((*v - f64::from(*black)).max(0.0) * q / 65536.0) + 0.5)
+                                    .floor()
+                                    .min(limit);
+                            }
+                            output.output.buffer().clone()
+                        } else {
+                            input.clone()
+                        };
+                        queue.submit([encoder.finish()]);
+                        for transfer in [false, true] {
+                            config.color.apply_srgb_transfer = transfer;
+                            let mut encoder = device.create_command_encoder(&Default::default());
+                            renderer.encode_render_to_texture(
+                                device,
+                                queue,
+                                &mut encoder,
+                                &render_input,
+                                4096,
+                                config,
+                            )?;
+                            queue.submit([encoder.finish()]);
+                            let actual = read_preview(device, queue, renderer.texture()?)?;
+                            let sample = |x: usize, y: usize| {
+                                let v = expected_samples[y * 64 + x];
+                                if mode == DisplayCliVignette::NoCorrection {
+                                    ((v - f64::from(*black)) / f64::from(*white - *black))
+                                        .clamp(0.0, 1.0)
+                                } else {
+                                    v / f64::from(*white)
+                                }
+                            };
+                            // Independently select neighbors by their CFA color. Border replication
+                            // is deliberately excluded; this test covers four interior CFA phases.
+                            for y in 2..30 {
+                                for x in 2..62 {
+                                    let mut rgb = [0.0; 3];
+                                    for (channel, value) in rgb.iter_mut().enumerate() {
+                                        if color_site(pattern, x, y) == channel {
+                                            *value = sample(x, y);
+                                        } else {
+                                            let cross =
+                                                [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)];
+                                            let corners = [
+                                                (x - 1, y - 1),
+                                                (x + 1, y - 1),
+                                                (x - 1, y + 1),
+                                                (x + 1, y + 1),
+                                            ];
+                                            let positions = if cross.iter().any(|&(xx, yy)| {
+                                                color_site(pattern, xx, yy) == channel
+                                            }) {
+                                                cross
+                                            } else {
+                                                corners
+                                            };
+                                            let selected: Vec<_> = positions
+                                                .into_iter()
+                                                .filter(|&(xx, yy)| {
+                                                    color_site(pattern, xx, yy) == channel
+                                                })
+                                                .collect();
+                                            *value = selected
+                                                .iter()
+                                                .map(|&(xx, yy)| sample(xx, yy))
+                                                .sum::<f64>()
+                                                / selected.len() as f64;
+                                        }
+                                    }
+                                    let mut linear = [0.0; 3];
+                                    for (c, v) in linear.iter_mut().enumerate() {
+                                        *v = (0..3)
+                                            .map(|j| expected_matrix[c * 3 + j] * rgb[j])
+                                            .sum::<f64>()
+                                            .max(0.0);
+                                    }
+                                    if mode == DisplayCliVignette::WithCorrection {
+                                        let peak = linear.iter().copied().fold(1.0, f64::max);
+                                        for v in &mut linear {
+                                            *v /= peak;
+                                        }
+                                    }
+                                    for c in 0..3 {
+                                        let v = linear[c].clamp(0.0, 1.0);
+                                        let encoded = if !transfer {
+                                            v
+                                        } else if v <= 0.0031308 {
+                                            12.92 * v
+                                        } else {
+                                            1.055 * v.powf(1.0 / 2.4) - 0.055
+                                        };
+                                        let expected = (255.0 * encoded).round() as i32;
+                                        let got = i32::from(actual[(y * 64 + x) * 4 + c]);
+                                        assert!(
+                                            (got - expected).abs() <= 1,
+                                            "case={case_index}/{case} CFA={pattern:?} mode={mode:?} transfer={transfer} xy={x},{y} channel={c}: {got} != {expected}"
+                                        );
+                                    }
+                                }
+                            }
+                            if visit == 0 {
+                                first_outputs.push(actual);
+                            } else if visit == 2 {
+                                restored_outputs.push(actual);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            first_outputs, restored_outputs,
+            "profile/level/map state must not leak across transitions"
+        );
+        Ok(())
+    }
+}

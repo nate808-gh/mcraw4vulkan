@@ -390,15 +390,6 @@ impl StrictMotionCamForwardMatrixColorV2 {
         self.policy_digest
     }
 
-    pub fn parse_and_validate_profile(
-        &self,
-        container_metadata_json: &str,
-        provenance: StrictColorProfileProvenance,
-    ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
-        let raw = RawCamera2ColorProfile::parse(container_metadata_json, provenance)?;
-        self.validate_profile(raw)
-    }
-
     /// Select a validated profile by source calibration availability. The V2
     /// entry points retain their frozen ForwardMatrix-only acceptance contract.
     pub fn parse_supported_profile(
@@ -455,6 +446,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
         ))
     }
 
+    #[cfg(test)]
     pub fn validate_profile(
         &self,
         raw: RawCamera2ColorProfile,
