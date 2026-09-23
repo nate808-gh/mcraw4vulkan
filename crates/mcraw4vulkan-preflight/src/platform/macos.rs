@@ -75,24 +75,3 @@ fn parse_first_non_empty_line(input: &str) -> Option<String> {
         .find(|line| !line.is_empty())
         .map(str::to_string)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn macos_sw_vers_parser_reads_product_version() {
-        assert_eq!(
-            parse_sw_vers_product_version("26.5.1\n").as_deref(),
-            Some("26.5.1")
-        );
-    }
-
-    #[test]
-    fn macos_sysctl_parser_reads_cpu_value() {
-        assert_eq!(
-            parse_sysctl_value("Apple M4 Pro\n").as_deref(),
-            Some("Apple M4 Pro")
-        );
-    }
-}

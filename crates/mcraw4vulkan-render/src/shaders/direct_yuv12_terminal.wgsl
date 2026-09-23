@@ -1,13 +1,13 @@
-// Bindings and terminal for direct normalized BT.2020-NCL to tightly packed
+// Bindings and terminal for original Apple Log / BT.2020 NCL to tightly packed
 // planar TV-range 12-bit codes. The host source-composes the shared signed
 // Bayer demosaic at the marked insertion point below.
 
 struct DirectYuv12Params {
     // width, height, Bayer-pattern tag, plane words
     dimensions_pattern_plane: vec4<u32>,
-    camera_to_ncl_row0: vec4<f32>,
-    camera_to_ncl_row1: vec4<f32>,
-    camera_to_ncl_row2: vec4<f32>,
+    camera_to_bt2020_row0: vec4<f32>,
+    camera_to_bt2020_row1: vec4<f32>,
+    camera_to_bt2020_row2: vec4<f32>,
 };
 
 struct DirectYuv12Status {
@@ -51,12 +51,24 @@ fn load_pipe_f32_bayer_index(index: u32) -> f32 {
 
 // __SIGNED_BAYER_DEMOSAIC_WGSL__
 
-// Direct normalized BT.2020-NCL to tightly packed planar TV-range 12-bit codes.
-// This terminal deliberately performs no metadata resolution, white balance,
-// OETF, tone map, gamut map, pre-NCL clamp, or intermediate RGB storage.
+// Original Apple Log on unscaled scene-linear BT.2020/D65 RGB, then NCL.
+// Metadata, white balance and calibration are resolved on the host.
+// No tone/gamut mapping, extra exposure scale or intermediate RGB storage.
+// Constants: ACES original Apple Log reference, commit
+// 2331f7d915c13ae99a5c203393bace972816c413 (see NOTICE).
+fn direct_yuv12_apple_log(x: f32) -> f32 {
+    if (x < -0.05641088) {
+        return 0.0;
+    }
+    if (x < 0.01) {
+        let t = x + 0.05641088;
+        return 47.28711236 * t * t;
+    }
+    return 0.08550479 * log2(x + 0.00964052) + 0.69336945;
+}
 
 const DIRECT_YUV12_NONFINITE_CAMERA: u32 = 1u;
-const DIRECT_YUV12_NONFINITE_NCL: u32 = 2u;
+const DIRECT_YUV12_NONFINITE_COLOR: u32 = 2u;
 const DIRECT_YUV12_NONFINITE_MAPPED: u32 = 4u;
 
 struct DirectYuv12PixelCodes {
@@ -158,21 +170,33 @@ fn direct_yuv12_pixel(x: u32, y: u32) -> DirectYuv12PixelCodes {
         camera = vec3<f32>(0.0);
     }
 
-    let ncl0 = direct_yuv12_checked_row_dot(
-        direct_yuv12_params.camera_to_ncl_row0.xyz,
+    let rgb0 = direct_yuv12_checked_row_dot(
+        direct_yuv12_params.camera_to_bt2020_row0.xyz,
         camera,
     );
-    let ncl1 = direct_yuv12_checked_row_dot(
-        direct_yuv12_params.camera_to_ncl_row1.xyz,
+    let rgb1 = direct_yuv12_checked_row_dot(
+        direct_yuv12_params.camera_to_bt2020_row1.xyz,
         camera,
     );
-    let ncl2 = direct_yuv12_checked_row_dot(
-        direct_yuv12_params.camera_to_ncl_row2.xyz,
+    let rgb2 = direct_yuv12_checked_row_dot(
+        direct_yuv12_params.camera_to_bt2020_row2.xyz,
         camera,
     );
-    var ncl = vec3<f32>(ncl0.value, ncl1.value, ncl2.value);
-    if (ncl0.failed || ncl1.failed || ncl2.failed || !direct_yuv12_vec3_finite(ncl)) {
-        failure_bits |= DIRECT_YUV12_NONFINITE_NCL;
+    var rgb = vec3<f32>(rgb0.value, rgb1.value, rgb2.value);
+    if (rgb0.failed || rgb1.failed || rgb2.failed || !direct_yuv12_vec3_finite(rgb)) {
+        failure_bits |= DIRECT_YUV12_NONFINITE_COLOR;
+        rgb = vec3<f32>(0.0);
+    }
+    let encoded = vec3<f32>(
+        direct_yuv12_apple_log(rgb.x),
+        direct_yuv12_apple_log(rgb.y),
+        direct_yuv12_apple_log(rgb.z),
+    );
+    let y_prime = dot(encoded, vec3<f32>(0.2627, 0.6780, 0.0593));
+    var ncl = vec3<f32>(y_prime, (encoded.z - y_prime) / 1.8814,
+        (encoded.x - y_prime) / 1.4746);
+    if (!direct_yuv12_vec3_finite(encoded) || !direct_yuv12_vec3_finite(ncl)) {
+        failure_bits |= DIRECT_YUV12_NONFINITE_COLOR;
         ncl = vec3<f32>(0.0);
     }
 
@@ -192,6 +216,10 @@ fn direct_yuv12_pixel(x: u32, y: u32) -> DirectYuv12PixelCodes {
     );
     if (!direct_yuv12_codes_valid(codes)) {
         failure_bits |= DIRECT_YUV12_NONFINITE_MAPPED;
+        codes = vec3<u32>(256u, 2048u, 2048u);
+    }
+    if (failure_bits != 0u) {
+        // Diagnostic placeholder only: the scheduler rejects this frame.
         codes = vec3<u32>(256u, 2048u, 2048u);
     }
     return DirectYuv12PixelCodes(codes, failure_bits);

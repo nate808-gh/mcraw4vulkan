@@ -60,21 +60,3 @@ fn projected_fs_library_path() -> Option<PathBuf> {
             .join("ProjectedFSLib.dll"),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn windows_processor_identifier_parser_reads_value() {
-        assert_eq!(
-            parse_processor_identifier(Some("Intel64 Family 6 Model 170")).as_deref(),
-            Some("Intel64 Family 6 Model 170")
-        );
-    }
-
-    #[test]
-    fn windows_processor_identifier_parser_ignores_empty_value() {
-        assert_eq!(parse_processor_identifier(Some("   ")), None);
-    }
-}

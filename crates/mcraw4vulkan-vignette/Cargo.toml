@@ -18,5 +18,3 @@ mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
 mcraw4vulkan-mcrawcontainer = { path = "../mcraw4vulkan-mcrawcontainer" }
 wgpu.workspace = true
 
-[dev-dependencies]
-pollster.workspace = true

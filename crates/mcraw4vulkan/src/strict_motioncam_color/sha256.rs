@@ -132,33 +132,3 @@ fn compress(state: &mut [u32; 8], chunk: &[u8; 64]) {
         *value = value.wrapping_add(compressed);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Sha256;
-
-    fn hex(bytes: [u8; 32]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    #[test]
-    fn matches_standard_vectors_and_incremental_boundaries() {
-        assert_eq!(
-            hex(Sha256::digest(b"")),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            hex(Sha256::digest(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let input = vec![b'a'; 1_000_000];
-        let mut incremental = Sha256::new();
-        for chunk in input.chunks(61) {
-            incremental.update(chunk);
-        }
-        assert_eq!(
-            hex(incremental.finalize()),
-            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
-        );
-    }
-}

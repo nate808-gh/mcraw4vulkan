@@ -25,6 +25,7 @@ pub use dng_mount::{
 };
 pub use pipe_cli::pipe_example_facts_for_input;
 pub use pipe_contract::{
-    PipeAspectRatio, PipeAudioContractV3, PipeContractError, PipeExampleFacts, PipeMovCadence,
-    PipeSidecarV3, validate_pipe_sidecar_v3,
+    PIPE_AUDIO_FILE_SUFFIX, PIPE_METADATA_FILE_SUFFIX, PIPE_OUTPUT_STEM_SUFFIX,
+    PIPE_PRORES_FILE_SUFFIX, PIPE_PRORES_SIDECAR_SUFFIX, PipeAspectRatio, PipeAudioContractV4,
+    PipeContractError, PipeExampleFacts, PipeMovCadence, PipeSidecarV4, validate_pipe_sidecar_v4,
 };

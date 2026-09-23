@@ -7,7 +7,7 @@ mcraw4vulkan is a Rust application for displaying and processing MotionCam RAW
 
 ## Public Beta status
 
-This source tree is a public Beta. Preserve original recordings and validate
+This source tree is Beta 0.9.1. Preserve original recordings and validate
 outputs before relying on them in a production workflow. Interfaces and package
 details may change as Beta feedback is incorporated.
 
@@ -26,8 +26,8 @@ optimizer workflows.
 - CLI and GUI applications.
 - Quick Preview and full decoded Display playback.
 - Direct planar `yuv444p12le` PIPE output with TV range, BT.2020 primaries,
-  linear transfer, BT.2020 NCL matrix coefficients, no alpha, and a fixed 1/2
-  scene-linear signal scale. Supported input audio is extracted through the
+  AppleLog transfer, BT.2020 NCL matrix coefficients, and no alpha channel.
+  Supported input audio is extracted through the
   existing WAV sidecar path.
 - Virtual DNG mounting with the platform's native filesystem adapter.
 - Audio playback and virtual audio files where the input and platform support
@@ -80,19 +80,77 @@ Launch the graphical interface through the preflight checker:
 mcraw4vulkan-preflight-check --gui mcraw4vulkan-gui
 ```
 
-Write the direct-YUV byte stream and version-3 metadata beside an output file:
+Write the direct-YUV byte stream and version-4 metadata beside an output file:
 
 ```sh
 mcraw4vulkan pipe --output clip.yuv444p12le FILE.mcraw
 ```
 
-PIPE is a scene-linear editing derivative intended for grading. It is not
-display-ready and may appear dark until exposure and a display transform are
-applied in the editor; mcraw4vulkan does not add display exposure, an OETF, or
-tone mapping. The GUI Pipe Example feeds these bytes to FFmpeg as-is and uses
-Vulkan ProRes 4444 profile 4 with no color-conversion filter and no alpha.
-ProRes remains lossy. Virtual DNG remains the camera-domain preservation
-output.
+`--output` applies the shared Apple Log filename stem; shell redirection uses
+the filename chosen by the shell.
+
+PIPE always encodes **original Apple Log / BT.2020 D65 / BT.2020 NCL / TV
+range**, with 12 meaningful bits in little-endian 16-bit planar Y/Cb/Cr lanes
+(4:4:4, six storage bytes per pixel). It is an editing encoding, not a
+display-ready image. Manually assign **Rec.2020** and **AppleLog** in the editor. Do not select Apple Log 2 or Apple Wide Gamut.
+
+
+The GUI Pipe Example feeds already encoded pixels to FFmpeg. Linux/Windows
+use Vulkan ProRes 4444 profile 4; macOS uses VideoToolbox after
+ a required conversion to `p410le` (ten meaningful bits in 16-bit storage). ProRes is lossy.
+The examples set `-color_primaries bt2020 -colorspace bt2020nc -color_range tv
+-color_trc 2 -movflags +write_colr`. Transfer tag 2 is deliberately unspecified:
+it does not automatically identify Apple Log. Neither the sidecar nor the
+filename guarantees automatic editor recognition.
+
+Version 0.9.1 replaces the previous half-scale linear transfer function. Sidecars use
+`metadata_version=4` and algorithm
+`mcraw-yuv444p12le-tv-bt2020-apple-log-original-ncl-v1`; video, JSON and audio
+names share `-BT2020-AppleLog-original-tv`. Display, RAW decoding and
+camera-domain DNG remain unchanged; Apple Log assignment is only for PIPE YUV444 video,
+not DNG files.
+
+### PIPE numerical contract
+
+Signed linear correction, demosaic and camera-to-BT.2020 conversion occur
+before the component transfer, without the former final half-signal scale.
+For each finite BT.2020 component `x`, original Apple Log is:
+
+```text
+R0=-0.05641088; Rt=0.01; c=47.28711236
+beta=0.00964052; gamma=0.08550479; delta=0.69336945
+F(x) = 0                                  x < R0
+       c*(x-R0)^2                         R0 <= x < Rt
+       gamma*log2(x+beta)+delta            x >= Rt
+```
+
+Physical zero encodes near 0.15047645 (neutral Y=783), middle gray `x=0.18`
+near 0.48827246 (Y=1967), and `x=5.76` near 0.90956672 (Y=3443).
+The physical gray target in a recording is not automatically normalized to
+0.18. Components below R0 collapse to R0 after inversion; finite upper
+excursions are retained until terminal packing. NaN, infinity and arithmetic
+overflow fail the frame. Apple Log and integer packing are not lossless, and
+shadow code spacing is not constant throughout the toe.
+
+For transferred components `R',G',B'`, `Y'=0.2627R'+0.6780G'+0.0593B'`,
+`Cb=(B'-Y')/1.8814`, `Cr=(R'-Y')/1.4746`. Map Y with `256+3504Y'` and chroma
+with `2048+3584C`. Clamp each plane to 16..4079, then round with
+`floor(value+0.5)`; no dithering. Nominal Y is 256..3760 and nominal chroma
+256..3840, centered at 2048. Colored components may saturate a chroma plane
+before neutral luma reaches its limit.
+
+To reconstruct, remove the limited-range offsets/scales, invert BT.2020 NCL,
+then apply the original component inverse. With `Pt=c*(Rt-R0)^2`:
+
+```text
+G(v) = R0                                 v < 0
+       sqrt(v/c)+R0                       0 <= v < Pt
+       exp2((v-delta)/gamma)-beta          v >= Pt
+```
+
+Do not subtract F(0), add one stop, or insert an ACES gamut conversion.
+The sidecar records the constants, domain, packing and reconstruction order.
+The reference and its revision are attributed in `NOTICE`.
 
 Run `mcraw4vulkan --help` for the complete current command syntax.
 

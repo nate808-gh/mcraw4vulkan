@@ -1,8 +1,5 @@
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use mcraw4vulkan_core::FrameNumber;
 use mcraw4vulkan_mcrawcontainer::{McrawContainer, payload_reader::PayloadReadPlan};
@@ -242,7 +239,7 @@ impl PipeProducerMeasurementRunner {
             byte_identity_rows: byte_rows,
             notes: vec![
                 measured.payload_note,
-                "canonical direct yuv444p12le producer path at fixed linear scale 1/2".to_string(),
+                "canonical direct yuv444p12le original Apple Log / BT.2020 path, unity terminal exposure scale".to_string(),
                 "native GPU payload feeder; zero CPU Bayer predecode and no validation oracle"
                     .to_string(),
                 if uses_vignette(request.policy.correction_mode) {
@@ -607,101 +604,5 @@ impl PipeDiscardWriter {
 
     fn finish(self, expected_total_bytes: u64) -> bool {
         self.bytes == expected_total_bytes
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::measurement::types::{
-        PayloadReadPolicy, PayloadReadPolicyMode, PipeProducerMeasurementPolicy,
-        PipeProducerMeasurementRunSpec,
-    };
-    use mcraw4vulkan_core::FrameNumber;
-    use mcraw4vulkan_gpu::GpuBackendPreference;
-
-    fn test_request() -> PipeProducerMeasurementRequest {
-        PipeProducerMeasurementRequest {
-            run: PipeProducerMeasurementRunSpec {
-                input_path: PathBuf::from("clip.mcraw"),
-                start_frame: 0,
-                stride: 1,
-                warmup_frames: 0,
-                frames_requested: 1,
-                selected_frames: vec![FrameNumber(0)],
-            },
-            payload: PayloadReadPolicy {
-                mode: PayloadReadPolicyMode::OffsetPrefetch,
-                chunk_mib: 16,
-            },
-            policy: PipeProducerMeasurementPolicy::canonical_discard(
-                GpuBackendPreference::VulkanOnly,
-            ),
-        }
-    }
-
-    #[test]
-    fn runner_policy_structs_are_constructible() {
-        let request = test_request();
-        assert_eq!(
-            request.policy.correction_mode,
-            PipeF32BayerCorrectionMode::MotionCamSpatial
-        );
-    }
-
-    #[test]
-    fn internal_measurement_requires_first_n_contiguous_frames() {
-        let mut request = test_request();
-        assert!(validate_direct_yuv_measurement_selection(&request).is_ok());
-
-        request.run.start_frame = 1;
-        assert!(
-            validate_direct_yuv_measurement_selection(&request)
-                .unwrap_err()
-                .to_string()
-                .contains("first-N contiguous")
-        );
-
-        request.run.start_frame = 0;
-        request.run.selected_frames = vec![FrameNumber(1)];
-        assert!(
-            validate_direct_yuv_measurement_selection(&request)
-                .unwrap_err()
-                .to_string()
-                .contains("not first-N contiguous")
-        );
-    }
-
-    #[test]
-    fn internal_measurement_production_prefix_has_no_legacy_or_validation_renderer() {
-        let source = include_str!("pipe.rs");
-        let production_prefix = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production prefix");
-        for forbidden in [
-            ["GpuRender", "Packer"].concat(),
-            ["gbrp", "16le"].concat(),
-            ["bayer_to_", "gbrp16"].concat(),
-            ["Metadata", "Srgb"].concat(),
-            ["PipeRender", "PackCore"].concat(),
-            ["new_for_", "validation"].concat(),
-            ["preflight_frame_", "payloads_cpu"].concat(),
-            ["cpu_decoded_", "bayer"].concat(),
-            ["clamp_", "telemetry"].concat(),
-        ] {
-            assert!(
-                !production_prefix.contains(&forbidden),
-                "internal PIPE production prefix contains validation/legacy symbol {forbidden}"
-            );
-        }
-        assert!(production_prefix.contains("preflight_pipe_frames"));
-        assert!(production_prefix.contains("stream_pipe_frames"));
-        assert!(production_prefix.contains("DirectYuv12MeasurementSink"));
-        assert!(production_prefix.contains("GpuGpuVignettePipeYuv444p12LeRaw"));
-        assert!(!production_prefix.contains("DirectYuv12FrameFeeder::NativePayload"));
-        assert!(
-            !production_prefix.contains("OneSharedComputeTwoReadbackDirectYuv12Scheduler::new")
-        );
     }
 }

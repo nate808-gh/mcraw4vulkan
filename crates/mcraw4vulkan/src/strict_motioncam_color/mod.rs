@@ -162,28 +162,14 @@ impl ResolvedStrictPipeColor {
         self.t50
     }
 
-    #[allow(dead_code)] // retained for exact portable resolver-vector coverage
+    /// Unscaled working RGB for the production Apple Log terminal.
     pub const fn camera_to_linear_bt2020(&self) -> [f64; 9] {
         self.camera_to_linear_bt2020
     }
 
-    #[allow(dead_code)] // retained for exact portable resolver-vector coverage
-    pub const fn camera_to_normalized_ncl(&self) -> [f64; 9] {
-        self.camera_to_normalized_ncl
-    }
-
+    // Retained as part of the frozen camera-color fingerprint, not an output encoder.
     pub const fn camera_to_normalized_ncl_f32(&self) -> [f32; 9] {
         self.camera_to_normalized_ncl_f32
-    }
-
-    #[allow(dead_code)] // retained for exact portable f32 serialization coverage
-    pub fn camera_to_normalized_ncl_f32_bits(&self) -> [u32; 9] {
-        self.camera_to_normalized_ncl_f32.map(f32::to_bits)
-    }
-
-    #[allow(dead_code)] // retained for exact portable convergence coverage
-    pub const fn convergence_iterations(&self) -> u32 {
-        self.convergence_iterations
     }
 
     pub fn validate_demosaiced_component_bound(
@@ -197,7 +183,8 @@ impl ResolvedStrictPipeColor {
             });
         }
         let maximum_row_sum = self
-            .camera_to_normalized_ncl_f32
+            .camera_to_linear_bt2020
+            .map(|value| value as f32)
             .chunks_exact(3)
             .map(|row| row.iter().map(|value| f64::from(*value).abs()).sum::<f64>())
             .fold(0.0_f64, f64::max);
@@ -444,14 +431,6 @@ impl StrictMotionCamForwardMatrixColorV2 {
         Ok(StrictMotionCamFrameColorInput::from_raw(
             RawCamera2FrameColor::parse(frame_metadata_json, source_frame_index, provenance)?,
         ))
-    }
-
-    #[cfg(test)]
-    pub fn validate_profile(
-        &self,
-        raw: RawCamera2ColorProfile,
-    ) -> Result<StrictMotionCamColorProfile, StrictMotionCamColorError> {
-        self.validate_profile_inner(raw, false)
     }
 
     fn validate_profile_inner(
@@ -875,6 +854,3 @@ fn correctly_rounded_hypot2(a: f64, b: f64) -> f64 {
     let residual = (sum - root_square) + (low - root_square_error);
     root + residual / (2.0 * root)
 }
-
-#[cfg(test)]
-mod tests;

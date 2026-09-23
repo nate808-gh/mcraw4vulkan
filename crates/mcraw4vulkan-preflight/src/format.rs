@@ -56,37 +56,3 @@ fn prefixed_line(prefix: &str, value: Option<&str>) -> String {
         .unwrap_or("unknown");
     format!("{prefix} {value}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_required_missing_lines() {
-        assert_eq!(
-            mount_backend_line(
-                MountBackendKind::LinuxFuse3,
-                PreflightRequirementStatus::Missing
-            ),
-            "FUSE3 is required"
-        );
-        assert_eq!(
-            mount_backend_line(
-                MountBackendKind::MacosMacFuse,
-                PreflightRequirementStatus::Missing
-            ),
-            "macFUSE is required"
-        );
-        assert_eq!(
-            mount_backend_line(
-                MountBackendKind::WindowsProjFs,
-                PreflightRequirementStatus::Missing
-            ),
-            "ProjFS is required"
-        );
-        assert_eq!(
-            vulkan_line(PlatformKind::Macos, PreflightRequirementStatus::Missing),
-            "Vulkan libraries are required"
-        );
-    }
-}

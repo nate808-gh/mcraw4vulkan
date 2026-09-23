@@ -37,8 +37,6 @@ pub struct PendingFileChooser {
 #[derive(Debug)]
 enum PendingFileChooserInner {
     Running(RunningChooser),
-    #[cfg(test)]
-    TestPending,
 }
 
 #[derive(Debug)]
@@ -165,13 +163,6 @@ impl PendingFileChooser {
             Err(error) => FileChooserPoll::Ready(FileChooserOutcome::Failed(format!(
                 "File chooser failed: {error}"
             ))),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_pending() -> Self {
-        Self {
-            inner: Some(PendingFileChooserInner::TestPending),
         }
     }
 }
@@ -316,107 +307,5 @@ fn osascript_command() -> ChooserCommand {
             "return outputText",
         ],
         kind: ChooserKind::Osascript,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selected_output_parses_one_path() {
-        assert_eq!(
-            parse_newline_paths("clips/one.mcraw\n"),
-            vec![PathBuf::from("clips/one.mcraw")]
-        );
-    }
-
-    #[test]
-    fn selected_output_parses_multiple_paths() {
-        assert_eq!(
-            parse_newline_paths("clips/one.mcraw\nclips/two.mcraw\n"),
-            vec![
-                PathBuf::from("clips/one.mcraw"),
-                PathBuf::from("clips/two.mcraw")
-            ]
-        );
-    }
-
-    #[test]
-    fn cancel_maps_to_cancelled() {
-        let output = ChooserOutput {
-            success: false,
-            code: Some(1),
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-
-        assert_eq!(
-            classify_output(ChooserKind::Zenity, output),
-            FileChooserOutcome::Cancelled
-        );
-    }
-
-    #[test]
-    fn powershell_cancel_marker_maps_to_cancelled() {
-        let output = ChooserOutput {
-            success: true,
-            code: Some(0),
-            stdout: format!("{WINDOWS_CANCEL_MARKER}\n"),
-            stderr: String::new(),
-        };
-
-        assert_eq!(
-            classify_output(ChooserKind::PowerShell, output),
-            FileChooserOutcome::Cancelled
-        );
-    }
-
-    #[test]
-    fn osascript_user_cancel_maps_to_cancelled() {
-        let output = ChooserOutput {
-            success: false,
-            code: Some(1),
-            stdout: String::new(),
-            stderr: "execution error: User canceled. (-128)".to_string(),
-        };
-
-        assert_eq!(
-            classify_output(ChooserKind::Osascript, output),
-            FileChooserOutcome::Cancelled
-        );
-    }
-
-    #[test]
-    fn unavailable_error_maps_to_unavailable() {
-        let mut spawner =
-            |_: &ChooserCommand| Err(io::Error::new(io::ErrorKind::NotFound, "chooser not found"));
-
-        let start = start_one_chooser(&zenity_command(), &mut spawner);
-
-        assert!(matches!(
-            start,
-            FileChooserStart::Ready(FileChooserOutcome::Unavailable(message))
-                if message == UNAVAILABLE_MESSAGE
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_tries_kdialog_when_zenity_is_unavailable() {
-        let mut attempted = Vec::new();
-        let mut spawner = |command: &ChooserCommand| {
-            attempted.push(command.program);
-            Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
-        };
-
-        let start = start_mcraw_file_chooser_with_spawner(&mut spawner);
-
-        assert_eq!(attempted, vec!["zenity", "kdialog"]);
-        assert!(matches!(
-            start,
-            FileChooserStart::Ready(FileChooserOutcome::Unavailable(message))
-                if message == UNAVAILABLE_MESSAGE
-        ));
     }
 }

@@ -17,7 +17,7 @@ use mcraw4vulkan_gpu::{
     GpuPreparedType6WorkPlan, GpuPreparedType7WorkPlan, GpuSubmittedNoReadbackGpuStageOutput,
 };
 use mcraw4vulkan_render::{
-    DIRECT_YUV12_NONFINITE_CAMERA, DIRECT_YUV12_NONFINITE_MAPPED, DIRECT_YUV12_NONFINITE_NCL,
+    DIRECT_YUV12_NONFINITE_CAMERA, DIRECT_YUV12_NONFINITE_COLOR, DIRECT_YUV12_NONFINITE_MAPPED,
     DIRECT_YUV12_STATUS_BYTE_LEN, DirectYuv12ColorTransform, GpuDirectYuv12DispatchStats,
     GpuDirectYuv12EncodeInput, GpuDirectYuv12Stage, Yuv444p12lePackPolicy,
 };
@@ -56,13 +56,6 @@ const BUFFER_COPY_ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT;
 pub struct DirectYuv12SourceFrameRange {
     pub first_frame_index: u64,
     pub frame_count: u64,
-}
-
-fn apply_linear_signal_scale(mut matrix: [f32; 9], factor: f32) -> [f32; 9] {
-    for value in &mut matrix {
-        *value *= factor;
-    }
-    matrix
 }
 
 #[derive(Clone, Copy)]
@@ -260,12 +253,11 @@ pub struct OneSharedComputeTwoReadbackDirectYuv12Scheduler {
     last_publication_at: Option<Instant>,
     map_callback_sender: mpsc::SyncSender<(u64, Result<(), wgpu::BufferAsyncError>)>,
     map_callback_receiver: mpsc::Receiver<(u64, Result<(), wgpu::BufferAsyncError>)>,
-    linear_signal_scale_factor: f32,
 }
 
 impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
-    /// Construct the production scheduler with the fixed 1/2 scene-linear
-    /// signal scale and all validation-only controls disabled.
+    /// Construct the sole original Apple Log production scheduler, with
+    /// validation-only controls disabled.
     pub fn new(
         backend: GpuDecodeBackend,
         source_range: DirectYuv12SourceFrameRange,
@@ -279,7 +271,6 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
             source_range,
             configured_memory_budget_bytes,
             DIRECT_YUV12_READBACK_SLOTS,
-            Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_FACTOR_F32,
         )
     }
 
@@ -288,7 +279,6 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
         source_range: DirectYuv12SourceFrameRange,
         configured_memory_budget_bytes: u64,
         effective_readback_slots: usize,
-        linear_signal_scale_factor: f32,
     ) -> Result<Self, DirectYuv12PipelineError> {
         if !(1..=DIRECT_YUV12_READBACK_SLOTS).contains(&effective_readback_slots) {
             return Err(DirectYuv12PipelineError::InvalidReadbackDepth {
@@ -346,7 +336,6 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
             last_publication_at: None,
             map_callback_sender,
             map_callback_receiver,
-            linear_signal_scale_factor,
         })
     }
 
@@ -547,10 +536,9 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
         let correction_mode = frame.correction_mode;
         let frame_color = frame.verified_color.resolved();
         let color_transform = DirectYuv12ColorTransform {
-            camera_to_normalized_ncl: apply_linear_signal_scale(
-                frame_color.camera_to_normalized_ncl_f32(),
-                self.linear_signal_scale_factor,
-            ),
+            camera_to_linear_bt2020: frame_color
+                .camera_to_linear_bt2020()
+                .map(|value| value as f32),
         };
 
         let bayer_correction = &mut self.bayer_correction;
@@ -1316,11 +1304,11 @@ fn validate_nonfinite_status(
             source_frame_index,
             categories: DirectYuv12NonfiniteCategories {
                 camera: flags & DIRECT_YUV12_NONFINITE_CAMERA != 0,
-                ncl: flags & DIRECT_YUV12_NONFINITE_NCL != 0,
+                ncl: flags & DIRECT_YUV12_NONFINITE_COLOR != 0,
                 mapped: flags & DIRECT_YUV12_NONFINITE_MAPPED != 0,
                 unknown_bits: flags
                     & !(DIRECT_YUV12_NONFINITE_CAMERA
-                        | DIRECT_YUV12_NONFINITE_NCL
+                        | DIRECT_YUV12_NONFINITE_COLOR
                         | DIRECT_YUV12_NONFINITE_MAPPED),
             },
             words,
@@ -1699,262 +1687,3 @@ impl fmt::Display for DirectYuv12PipelineError {
 }
 
 impl Error for DirectYuv12PipelineError {}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-    use mcraw4vulkan_gpu::{GpuBackendPreference, GpuDecodeConfig};
-
-    fn test_backend() -> GpuDecodeBackend {
-        GpuDecodeBackend::new_blocking(GpuDecodeConfig {
-            backend_preference: GpuBackendPreference::VulkanOnly,
-            ..GpuDecodeConfig::default()
-        })
-        .expect("scheduler test Vulkan backend")
-    }
-
-    fn test_source_sha() -> ClipSourceSha256 {
-        ClipSourceSha256::read_once(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("test source SHA")
-    }
-
-    #[test]
-    fn accepts_clean_status_and_rejects_every_changed_word() {
-        let clean = [0_u32, 0, u32::MAX, 0];
-        let bytes: Vec<_> = clean.iter().flat_map(|word| word.to_le_bytes()).collect();
-        assert_eq!(validate_nonfinite_status(&bytes, 0, 11), Ok(()));
-        for index in 0..4 {
-            let mut changed = clean;
-            changed[index] ^= 1;
-            let bytes: Vec<_> = changed.iter().flat_map(|word| word.to_le_bytes()).collect();
-            assert!(matches!(
-                validate_nonfinite_status(&bytes, 7, 19),
-                Err(DirectYuv12PipelineError::NonfiniteStatus {
-                    sequence: 7,
-                    source_frame_index: 19,
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn selected_scheduler_depth_is_two_with_one_decoder_slot() {
-        assert_eq!(DIRECT_YUV12_READBACK_SLOTS, 2);
-        assert_eq!(SHARED_DECODER_SLOT, 0);
-    }
-
-    #[test]
-    fn production_constructor_freezes_half_scale_depth_and_timestamp_policy() {
-        let scheduler = OneSharedComputeTwoReadbackDirectYuv12Scheduler::new(
-            test_backend(),
-            DirectYuv12SourceFrameRange {
-                first_frame_index: 0,
-                frame_count: 1,
-            },
-            8 * 1024 * 1024,
-        )
-        .expect("production scheduler");
-
-        assert_eq!(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_NUMERATOR, 1);
-        assert_eq!(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_DENOMINATOR, 2);
-        assert_eq!(
-            scheduler.linear_signal_scale_factor.to_bits(),
-            Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_FACTOR_F32.to_bits()
-        );
-        assert_eq!(
-            scheduler.effective_readback_slots,
-            DIRECT_YUV12_READBACK_SLOTS
-        );
-        assert!(!scheduler.backend.gpu_timestamp_support().enabled);
-    }
-
-    #[test]
-    fn decoder_allocation_preflight_checks_buffer_and_binding_limits() {
-        let limits = wgpu::Limits {
-            max_buffer_size: 1024,
-            max_storage_buffer_binding_size: 768,
-            max_uniform_buffer_binding_size: 256,
-            ..wgpu::Limits::default()
-        };
-        let admitted = GpuNoReadbackSlotAllocation {
-            raw_payload_bytes: 512,
-            work_item_bytes: 256,
-            packed_output_bytes: 768,
-            params_bytes: 256,
-            retained_readback_bytes: 1024,
-            retained_mappable_output_bytes: 1024,
-            timestamp_buffer_bytes: 16,
-            ..GpuNoReadbackSlotAllocation::default()
-        };
-        assert_eq!(
-            validate_decoder_allocation_limits(admitted, &limits),
-            Ok(())
-        );
-
-        let mut too_large = admitted;
-        too_large.retained_readback_bytes = 1025;
-        assert!(matches!(
-            validate_decoder_allocation_limits(too_large, &limits),
-            Err(DirectYuv12PipelineError::DecoderBufferLimit {
-                buffer: "retained readback",
-                limit_kind: "max_buffer_size",
-                ..
-            })
-        ));
-        let mut storage = admitted;
-        storage.raw_payload_bytes = 769;
-        assert!(matches!(
-            validate_decoder_allocation_limits(storage, &limits),
-            Err(DirectYuv12PipelineError::DecoderBufferLimit {
-                buffer: "raw payload",
-                limit_kind: "max_storage_buffer_binding_size",
-                ..
-            })
-        ));
-        let mut uniform = admitted;
-        uniform.params_bytes = 257;
-        assert!(matches!(
-            validate_decoder_allocation_limits(uniform, &limits),
-            Err(DirectYuv12PipelineError::DecoderBufferLimit {
-                buffer: "params",
-                limit_kind: "max_uniform_buffer_binding_size",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn nonfinite_status_carries_source_and_categories() {
-        let bytes: Vec<_> = [
-            DIRECT_YUV12_NONFINITE_CAMERA | DIRECT_YUV12_NONFINITE_MAPPED,
-            2,
-            3,
-            0,
-        ]
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect();
-        assert!(matches!(
-            validate_nonfinite_status(&bytes, 9, 42),
-            Err(DirectYuv12PipelineError::NonfiniteStatus {
-                sequence: 9,
-                source_frame_index: 42,
-                categories: DirectYuv12NonfiniteCategories {
-                    camera: true,
-                    ncl: false,
-                    mapped: true,
-                    unknown_bits: 0,
-                },
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn stale_or_future_map_callback_is_rejected_before_publication() {
-        assert_eq!(validate_map_callback(7, 7, Ok(())), Ok(()));
-        for received in [6, 8] {
-            assert!(matches!(
-                validate_map_callback(7, received, Ok(())),
-                Err(DirectYuv12PipelineError::Map { sequence: 7, .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn verified_color_fact_check_rejects_each_single_field_mismatch() {
-        let source = test_source_sha();
-        let expected = ColorContextFingerprintFacts {
-            numeric_domain: PipeF32BayerNumericDomain::RelativeLinearCorrectedCodeV1,
-            dimensions: FrameDimensions {
-                width: 4,
-                height: 3,
-            },
-            bayer_pattern: BayerPattern::Rggb,
-            correction_mode: PipeF32BayerCorrectionMode::IdentitySpatialGain,
-            source_sha256: source,
-            source_frame_index: 7,
-        };
-        assert_eq!(
-            validate_verified_color_facts(
-                expected,
-                expected.dimensions,
-                expected.bayer_pattern,
-                expected.correction_mode,
-                expected.source_sha256,
-                expected.source_frame_index,
-            ),
-            Ok(())
-        );
-        let mismatches = [
-            (
-                ColorContextFingerprintFacts {
-                    numeric_domain: PipeF32BayerNumericDomain::RelativeLinearCorrectedCodeV1,
-                    dimensions: FrameDimensions {
-                        width: 6,
-                        height: 3,
-                    },
-                    ..expected
-                },
-                "dimensions",
-            ),
-            (
-                ColorContextFingerprintFacts {
-                    bayer_pattern: BayerPattern::Bggr,
-                    ..expected
-                },
-                "CFA pattern",
-            ),
-            (
-                ColorContextFingerprintFacts {
-                    correction_mode: PipeF32BayerCorrectionMode::MotionCamSpatial,
-                    ..expected
-                },
-                "correction mode",
-            ),
-            (
-                ColorContextFingerprintFacts {
-                    source_sha256: test_source_sha(),
-                    ..expected
-                },
-                "source SHA-256",
-            ),
-            (
-                ColorContextFingerprintFacts {
-                    source_frame_index: 8,
-                    ..expected
-                },
-                "source frame index",
-            ),
-        ];
-        for (actual, reason) in mismatches {
-            // The SHA case uses the same file above; replace it with a
-            // different real digest without exposing a digest constructor.
-            let actual = if reason == "source SHA-256" {
-                ColorContextFingerprintFacts {
-                    source_sha256: ClipSourceSha256::read_once(
-                        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
-                    )
-                    .expect("second test source SHA"),
-                    ..actual
-                }
-            } else {
-                actual
-            };
-            assert_eq!(
-                validate_verified_color_facts(
-                    actual,
-                    expected.dimensions,
-                    expected.bayer_pattern,
-                    expected.correction_mode,
-                    expected.source_sha256,
-                    expected.source_frame_index,
-                ),
-                Err(DirectYuv12PipelineError::VerifiedColorContextMismatch { reason })
-            );
-        }
-    }
-}

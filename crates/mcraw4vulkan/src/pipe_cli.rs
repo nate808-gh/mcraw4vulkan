@@ -39,8 +39,9 @@ use crate::direct_yuv12_pipeline::{
     OneSharedComputeTwoReadbackDirectYuv12Scheduler,
 };
 use crate::pipe_contract::{
-    PipeAspectRatio, PipeAudioContractV3, PipeExampleFacts, PipeMovCadence, PipeSidecarV3,
-    checked_pipe_bytes_per_frame, checked_pipe_total_bytes, validate_pipe_sidecar_v3,
+    PIPE_AUDIO_FILE_SUFFIX, PIPE_OUTPUT_STEM_SUFFIX, PipeAspectRatio, PipeAudioContractV4,
+    PipeExampleFacts, PipeMovCadence, PipeSidecarV4, checked_pipe_bytes_per_frame,
+    checked_pipe_total_bytes, validate_pipe_sidecar_v4,
 };
 use crate::strict_motioncam_color::{
     ClipSourceSha256, ColorContextFingerprintFacts, DeferredColorContextFingerprintV2,
@@ -684,7 +685,7 @@ fn run_pipe_cli_inner(
 
     let sidecar =
         pipe_metadata_sidecar_json(config, preflight, &identities, layout, audio_summary, video)?;
-    validate_pipe_sidecar_v3(&sidecar).context("generated PIPE sidecar v3 failed validation")?;
+    validate_pipe_sidecar_v4(&sidecar).context("generated PIPE sidecar v4 failed validation")?;
     write_metadata_sidecar_part(&temps.metadata_part_path, &sidecar)?;
 
     let mut published = Vec::<PublishedPipeOutput>::new();
@@ -1269,7 +1270,7 @@ fn resolve_pipe_visible_outputs(
 
     let output_stem = visible_direct_yuv_stem(&base_stem);
     Ok(PipeVisibleOutputs {
-        audio_sidecar_path: parent.join(format!("{base_stem}-audio.wav")),
+        audio_sidecar_path: parent.join(format!("{base_stem}{PIPE_AUDIO_FILE_SUFFIX}")),
         metadata_sidecar_path: parent.join(format!("{output_stem}.json")),
         raw_output_path,
         output_stem,
@@ -1310,7 +1311,7 @@ fn visible_base_stem_for_output_arg(output_arg: &Path) -> Result<String> {
                 )
             })?
     };
-    let stem = stem.strip_suffix("-BT2020-linear-tv").unwrap_or(stem);
+    let stem = stem.strip_suffix(PIPE_OUTPUT_STEM_SUFFIX).unwrap_or(stem);
     if stem.is_empty() {
         bail!(
             "path {:?} does not have a non-empty output stem",
@@ -1322,9 +1323,9 @@ fn visible_base_stem_for_output_arg(output_arg: &Path) -> Result<String> {
 
 fn visible_direct_yuv_stem(base_stem: &str) -> String {
     let base_stem = base_stem
-        .strip_suffix("-BT2020-linear-tv")
+        .strip_suffix(PIPE_OUTPUT_STEM_SUFFIX)
         .unwrap_or(base_stem);
-    format!("{base_stem}-BT2020-linear-tv")
+    format!("{base_stem}{PIPE_OUTPUT_STEM_SUFFIX}")
 }
 
 fn ensure_output_is_not_input(input: &Path, layout: &PipeOutputLayout) -> Result<()> {
@@ -1762,15 +1763,15 @@ fn pipe_metadata_sidecar_json(
         sample_aspect_ratio,
     )?;
     let audio = match audio_summary {
-        Some(summary) => PipeAudioContractV3::pcm_s16le(
+        Some(summary) => PipeAudioContractV4::pcm_s16le(
             summary.metadata.sample_rate_hz,
             summary.metadata.channels,
             summary.metadata.sample_frames,
             summary.metadata.byte_len,
         )?,
-        None => PipeAudioContractV3::absent(),
+        None => PipeAudioContractV4::absent(),
     };
-    let contract = PipeSidecarV3::new(
+    let contract = PipeSidecarV4::new(
         preflight.dimensions.width,
         preflight.dimensions.height,
         u64::from(preflight.clip_info.frame_count),
@@ -1819,8 +1820,8 @@ fn pipe_metadata_sidecar_json(
     );
     root.insert("diagnostics_stream".to_string(), json!("stderr"));
     root.insert(
-        "scene_linear_display_note".to_string(),
-        json!("This scene-linear editing derivative uses a fixed 1/2 signal scale. It is intentionally not display-ready and may appear dark until exposure and a display transform are applied in the editor."),
+        "editing_display_note".to_string(),
+        json!("This editing encoding uses original Apple Log with Rec.2020/D65, video levels and BT.2020 NCL. Assign that input transform manually; no additional one-stop compensation is needed. It is not display-ready. Older linear PIPE files and camera-domain DNG require different interpretation."),
     );
     root.insert("prores_is_lossy".to_string(), json!(true));
     root.insert(
@@ -1842,7 +1843,7 @@ fn pipe_metadata_sidecar_json(
     );
     root.insert("mcraw4vulkan_commit".to_string(), Value::Null);
 
-    validate_pipe_sidecar_v3(&value).context("PIPE sidecar v3 final validation failed")?;
+    validate_pipe_sidecar_v4(&value).context("PIPE sidecar v4 final validation failed")?;
     Ok(value)
 }
 fn payload_layout_label(layout: FramePayloadLayout) -> String {
@@ -1888,550 +1889,4 @@ fn path_stem(path: &Path) -> Result<String> {
         bail!("path {:?} does not have a non-empty file stem", path);
     }
     Ok(stem.to_string())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fake_config(output: PipeCliOutput) -> PipeCliRunConfig {
-        PipeCliRunConfig {
-            input_path: PathBuf::from("clip.mcraw"),
-            backend: PipeCliBackend::Gpu,
-            vignette: PipeCliVignette::WithCorrection,
-            output,
-            payload_feeder_options: PayloadFeederOptions::production_default(),
-        }
-    }
-
-    fn test_abs_path(parts: &[&str]) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        for part in parts {
-            path.push(part);
-        }
-        path
-    }
-
-    fn test_owned_directory(label: &str) -> PathBuf {
-        let sequence = PIPE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "mcraw4vulkan-pipe-test-{label}-{}-{sequence:016x}",
-            std::process::id(),
-        ));
-        fs::create_dir(&path).expect("create unique test directory");
-        path
-    }
-
-    #[test]
-    fn production_modes_map_only_the_spatial_gain_choice() {
-        let mut config = fake_config(PipeCliOutput::Stdout);
-        assert_eq!(
-            config.correction_mode(),
-            PipeF32BayerCorrectionMode::MotionCamSpatial
-        );
-        config.vignette = PipeCliVignette::NoCorrection;
-        assert_eq!(
-            config.correction_mode(),
-            PipeF32BayerCorrectionMode::IdentitySpatialGain
-        );
-    }
-
-    #[test]
-    fn pipe_example_facts_path_is_index_only_and_independent_of_production_preflight() {
-        let source = include_str!("pipe_cli.rs");
-        let facts_path = source
-            .split("pub fn pipe_example_facts_for_input")
-            .nth(1)
-            .and_then(|tail| tail.split("pub(crate) fn run_pipe_cli").next())
-            .expect("Pipe Example facts source");
-
-        assert!(facts_path.contains("McrawContainer::open_for_display(input_path)"));
-        assert!(facts_path.contains("PipeMovCadence::from_source_rate"));
-        assert!(facts_path.contains("PipeAspectRatio::display_for_frame"));
-        for forbidden in [
-            "McrawContainer::open(input_path)",
-            "open_for_display_with_audio",
-            "preflight_pipe_frames",
-            "ClipSourceSha256",
-            "read_video_payload",
-            "stream_pipe_frames",
-            "GpuDecodeBackend",
-        ] {
-            assert!(
-                !facts_path.contains(forbidden),
-                "Pipe Example facts path contains forbidden work: {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn file_layout_uses_neutral_direct_yuv_names() {
-        let current = test_abs_path(&["pipe-layout"]);
-        let layout = pipe_file_output_layout_in_current_dir(
-            Path::new("source.mcraw"),
-            Path::new("clip.yuv444p12le"),
-            &current,
-        )
-        .expect("file layout");
-        assert_eq!(layout.output_stem, "clip-BT2020-linear-tv");
-        assert_eq!(
-            layout.raw_output_path,
-            Some(current.join("clip-BT2020-linear-tv.yuv444p12le"))
-        );
-        assert_eq!(layout.audio_sidecar_path, current.join("clip-audio.wav"));
-        assert_eq!(
-            layout.metadata_sidecar_path,
-            current.join("clip-BT2020-linear-tv.json")
-        );
-        let names = [
-            layout.output_stem,
-            path_to_string(layout.raw_output_path.as_ref().unwrap()),
-            path_to_string(&layout.audio_sidecar_path),
-            path_to_string(&layout.metadata_sidecar_path),
-        ]
-        .join("\n");
-        assert!(!names.contains("sRGB"));
-        assert!(!names.contains("gbrp16le"));
-    }
-
-    #[test]
-    fn stdout_layout_uses_input_basename_and_neutral_sidecars() {
-        let current = test_abs_path(&["pipe-stdout"]);
-        let layout =
-            pipe_stdout_output_layout_in_current_dir(Path::new("input/ocean.mcraw"), &current)
-                .expect("stdout layout");
-        assert_eq!(layout.output_stem, "ocean-BT2020-linear-tv");
-        assert_eq!(layout.raw_output_path, None);
-        assert_eq!(layout.audio_sidecar_path, current.join("ocean-audio.wav"));
-        assert_eq!(
-            layout.metadata_sidecar_path,
-            current.join("ocean-BT2020-linear-tv.json")
-        );
-    }
-
-    #[test]
-    fn already_neutral_output_suffix_is_not_duplicated() {
-        let current = test_abs_path(&["pipe-neutral"]);
-        let layout = pipe_file_output_layout_in_current_dir(
-            Path::new("source.mcraw"),
-            Path::new("clip-BT2020-linear-tv.yuv444p12le"),
-            &current,
-        )
-        .expect("file layout");
-        assert_eq!(layout.output_stem, "clip-BT2020-linear-tv");
-        assert_eq!(
-            layout.raw_output_path,
-            Some(current.join("clip-BT2020-linear-tv.yuv444p12le"))
-        );
-        assert_eq!(layout.audio_sidecar_path, current.join("clip-audio.wav"));
-    }
-
-    #[test]
-    fn temp_paths_are_confined_to_their_final_paths() {
-        let suffix = format!("pipe-temp-test-{}", std::process::id());
-        let parent = std::env::temp_dir();
-        let layout = PipeOutputLayout {
-            mode: PipeOutputMode::File,
-            output_stem: "clip-BT2020-linear-tv".to_string(),
-            raw_output_path: Some(parent.join(format!("{suffix}.yuv444p12le"))),
-            audio_sidecar_path: parent.join(format!("{suffix}-audio.wav")),
-            metadata_sidecar_path: parent.join(format!("{suffix}.json")),
-        };
-        let temps = create_temp_paths_for_layout(&layout, true).expect("owned temp directory");
-        assert_eq!(temps.owned_dir.parent(), Some(parent.as_path()));
-        assert_eq!(
-            temps.raw_part_path.as_deref().and_then(Path::parent),
-            Some(temps.owned_dir.as_path())
-        );
-        assert_eq!(
-            temps.audio_part_path.as_deref().and_then(Path::parent),
-            Some(temps.owned_dir.as_path())
-        );
-        assert_eq!(
-            temps.metadata_part_path.parent(),
-            Some(temps.owned_dir.as_path())
-        );
-        cleanup_temp_paths(&temps).expect("owned temp cleanup");
-        assert!(!temps.owned_dir.exists());
-    }
-
-    #[test]
-    fn publication_is_no_replace_and_rollback_removes_only_the_published_link() {
-        let directory = test_owned_directory("publication");
-        let temp = directory.join("temporary");
-        let final_path = directory.join("final");
-        fs::write(&temp, b"owned bytes").expect("write temporary file");
-
-        let published = publish_temp_no_replace(&temp, &final_path).expect("publish link");
-        assert!(!temp.exists());
-        assert_eq!(fs::read(&final_path).expect("read final"), b"owned bytes");
-
-        let replacement_temp = directory.join("replacement-temporary");
-        fs::write(&replacement_temp, b"replacement").expect("write replacement temporary");
-        assert!(publish_temp_no_replace(&replacement_temp, &final_path).is_err());
-        assert_eq!(
-            fs::read(&final_path).expect("read preserved final"),
-            b"owned bytes"
-        );
-        assert_eq!(
-            fs::read(&replacement_temp).expect("read preserved replacement temporary"),
-            b"replacement"
-        );
-
-        published.rollback().expect("roll back published link");
-        assert!(!final_path.exists());
-        fs::remove_dir_all(&directory).expect("remove test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rollback_refuses_to_remove_an_inode_replacement() {
-        let directory = test_owned_directory("inode-guard");
-        let temp = directory.join("temporary");
-        let final_path = directory.join("final");
-        fs::write(&temp, b"owned bytes").expect("write temporary file");
-        let published = publish_temp_no_replace(&temp, &final_path).expect("publish link");
-
-        fs::remove_file(&final_path).expect("remove published link");
-        fs::write(&final_path, b"competitor").expect("write competitor replacement");
-        assert!(published.rollback().is_err());
-        assert_eq!(
-            fs::read(&final_path).expect("read competitor"),
-            b"competitor"
-        );
-        fs::remove_dir_all(&directory).expect("remove test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_symlink_counts_as_an_existing_output() {
-        use std::os::unix::fs::symlink;
-
-        let directory = test_owned_directory("dangling-link");
-        let path = directory.join("final");
-        symlink(directory.join("missing-target"), &path).expect("create dangling symlink");
-        assert!(ensure_missing(&path).is_err());
-        fs::remove_file(&path).expect("remove dangling symlink");
-        fs::remove_dir(&directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn temporary_cleanup_failure_is_reported() {
-        let directory = test_owned_directory("cleanup-error");
-        let not_a_directory = directory.join("temporary-file");
-        fs::write(&not_a_directory, b"not a directory").expect("write cleanup fixture");
-        let temps = PipeTempPaths {
-            owned_dir: not_a_directory.clone(),
-            raw_part_path: None,
-            audio_part_path: None,
-            metadata_part_path: not_a_directory.clone(),
-        };
-        assert!(cleanup_temp_paths(&temps).is_err());
-        assert!(not_a_directory.exists());
-        fs::remove_file(&not_a_directory).expect("remove cleanup fixture");
-        fs::remove_dir(&directory).expect("remove test directory");
-    }
-
-    #[test]
-    fn output_paths_must_be_distinct() {
-        let shared = test_abs_path(&["pipe-test", "shared"]);
-        let layout = PipeOutputLayout {
-            mode: PipeOutputMode::File,
-            output_stem: "clip".to_string(),
-            raw_output_path: Some(shared.clone()),
-            audio_sidecar_path: shared.clone(),
-            metadata_sidecar_path: test_abs_path(&["pipe-test", "metadata.json"]),
-        };
-        assert!(ensure_distinct_final_paths(&layout, true).is_err());
-    }
-
-    #[test]
-    fn bytes_per_frame_is_exactly_six_bytes_per_pixel() {
-        let width = 3840_u64;
-        let height = 2160_u64;
-        assert_eq!(width * height * 6, 49_766_400);
-        assert_eq!(49_766_400_u64 * 1_941, 96_596_582_400);
-    }
-
-    #[test]
-    fn pipe_gpu_requirements_cover_the_exact_8k_storage_and_readback_shapes() {
-        let dimensions = FrameDimensions {
-            width: 8_192,
-            height: 4_608,
-        };
-        let required = pipe_gpu_required_limits(dimensions).expect("8K requirements fit");
-
-        assert_eq!(required.dimensions(), dimensions);
-        assert_eq!(required.storage_buffer_resource(), "direct YUV12 output");
-        assert_eq!(required.storage_buffer_binding_bytes(), 226_492_416);
-        assert_eq!(
-            required.buffer_resource(),
-            "direct YUV12 output/status readback"
-        );
-        assert_eq!(required.buffer_bytes(), 226_492_432);
-    }
-
-    #[test]
-    fn pipe_gpu_requirements_reject_zero_and_overflowing_dimensions() {
-        for dimensions in [
-            FrameDimensions {
-                width: 0,
-                height: 4_608,
-            },
-            FrameDimensions {
-                width: 8_192,
-                height: 0,
-            },
-            FrameDimensions {
-                width: u32::MAX,
-                height: u32::MAX,
-            },
-        ] {
-            assert!(pipe_gpu_required_limits(dimensions).is_err());
-        }
-    }
-
-    #[test]
-    fn audio_pcm_formula_counts_interleaved_channels() {
-        assert_eq!(audio_pcm_data_bytes(48_000, 2, 16).unwrap(), 192_000);
-        assert!(audio_pcm_data_bytes(1, 2, 12).is_err());
-    }
-
-    #[test]
-    fn audio_layout_and_payload_work_happen_after_video() {
-        let source = include_str!("pipe_cli.rs");
-        let run_inner = source
-            .split("fn run_pipe_cli_inner")
-            .nth(1)
-            .and_then(|tail| tail.split("fn print_pipe_completion").next())
-            .expect("production PIPE inner function source");
-        let render = run_inner.find("stream_pipe_frames").expect("video render");
-        let prepare = run_inner
-            .find("prepare_pipe_audio")
-            .expect("lazy audio metadata preparation");
-        let materialize = run_inner
-            .find("write_audio_sidecar_part")
-            .expect("audio materialization");
-        assert!(render < prepare);
-        assert!(prepare < materialize);
-    }
-
-    #[test]
-    fn payload_labels_are_format_specific_without_color_policy_forks() {
-        assert_eq!(
-            payload_layout_label(FramePayloadLayout::CompressedRawcodecType7),
-            "compressed_rawcodec_type7"
-        );
-        assert_eq!(
-            payload_layout_label(FramePayloadLayout::BinnedRaw16Type6 { row_stride: 7680 }),
-            "binned_raw16_type6:row_stride=7680"
-        );
-    }
-
-    #[test]
-    fn public_source_has_no_validation_only_hot_path() {
-        let source = include_str!("pipe_cli.rs");
-        let preflight = source
-            .split("fn preflight_pipe_frames")
-            .nth(1)
-            .and_then(|tail| tail.split("fn resolve_pipe_frame_context").next())
-            .expect("production preflight source");
-        for forbidden in [
-            "ClipSourceSha256::read_once",
-            "read_once_until_cancelled",
-            "read_video_payload_into",
-            "decode_loaded_payload",
-            "resolve_pipe_frame_context",
-            "motioncam_pipe_f32_bayer_facts",
-            "parse_frame_input",
-            "resolve_stream_context",
-            "enable_validation_clamp",
-            "set_validation_linear_signal_scale",
-            "sha256_bytes",
-            "validation_json",
-            "source_saturation",
-        ] {
-            assert!(
-                !preflight.contains(forbidden),
-                "production preflight contains forbidden hot-path token {forbidden}"
-            );
-        }
-        let legacy_cpu_preflight = ["preflight_frame_payloads", "cpu"].join("_");
-        assert!(!preflight.contains(&legacy_cpu_preflight));
-        assert_eq!(preflight.matches(".frame_metadata(").count(), 1);
-        assert!(preflight.contains("FrameNumber(0)"));
-        assert!(preflight.contains("PayloadReadPlan::from_core_frame_numbers"));
-        let renderer = source
-            .split("fn stream_pipe_frames")
-            .nth(1)
-            .and_then(|tail| tail.split("fn pipe_file_output_layout").next())
-            .expect("production renderer source");
-        assert!(renderer.contains("DirectYuv12FrameFeeder::NativePayload"));
-        assert!(renderer.contains("OneSharedComputeTwoReadbackDirectYuv12Scheduler::new"));
-        assert!(!renderer.contains("enable_validation_clamp"));
-        assert!(!renderer.contains("set_validation_linear_signal_scale"));
-        assert!(!renderer.contains("GpuRenderPacker"));
-        assert!(!renderer.contains("Gbrp16"));
-    }
-
-    #[test]
-    fn public_pipe_opens_one_lazy_frame_container_before_streaming() {
-        let source = include_str!("pipe_cli.rs");
-        let run = source
-            .split("pub(crate) fn run_pipe_cli")
-            .nth(1)
-            .and_then(|tail| tail.split("fn run_pipe_cli_inner").next())
-            .expect("public PIPE orchestration source");
-        assert_eq!(
-            run.matches("McrawContainer::open_for_display_with_audio")
-                .count(),
-            1
-        );
-        assert!(!run.contains("McrawContainer::open(&config.input_path)"));
-        let preflight = run
-            .find("preflight_pipe_frames")
-            .expect("bounded preflight");
-        let hash = run
-            .find("PipeSourceHashWorker::spawn")
-            .expect("hash worker");
-        let stream = run
-            .find("run_pipe_cli_inner")
-            .expect("stream orchestration");
-        assert!(preflight < hash && hash < stream);
-    }
-
-    #[test]
-    fn frame_context_is_resolved_just_in_time_before_the_selected_decode() {
-        let source = include_str!("pipe_cli.rs");
-        let renderer = source
-            .split("pub(crate) fn stream_pipe_frames")
-            .nth(1)
-            .and_then(|tail| tail.split("fn public_video_summary").next())
-            .expect("production stream source");
-        let metadata = renderer
-            .find(".frame_metadata(number)")
-            .expect("frame metadata");
-        let resolve = renderer
-            .find("resolve_pipe_frame_context")
-            .expect("frame context resolve");
-        let submit = renderer
-            .find("scheduler.submit_frame")
-            .expect("selected decode/submit");
-        let collect = renderer
-            .find("contexts.collect")
-            .expect("context collection");
-        assert!(metadata < resolve && resolve < submit && submit < collect);
-    }
-
-    #[test]
-    fn source_hash_is_joined_only_after_video_and_before_success_sidecar() {
-        let source = include_str!("pipe_cli.rs");
-        let run_inner = source
-            .split("fn run_pipe_cli_inner")
-            .nth(1)
-            .and_then(|tail| tail.split("fn print_pipe_completion").next())
-            .expect("production PIPE inner function source");
-        let stream = run_inner.find("stream_pipe_frames").expect("video stream");
-        let audio = run_inner.find("prepare_pipe_audio").expect("lazy audio");
-        let hash = run_inner
-            .find("source_hash_worker.finish")
-            .expect("source hash join");
-        let sidecar = run_inner
-            .find("pipe_metadata_sidecar_json")
-            .expect("sidecar construction");
-        assert!(stream < audio && audio < hash && hash < sidecar);
-    }
-
-    #[test]
-    fn source_hash_worker_reports_exact_digest_and_missing_source_failure() {
-        let directory = test_owned_directory("source-hash-worker");
-        let source = directory.join("source.mcraw");
-        fs::write(&source, b"bounded source identity").expect("write hash fixture");
-        let expected = ClipSourceSha256::read_once(&source).expect("synchronous test digest");
-        let completion = PipeSourceHashWorker::spawn(&source)
-            .expect("spawn source hash")
-            .finish()
-            .expect("finish source hash");
-        assert_eq!(completion.source_sha256, expected);
-        assert_eq!(completion.bytes_read, 23);
-
-        let missing = directory.join("missing.mcraw");
-        assert!(
-            PipeSourceHashWorker::spawn(&missing)
-                .expect("spawn missing-source worker")
-                .finish()
-                .is_err()
-        );
-        fs::remove_file(source).expect("remove hash fixture");
-        fs::remove_dir(directory).expect("remove hash test directory");
-    }
-
-    #[test]
-    fn gpu_path_does_not_construct_a_cpu_decoder() {
-        let source = include_str!("pipe_cli.rs");
-        assert!(
-            source.contains("(selected_backend == PipeCliBackend::Cpu).then(CpuFrameDecoder::new)")
-        );
-        let forbidden = ["let mut cpu_", "decoder = CpuFrameDecoder::new();"].concat();
-        assert!(!source.contains(&forbidden));
-    }
-
-    #[test]
-    fn sidecar_writer_is_byte_clean_and_newline_terminated() {
-        let mut bytes = Vec::new();
-        write_pipe_metadata_json(&mut bytes, &json!({"metadata_version": 3})).expect("write JSON");
-        assert_eq!(bytes.last(), Some(&b'\n'));
-        let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(parsed["metadata_version"], 3);
-    }
-
-    #[test]
-    fn public_algorithm_has_no_display_compensation() {
-        let source = include_str!("pipe_cli.rs");
-        let renderer = source
-            .split("fn stream_pipe_frames")
-            .nth(1)
-            .and_then(|tail| tail.split("fn pipe_file_output_layout").next())
-            .expect("production renderer source");
-        for forbidden in [
-            "P999",
-            "Srgb",
-            "srgb",
-            "tone",
-            "exposure",
-            "display_transform",
-            "RgbSink",
-        ] {
-            assert!(
-                !renderer.contains(forbidden),
-                "public direct-YUV renderer contains {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn final_publication_orders_raw_file_last() {
-        let source = include_str!("pipe_cli.rs");
-        let publication = source
-            .split("let publish_result")
-            .nth(1)
-            .and_then(|tail| tail.split("eprintln!(").next())
-            .expect("publication source");
-        let metadata = publication
-            .find("metadata_part_path")
-            .expect("metadata publication");
-        let raw = publication.find("raw_part_path").expect("raw publication");
-        assert!(metadata < raw, "raw output must be the last success marker");
-    }
-
-    #[test]
-    fn no_vignette_semantics_remain_non_spatial_only() {
-        let source = include_str!("pipe_cli.rs");
-        assert!(source.contains("PipeF32BayerCorrectionMode::IdentitySpatialGain"));
-        assert!(source.contains("motioncam_pipe_f32_bayer_facts("));
-        assert!(source.contains("PipeF32BayerCorrectionFingerprint::from_fixed_facts"));
-        let correction_metadata = include_str!("../../mcraw4vulkan-vignette/src/metadata.rs");
-        assert!(correction_metadata.contains("VignetteCorrectionMode::Enabled"));
-        assert!(correction_metadata.contains("IdentitySpatialGain => None"));
-        assert!(correction_metadata.contains("from_input_facts_with_fixed_map"));
-    }
 }

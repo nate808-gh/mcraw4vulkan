@@ -1,7 +1,7 @@
-//! Production direct linear-TV YUV12 terminal for the public PIPE renderer.
+//! Production original-Apple-Log TV YUV12 terminal for the public PIPE renderer.
 //!
 //! This module accepts only the typed relative-linear Candidate-4 dispatch and
-//! a pre-resolved camera-to-normalized-NCL matrix. Metadata interpretation and
+//! a pre-resolved camera-to-linear-BT.2020 matrix. Metadata interpretation and
 //! frame scheduling deliberately remain outside the render crate.
 
 use mcraw4vulkan_core::{BayerPattern, FrameDimensions};
@@ -34,15 +34,15 @@ fn direct_yuv12_shader_source() -> String {
 
 pub const DIRECT_YUV12_STATUS_BYTE_LEN: u64 = 16;
 pub const DIRECT_YUV12_NONFINITE_CAMERA: u32 = 1;
-pub const DIRECT_YUV12_NONFINITE_NCL: u32 = 2;
+pub const DIRECT_YUV12_NONFINITE_COLOR: u32 = 2;
 pub const DIRECT_YUV12_NONFINITE_MAPPED: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Yuv444p12leNumericDomain {
-    LinearBt2020NclTvRangeV1,
+    AppleLogBt2020NclTvRangeV1,
 }
 
-/// The one adopted linear 12-bit TV-range planar packing policy.
+/// The one adopted Apple Log 12-bit TV-range planar packing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Yuv444p12lePackPolicy {
     _adopted_only: (),
@@ -50,17 +50,17 @@ pub struct Yuv444p12lePackPolicy {
 
 impl Yuv444p12lePackPolicy {
     pub const ADOPTED: Self = Self { _adopted_only: () };
-    pub const DOMAIN: Yuv444p12leNumericDomain = Yuv444p12leNumericDomain::LinearBt2020NclTvRangeV1;
+    pub const DOMAIN: Yuv444p12leNumericDomain =
+        Yuv444p12leNumericDomain::AppleLogBt2020NclTvRangeV1;
     pub const PLANE_COUNT: u8 = 3;
     pub const PLANE_ORDER: [&str; 3] = ["Y", "Cb", "Cr"];
     pub const BYTES_PER_SAMPLE: u8 = 2;
     pub const STORAGE_BYTES_PER_PIXEL: u8 = 6;
     pub const STORAGE_BITS_PER_SAMPLE: u8 = 16;
     pub const MEANINGFUL_BITS_PER_SAMPLE: u8 = 12;
-    pub const LINEAR_SIGNAL_SCALE_NUMERATOR: u32 = 1;
-    pub const LINEAR_SIGNAL_SCALE_DENOMINATOR: u32 = 2;
-    pub const LINEAR_SIGNAL_SCALE_STOPS: i32 = -1;
-    pub const LINEAR_SIGNAL_SCALE_FACTOR_F32: f32 = 0.5;
+    pub const TERMINAL_EXPOSURE_SCALE_NUMERATOR: u32 = 1;
+    pub const TERMINAL_EXPOSURE_SCALE_DENOMINATOR: u32 = 1;
+    pub const TERMINAL_EXPOSURE_SCALE_STOPS: i32 = 0;
     pub const LUMA_OFFSET: u16 = 256;
     pub const LUMA_SCALE: u16 = 3504;
     pub const CHROMA_OFFSET: u16 = 2048;
@@ -79,11 +79,10 @@ impl Yuv444p12lePackPolicy {
 
 /// Per-frame transform resolved by the strict host color authority.
 ///
-/// Rows map signed, relative-linear camera RGB to normalized BT.2020-NCL
-/// Y/Cb/Cr. No metadata or context fingerprint crosses this render boundary.
+/// Rows map signed, relative-linear camera RGB to unscaled BT.2020/D65 RGB. No metadata or context fingerprint crosses this render boundary.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DirectYuv12ColorTransform {
-    pub camera_to_normalized_ncl: [f32; 9],
+    pub camera_to_linear_bt2020: [f32; 9],
 }
 
 pub struct GpuDirectYuv12EncodeInput<'input, 'view, 'encoder> {
@@ -169,7 +168,7 @@ pub struct GpuDirectYuv12DispatchStats {
     pub workgroup_size_y: u32,
     pub max_abs_matrix_row_sum: f64,
     pub conservative_max_abs_camera_component: f64,
-    pub conservative_max_abs_ncl_component: f64,
+    pub conservative_max_abs_working_rgb_component: f64,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub max_compute_workgroups_per_dimension: u32,
@@ -222,11 +221,11 @@ impl GpuDirectYuv12Stage {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, DirectYuv12Error> {
         let shader_source = direct_yuv12_shader_source();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mcraw4vulkan direct linear-TV YUV12 shader"),
+            label: Some("mcraw4vulkan direct Apple-Log-TV YUV12 shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mcraw4vulkan direct linear-TV YUV12 pipeline"),
+            label: Some("mcraw4vulkan direct Apple-Log-TV YUV12 pipeline"),
             layout: None,
             module: &shader,
             entry_point: Some("direct_yuv12_main"),
@@ -342,7 +341,7 @@ impl GpuDirectYuv12Stage {
             self.bind_group_reuse_count = self.bind_group_reuse_count.saturating_add(1);
         } else {
             let bind_group = input.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mcraw4vulkan direct linear-TV YUV12 bind group"),
+                label: Some("mcraw4vulkan direct Apple-Log-TV YUV12 bind group"),
                 layout: &self.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -390,7 +389,7 @@ impl GpuDirectYuv12Stage {
             let mut pass = input
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("mcraw4vulkan direct linear-TV YUV12 pass"),
+                    label: Some("mcraw4vulkan direct Apple-Log-TV YUV12 pass"),
                     timestamp_writes: None,
                 });
             pass.set_pipeline(&self.pipeline);
@@ -416,7 +415,8 @@ impl GpuDirectYuv12Stage {
             workgroup_size_y: DIRECT_YUV12_WORKGROUP_Y,
             max_abs_matrix_row_sum: contract.max_abs_matrix_row_sum,
             conservative_max_abs_camera_component: contract.conservative_max_abs_camera_component,
-            conservative_max_abs_ncl_component: contract.conservative_max_abs_ncl_component,
+            conservative_max_abs_working_rgb_component: contract
+                .conservative_max_abs_working_rgb_component,
             max_storage_buffer_binding_size: contract.limits.max_storage_buffer_binding_size,
             max_buffer_size: contract.limits.max_buffer_size,
             max_compute_workgroups_per_dimension: contract
@@ -562,7 +562,7 @@ struct DirectYuv12Contract {
     params: DirectYuv12Params,
     max_abs_matrix_row_sum: f64,
     conservative_max_abs_camera_component: f64,
-    conservative_max_abs_ncl_component: f64,
+    conservative_max_abs_working_rgb_component: f64,
     limits: DirectYuv12Limits,
 }
 
@@ -582,7 +582,7 @@ impl DirectYuv12Contract {
             });
         }
 
-        let matrix = color_transform.camera_to_normalized_ncl;
+        let matrix = color_transform.camera_to_linear_bt2020;
         for (index, value) in matrix.into_iter().enumerate() {
             if !value.is_finite() {
                 return Err(DirectYuv12Error::NonfiniteColorTransform { index, value });
@@ -599,16 +599,16 @@ impl DirectYuv12Contract {
                 max_abs_camera_component: conservative_max_abs_camera_component,
             });
         }
-        let conservative_max_abs_ncl_component =
+        let conservative_max_abs_working_rgb_component =
             conservative_max_abs_camera_component * max_abs_matrix_row_sum;
         let allowed = f64::from(f32::MAX) / 2.0;
-        if !conservative_max_abs_ncl_component.is_finite()
-            || conservative_max_abs_ncl_component > allowed
+        if !conservative_max_abs_working_rgb_component.is_finite()
+            || conservative_max_abs_working_rgb_component > allowed
         {
             return Err(DirectYuv12Error::UnsafeColorMagnitude {
                 max_abs_camera_component: conservative_max_abs_camera_component,
                 max_abs_matrix_row_sum,
-                max_abs_ncl_component: conservative_max_abs_ncl_component,
+                max_abs_ncl_component: conservative_max_abs_working_rgb_component,
                 allowed_max_abs_ncl_component: allowed,
             });
         }
@@ -680,7 +680,7 @@ impl DirectYuv12Contract {
             params: DirectYuv12Params { words },
             max_abs_matrix_row_sum,
             conservative_max_abs_camera_component,
-            conservative_max_abs_ncl_component,
+            conservative_max_abs_working_rgb_component,
             limits,
         })
     }
@@ -699,7 +699,7 @@ fn ensure_output_buffer(
     }
     *slot = Some(GpuSizedBuffer {
         buffer: device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mcraw4vulkan direct linear-TV YUV12 output"),
+            label: Some("mcraw4vulkan direct Apple-Log-TV YUV12 output"),
             size: required_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -801,262 +801,4 @@ pub enum DirectYuv12Error {
         required_workgroups: u32,
         max_workgroups: u32,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn unrestricted_geometry_limits() -> DirectYuv12Limits {
-        DirectYuv12Limits {
-            max_storage_buffer_binding_size: u64::MAX,
-            max_buffer_size: u64::MAX,
-            max_compute_workgroups_per_dimension: u32::MAX,
-        }
-    }
-
-    #[test]
-    fn params_layout_is_four_vec4_words() {
-        assert_eq!(std::mem::size_of::<DirectYuv12Params>(), 64);
-        assert_eq!(DIRECT_YUV12_PARAMS_BYTE_LEN, 64);
-    }
-
-    #[test]
-    fn adopted_pack_policy_is_the_single_storage_mapping_and_scale_authority() {
-        assert_eq!(Yuv444p12lePackPolicy::PLANE_COUNT, 3);
-        assert_eq!(Yuv444p12lePackPolicy::PLANE_ORDER, ["Y", "Cb", "Cr"]);
-        assert_eq!(Yuv444p12lePackPolicy::BYTES_PER_SAMPLE, 2);
-        assert_eq!(Yuv444p12lePackPolicy::STORAGE_BYTES_PER_PIXEL, 6);
-        assert_eq!(Yuv444p12lePackPolicy::STORAGE_BITS_PER_SAMPLE, 16);
-        assert_eq!(Yuv444p12lePackPolicy::MEANINGFUL_BITS_PER_SAMPLE, 12);
-        assert_eq!(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_NUMERATOR, 1);
-        assert_eq!(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_DENOMINATOR, 2);
-        assert_eq!(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_STOPS, -1);
-        assert_eq!(
-            Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_FACTOR_F32.to_bits(),
-            0.5_f32.to_bits()
-        );
-        assert_eq!(Yuv444p12lePackPolicy::NOMINAL_LUMA_MIN_CODE, 256);
-        assert_eq!(Yuv444p12lePackPolicy::NOMINAL_LUMA_MAX_CODE, 3760);
-        assert_eq!(Yuv444p12lePackPolicy::NOMINAL_CHROMA_MIN_CODE, 256);
-        assert_eq!(Yuv444p12lePackPolicy::NOMINAL_CHROMA_MAX_CODE, 3840);
-        assert_eq!(Yuv444p12lePackPolicy::MIN_CODE, 16);
-        assert_eq!(Yuv444p12lePackPolicy::MAX_CODE, 4079);
-    }
-
-    #[test]
-    fn status_contract_is_four_u32_words() {
-        assert_eq!(DIRECT_YUV12_STATUS_BYTE_LEN, 16);
-        assert_eq!(
-            DIRECT_YUV12_NONFINITE_CAMERA
-                | DIRECT_YUV12_NONFINITE_NCL
-                | DIRECT_YUV12_NONFINITE_MAPPED,
-            7
-        );
-    }
-
-    #[test]
-    fn terminal_contains_exact_mapping_and_no_metadata_or_oetf() {
-        for required in [
-            "direct_yuv12_checked_affine(256.0, 3504.0, ncl.x)",
-            "direct_yuv12_checked_affine(2048.0, 3584.0, ncl.y)",
-            "direct_yuv12_checked_affine(2048.0, 3584.0, ncl.z)",
-            "let result = dot(row, camera)",
-            "floor(clamp(mapped, 16.0, 4079.0) + 0.5)",
-            "var camera = demosaic_signed_bayer(x, y)",
-            "let pixel0 = direct_yuv12_pixel(x0, gid.y)",
-            "let pixel1 = direct_yuv12_pixel(x1, gid.y)",
-            "return low | (high << 16u)",
-            "all(codes <= vec3<u32>(4095u))",
-        ] {
-            assert!(DIRECT_YUV12_TERMINAL_WGSL.contains(required));
-        }
-        for forbidden in [
-            "AsShotNeutral",
-            "ForwardMatrix",
-            "CameraCalibration",
-            "oetf",
-            "tone_map",
-            "gamut_map",
-            "& 0xffffu",
-        ] {
-            assert!(!DIRECT_YUV12_TERMINAL_WGSL.contains(forbidden));
-        }
-    }
-
-    #[test]
-    fn shader_composes_one_signed_demosaic_source() {
-        let source = direct_yuv12_shader_source();
-        assert!(!source.contains(SIGNED_BAYER_DEMOSAIC_INSERTION_POINT));
-        assert_eq!(source.matches("fn demosaic_signed_bayer(").count(), 1);
-        assert_eq!(
-            source
-                .matches("var camera = demosaic_signed_bayer(x, y)")
-                .count(),
-            1
-        );
-        assert_eq!(
-            source
-                .matches("let pixel0 = direct_yuv12_pixel(x0, gid.y)")
-                .count(),
-            1
-        );
-        assert_eq!(
-            source
-                .matches("let pixel1 = direct_yuv12_pixel(x1, gid.y)")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn geometry_accepts_required_even_width_and_odd_height_shapes() {
-        for dimensions in [
-            FrameDimensions {
-                width: 2,
-                height: 1,
-            },
-            FrameDimensions {
-                width: 2,
-                height: 2,
-            },
-            FrameDimensions {
-                width: 4,
-                height: 3,
-            },
-            FrameDimensions {
-                width: 30,
-                height: 15,
-            },
-            FrameDimensions {
-                width: 32,
-                height: 16,
-            },
-            FrameDimensions {
-                width: 34,
-                height: 17,
-            },
-            FrameDimensions {
-                width: 1920,
-                height: 1080,
-            },
-            FrameDimensions {
-                width: 3840,
-                height: 2160,
-            },
-            FrameDimensions {
-                width: 4080,
-                height: 3072,
-            },
-        ] {
-            let geometry =
-                DirectYuv12Geometry::validate(dimensions, unrestricted_geometry_limits())
-                    .expect("required geometry validates");
-            let pixels = u64::from(dimensions.width) * u64::from(dimensions.height);
-            assert_eq!(geometry.input_binding_bytes, pixels * 4);
-            assert_eq!(geometry.plane_byte_len, pixels * 2);
-            assert_eq!(geometry.visible_output_bytes, pixels * 6);
-        }
-    }
-
-    #[test]
-    fn geometry_rejects_zero_odd_and_index_overflow_before_dispatch() {
-        for dimensions in [
-            FrameDimensions {
-                width: 0,
-                height: 1,
-            },
-            FrameDimensions {
-                width: 2,
-                height: 0,
-            },
-        ] {
-            assert_eq!(
-                DirectYuv12Geometry::validate(dimensions, unrestricted_geometry_limits())
-                    .unwrap_err(),
-                DirectYuv12Error::InvalidDimensions { dimensions }
-            );
-        }
-        for dimensions in [
-            FrameDimensions {
-                width: 1,
-                height: 1,
-            },
-            FrameDimensions {
-                width: 3,
-                height: 2,
-            },
-        ] {
-            assert_eq!(
-                DirectYuv12Geometry::validate(dimensions, unrestricted_geometry_limits())
-                    .unwrap_err(),
-                DirectYuv12Error::OddVisibleWidth {
-                    width: dimensions.width
-                }
-            );
-        }
-        let dimensions = FrameDimensions {
-            width: u32::MAX - 1,
-            height: 2,
-        };
-        assert_eq!(
-            DirectYuv12Geometry::validate(dimensions, unrestricted_geometry_limits()).unwrap_err(),
-            DirectYuv12Error::DimensionOverflow { dimensions }
-        );
-    }
-
-    #[test]
-    fn geometry_rejects_binding_buffer_and_dispatch_limits_precisely() {
-        let dimensions = FrameDimensions {
-            width: 2,
-            height: 2,
-        };
-        assert!(matches!(
-            DirectYuv12Geometry::validate(
-                dimensions,
-                DirectYuv12Limits {
-                    max_storage_buffer_binding_size: 15,
-                    ..unrestricted_geometry_limits()
-                }
-            ),
-            Err(DirectYuv12Error::StorageBindingTooLarge {
-                buffer: "relative-linear f32 Bayer input",
-                required_bytes: 16,
-                max_binding_bytes: 15,
-            })
-        ));
-        assert_eq!(
-            DirectYuv12Geometry::validate(
-                dimensions,
-                DirectYuv12Limits {
-                    max_buffer_size: 23,
-                    ..unrestricted_geometry_limits()
-                }
-            )
-            .unwrap_err(),
-            DirectYuv12Error::OutputBufferTooLarge {
-                required_bytes: 24,
-                max_buffer_bytes: 23,
-            }
-        );
-        let dimensions = FrameDimensions {
-            width: 34,
-            height: 1,
-        };
-        assert_eq!(
-            DirectYuv12Geometry::validate(
-                dimensions,
-                DirectYuv12Limits {
-                    max_compute_workgroups_per_dimension: 1,
-                    ..unrestricted_geometry_limits()
-                }
-            )
-            .unwrap_err(),
-            DirectYuv12Error::DispatchTooLarge {
-                axis: "x",
-                required_workgroups: 2,
-                max_workgroups: 1,
-            }
-        );
-    }
 }

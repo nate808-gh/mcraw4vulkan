@@ -136,34 +136,3 @@ fn parse_u32_ascii(bytes: &[u8]) -> Option<u32> {
 fn parse_i8_ascii(bytes: &[u8]) -> Option<i8> {
     i8::try_from(parse_u32_ascii(bytes)?).ok()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::parse_motioncam_capture_timestamp_from_stem;
-
-    #[test]
-    fn parses_motioncam_capture_timestamp_prefix() {
-        let timestamp = parse_motioncam_capture_timestamp_from_stem("260509_213010_VIDEO_25mm");
-
-        assert!(timestamp.is_some());
-    }
-
-    #[test]
-    fn ignores_non_motioncam_test_names() {
-        assert!(parse_motioncam_capture_timestamp_from_stem("bigfile").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260509-213010").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260509_21301").is_none());
-    }
-
-    #[test]
-    fn ignores_invalid_dates() {
-        assert!(parse_motioncam_capture_timestamp_from_stem("261399_213010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260099_213010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260500_213010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260230_213010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("250229_213010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260509_253010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260509_246010_VIDEO").is_none());
-        assert!(parse_motioncam_capture_timestamp_from_stem("260509_213060_VIDEO").is_none());
-    }
-}

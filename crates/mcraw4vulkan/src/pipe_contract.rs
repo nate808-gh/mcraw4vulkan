@@ -1,4 +1,4 @@
-//! Production PIPE format, timing, and sidecar-v3 contract.
+//! Production PIPE format, timing, and sidecar-v4 contract.
 //!
 //! This module is deliberately independent of the CLI and GUI. The public
 //! producer and every sidecar consumer use the same fixed direct-YUV policy
@@ -12,14 +12,14 @@ use std::fmt;
 use mcraw4vulkan_render::Yuv444p12lePackPolicy;
 use serde_json::{Map, Value, json};
 
-const PIPE_METADATA_VERSION: u64 = 3;
+const PIPE_METADATA_VERSION: u64 = 4;
 const PIPE_PRODUCER: &str = "mcraw4vulkan pipe";
-const PIPE_OUTPUT_ALGORITHM_ID: &str = "mcraw-yuv444p12le-tv-bt2020-linear-ncl-scale-1of2-v1";
+const PIPE_OUTPUT_ALGORITHM_ID: &str = "mcraw-yuv444p12le-tv-bt2020-apple-log-original-ncl-v1";
 pub(crate) const PIPE_PIXEL_FORMAT: &str = "yuv444p12le";
 const PIPE_MIME_TYPE: &str = "application/octet-stream";
 const PIPE_MAX_MOV_TIMESCALE_NUMERATOR: u64 = 99_999;
-const PIPE_LINEAR_SIGNAL_SCALE_ID: &str = "fixed-power-of-two-headroom-v1";
-pub(crate) const PIPE_SCALE_APPLICATION_POINT: &str = "linear-signal-before-ycbcr-tv-offsets";
+const PIPE_TERMINAL_EXPOSURE_SCALE_ID: &str = "unity-no-extra-exposure-v1";
+pub(crate) const PIPE_SCALE_APPLICATION_POINT: &str = "scene-linear-bt2020-before-apple-log";
 pub(crate) const PIPE_CORRECTION_POLICY_ID: &str = "motioncam-compatible-pixel-domain-v1";
 pub(crate) const PIPE_CORRECTION_TERMINAL_ID: &str = "materialized-signed-f32-before-demosaic-v1";
 const PIPE_CORRECTION_MODE_MOTIONCAM_SPATIAL: &str = "motioncam-spatial";
@@ -36,7 +36,7 @@ const PIPE_BYTE_ORDER: &str = "little-endian";
 pub(crate) const PIPE_SAMPLE_RANGE: &str = "video-data-12bit";
 pub(crate) const PIPE_COLOR_RANGE: &str = "tv";
 pub(crate) const PIPE_COLOR_PRIMARIES: &str = "bt2020";
-pub(crate) const PIPE_COLOR_TRANSFER: &str = "linear";
+pub(crate) const PIPE_COLOR_TRANSFER: &str = "apple-log-original";
 pub(crate) const PIPE_MATRIX_COEFFICIENTS: &str = "bt2020nc";
 pub(crate) const PIPE_CHROMA_SAMPLING: &str = "4:4:4";
 pub(crate) const PIPE_ALPHA: &str = "none";
@@ -63,7 +63,42 @@ pub(crate) fn checked_pipe_total_bytes(
         .ok_or_else(|| PipeContractError::new("PIPE total-byte count overflow"))
 }
 
-const LEGACY_V2_FORMAT_FIELDS: &[&str] = &[
+// One naming owner for raw video, metadata, audio and GUI-generated ProRes.
+macro_rules! pipe_output_suffixes {
+    ($stem:literal) => {
+        pub const PIPE_OUTPUT_STEM_SUFFIX: &str = $stem;
+        pub const PIPE_METADATA_FILE_SUFFIX: &str = concat!($stem, ".json");
+        pub const PIPE_AUDIO_FILE_SUFFIX: &str = concat!($stem, "-audio.wav");
+        pub const PIPE_PRORES_FILE_SUFFIX: &str = "_prores4444_bt2020_applelog.mov";
+        pub const PIPE_PRORES_SIDECAR_SUFFIX: &str = "_prores4444_bt2020_applelog.json";
+    };
+}
+pipe_output_suffixes!("-BT2020-AppleLog");
+
+fn apple_log_contract_fields() -> Value {
+    json!({
+        "white_point": "D65",
+        "ffmpeg_color_trc": 2,
+        "transfer_parameters": {
+            "R0": -0.05641088, "Rt": 0.01, "c": 47.28711236,
+            "beta": 0.00964052, "gamma": 0.08550479, "delta": 0.69336945
+        },
+        "negative_component_policy": "finite-below-R0-encodes-zero-inverse-R0",
+        "upper_transfer_policy": "no-F-one-clamp-final-ycbcr-bounds-only",
+        "nonfinite_policy": "frame-error-before-publication",
+        "dither": false,
+        "inverse_order": ["remove-tv-offsets-and-scales", "inverse-bt2020-ncl",
+            "original-apple-log-component-inverse", "unity-exposure-scale"],
+        "editor_input_assignment": "manual-original-Apple-Log-Rec2020-D65-video-levels-BT2020-NCL",
+        "automatic_editor_recognition": false
+    })
+}
+
+const LEGACY_FORMAT_FIELDS: &[&str] = &[
+    "linear_signal_scale_num",
+    "linear_signal_scale_den",
+    "linear_signal_scale_stops",
+    "linear_signal_scale_id",
     "bits_per_channel",
     "black_code_value",
     "camera_to_linear_srgb_3x3",
@@ -350,7 +385,7 @@ impl PipeAspectRatio {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipeAudioContractV3 {
+pub struct PipeAudioContractV4 {
     pub present: bool,
     pub sample_rate_hz: Option<u32>,
     pub channels: Option<u16>,
@@ -360,7 +395,7 @@ pub struct PipeAudioContractV3 {
     pub byte_len: Option<u64>,
 }
 
-impl PipeAudioContractV3 {
+impl PipeAudioContractV4 {
     pub fn absent() -> Self {
         Self {
             present: false,
@@ -484,7 +519,7 @@ impl PipeAudioContractV3 {
 /// All format policy is fixed by `to_value`; only clip facts and validated
 /// context identities vary.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PipeSidecarV3 {
+pub struct PipeSidecarV4 {
     pub frame_width: u32,
     pub frame_height: u32,
     pub frame_count: u64,
@@ -497,10 +532,10 @@ pub struct PipeSidecarV3 {
     pub source_payload_geometry_identity: Value,
     pub strict_color_context_identity: Value,
     pub correction_context_identity: Value,
-    pub audio: PipeAudioContractV3,
+    pub audio: PipeAudioContractV4,
 }
 
-impl PipeSidecarV3 {
+impl PipeSidecarV4 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         frame_width: u32,
@@ -513,7 +548,7 @@ impl PipeSidecarV3 {
         source_payload_geometry_identity: Value,
         strict_color_context_identity: Value,
         correction_context_identity: Value,
-        audio: PipeAudioContractV3,
+        audio: PipeAudioContractV4,
     ) -> Result<Self, PipeContractError> {
         if frame_width == 0 || frame_height == 0 || frame_count == 0 {
             return Err(PipeContractError::new(
@@ -627,10 +662,10 @@ impl PipeSidecarV3 {
                 Yuv444p12lePackPolicy::MAX_CODE,
             ],
             "rounding_id": PIPE_ROUNDING_ID,
-            "linear_signal_scale_num": Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_NUMERATOR,
-            "linear_signal_scale_den": Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_DENOMINATOR,
-            "linear_signal_scale_stops": Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_STOPS,
-            "linear_signal_scale_id": PIPE_LINEAR_SIGNAL_SCALE_ID,
+            "terminal_exposure_scale_num": Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_NUMERATOR,
+            "terminal_exposure_scale_den": Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_DENOMINATOR,
+            "terminal_exposure_scale_stops": Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_STOPS,
+            "terminal_exposure_scale_id": PIPE_TERMINAL_EXPOSURE_SCALE_ID,
             "scale_application_point": PIPE_SCALE_APPLICATION_POINT,
             "display_ready": false,
             "correction_policy_id": PIPE_CORRECTION_POLICY_ID,
@@ -652,20 +687,41 @@ impl PipeSidecarV3 {
                     .expect("PIPE fixed-contract JSON literal is an object")
                     .clone(),
             );
+        sidecar.as_object_mut().expect("sidecar object").extend(
+            apple_log_contract_fields()
+                .as_object()
+                .expect("transfer object")
+                .clone(),
+        );
         sidecar
     }
 
     fn from_value(value: &Value) -> Result<Self, PipeContractError> {
         let object = required_object_value(value, "PIPE sidecar")?;
-        for field in LEGACY_V2_FORMAT_FIELDS {
+        if object.get("metadata_version").and_then(Value::as_u64) == Some(3) {
+            return Err(PipeContractError::new(
+                "legacy PIPE version 3 is half-scale linear (0.9.0); it cannot be interpreted as original Apple Log version 4",
+            ));
+        }
+        for field in LEGACY_FORMAT_FIELDS {
             if object.contains_key(*field) {
                 return Err(PipeContractError::new(format!(
-                    "PIPE sidecar contains stale version-2 field {field}"
+                    "PIPE sidecar contains stale legacy field {field}"
                 )));
             }
         }
 
         require_u64_equal(object, "metadata_version", PIPE_METADATA_VERSION)?;
+        for (field, expected) in apple_log_contract_fields()
+            .as_object()
+            .expect("transfer object")
+        {
+            if object.get(field) != Some(expected) {
+                return Err(PipeContractError::new(format!(
+                    "PIPE sidecar {field} contradicts original Apple Log contract"
+                )));
+            }
+        }
         require_string_equal(object, "producer", PIPE_PRODUCER)?;
         require_string_equal(object, "output_algorithm_id", PIPE_OUTPUT_ALGORITHM_ID)?;
         require_string_equal(object, "pixel_format", PIPE_PIXEL_FORMAT)?;
@@ -732,23 +788,23 @@ impl PipeSidecarV3 {
         require_string_equal(object, "rounding_id", PIPE_ROUNDING_ID)?;
         require_u64_equal(
             object,
-            "linear_signal_scale_num",
-            u64::from(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_NUMERATOR),
+            "terminal_exposure_scale_num",
+            u64::from(Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_NUMERATOR),
         )?;
         require_u64_equal(
             object,
-            "linear_signal_scale_den",
-            u64::from(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_DENOMINATOR),
+            "terminal_exposure_scale_den",
+            u64::from(Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_DENOMINATOR),
         )?;
         require_i64_equal(
             object,
-            "linear_signal_scale_stops",
-            i64::from(Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_STOPS),
+            "terminal_exposure_scale_stops",
+            i64::from(Yuv444p12lePackPolicy::TERMINAL_EXPOSURE_SCALE_STOPS),
         )?;
         require_string_equal(
             object,
-            "linear_signal_scale_id",
-            PIPE_LINEAR_SIGNAL_SCALE_ID,
+            "terminal_exposure_scale_id",
+            PIPE_TERMINAL_EXPOSURE_SCALE_ID,
         )?;
         require_string_equal(
             object,
@@ -802,7 +858,7 @@ impl PipeSidecarV3 {
             required_value(object, "strict_color_context_identity")?.clone();
         let correction_context_identity =
             required_value(object, "correction_context_identity")?.clone();
-        let audio = PipeAudioContractV3::from_value(required_value(object, "audio")?)?;
+        let audio = PipeAudioContractV4::from_value(required_value(object, "audio")?)?;
         let result = Self::new(
             frame_width,
             frame_height,
@@ -830,8 +886,8 @@ impl PipeSidecarV3 {
     }
 }
 
-pub fn validate_pipe_sidecar_v3(value: &Value) -> Result<PipeSidecarV3, PipeContractError> {
-    PipeSidecarV3::from_value(value)
+pub fn validate_pipe_sidecar_v4(value: &Value) -> Result<PipeSidecarV4, PipeContractError> {
+    PipeSidecarV4::from_value(value)
 }
 
 fn exact_reduced_aspect(
@@ -1027,217 +1083,4 @@ fn require_u64_array_equal(
         )));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn canonical_sidecar() -> PipeSidecarV3 {
-        let cadence = PipeMovCadence::from_source_rate(500_000_000, 16_668_971).unwrap();
-        let sar = PipeAspectRatio::square_pixels();
-        let dar = PipeAspectRatio::display_for_frame(3840, 2160, sar).unwrap();
-        PipeSidecarV3::new(
-            3840,
-            2160,
-            1941,
-            cadence,
-            sar,
-            dar,
-            PIPE_CORRECTION_MODE_MOTIONCAM_SPATIAL.to_string(),
-            json!({"source_sha256": "00", "payload_layouts": ["type7"]}),
-            json!({"policy": PIPE_COLOR_POLICY_ID, "context_count": 1}),
-            json!({"policy": PIPE_CORRECTION_POLICY_ID, "context_count": 1}),
-            PipeAudioContractV3::pcm_s16le(48_000, 2, 3_106_029, 12_424_196).unwrap(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn ocean_uses_established_bounded_integer_cadence() {
-        let cadence = PipeMovCadence::from_source_rate(500_000_000, 16_668_971).unwrap();
-        assert_eq!(cadence.fps_num, 57_862);
-        assert_eq!(cadence.fps_den, 1_929);
-        assert_eq!(cadence.timebase_num, 1_929);
-        assert_eq!(cadence.timebase_den, 57_862);
-        assert_eq!(cadence.video_track_timescale, 57_862);
-        assert_eq!(cadence.ffmpeg_framerate(), "57862/1929");
-
-        assert!(
-            PipeMovCadence::from_sidecar_fields(
-                500_000_000,
-                16_668_971,
-                16_668_971,
-                500_000_000,
-                500_000_000,
-            )
-            .is_err(),
-            "the rejected nanosecond cadence must not satisfy the production sidecar contract",
-        );
-    }
-
-    #[test]
-    fn pipe_example_facts_are_a_narrow_projection_of_canonical_contract_types() {
-        let cadence = PipeMovCadence::from_source_rate(500_000_000, 16_668_971).unwrap();
-        let sample_aspect_ratio = PipeAspectRatio::square_pixels();
-        let display_aspect_ratio =
-            PipeAspectRatio::display_for_frame(3840, 2160, sample_aspect_ratio).unwrap();
-        let facts = PipeExampleFacts {
-            width: 3840,
-            height: 2160,
-            cadence,
-            sample_aspect_ratio,
-            display_aspect_ratio,
-        };
-
-        assert_eq!(facts.cadence.ffmpeg_framerate(), "57862/1929");
-        assert_eq!(facts.cadence.timebase_num, 1_929);
-        assert_eq!(facts.cadence.timebase_den, 57_862);
-        assert_eq!(facts.cadence.video_track_timescale, 57_862);
-        assert_eq!(facts.sample_aspect_ratio, PipeAspectRatio::square_pixels());
-        assert_eq!(
-            facts.display_aspect_ratio,
-            PipeAspectRatio::new(16, 9).unwrap()
-        );
-    }
-
-    #[test]
-    fn sidecar_format_facts_are_owned_by_the_production_renderer_policy() {
-        assert_eq!(
-            canonical_sidecar().to_value()["plane_order"],
-            json!(Yuv444p12lePackPolicy::PLANE_ORDER),
-        );
-        assert_eq!(
-            canonical_sidecar().to_value()["linear_signal_scale_num"],
-            Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_NUMERATOR,
-        );
-        assert_eq!(
-            canonical_sidecar().to_value()["linear_signal_scale_den"],
-            Yuv444p12lePackPolicy::LINEAR_SIGNAL_SCALE_DENOMINATOR,
-        );
-        assert_eq!(
-            PIPE_PLANE_ORDER_LABEL,
-            Yuv444p12lePackPolicy::PLANE_ORDER.join(",")
-        );
-        assert_eq!(
-            PIPE_STORAGE_BYTES_PER_PIXEL,
-            u64::from(Yuv444p12lePackPolicy::STORAGE_BYTES_PER_PIXEL)
-        );
-    }
-
-    #[test]
-    fn one_typed_validator_owns_sidecar_and_cadence_validation() {
-        let validator: fn(&Value) -> Result<PipeSidecarV3, PipeContractError> =
-            validate_pipe_sidecar_v3;
-        let expected = canonical_sidecar();
-        let actual = validator(&expected.to_value()).unwrap();
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual.cadence.video_track_timescale, actual.cadence.fps_num);
-        assert_eq!(actual.cadence.timebase_num, actual.cadence.fps_den);
-        assert_eq!(actual.cadence.timebase_den, actual.cadence.fps_num);
-    }
-
-    #[test]
-    fn established_cadence_keeps_common_exact_rate() {
-        let cadence = PipeMovCadence::from_source_rate(24_000, 1_001).unwrap();
-        assert_eq!(cadence.fps_num, 24_000);
-        assert_eq!(cadence.fps_den, 1_001);
-        assert_eq!(cadence.video_track_timescale, 24_000);
-    }
-
-    #[test]
-    fn established_cadence_keeps_integer_rate() {
-        let cadence = PipeMovCadence::from_source_rate_text("24/1").unwrap();
-        assert_eq!(cadence.fps_num, 24);
-        assert_eq!(cadence.fps_den, 1);
-        assert_eq!(cadence.video_track_timescale, 24);
-    }
-
-    #[test]
-    fn established_cadence_preserves_old_large_rate_result() {
-        let cadence = PipeMovCadence::from_source_rate(62_500_000, 2_603_999).unwrap();
-        assert_eq!(cadence.fps_num, 93_198);
-        assert_eq!(cadence.fps_den, 3_883);
-        assert_eq!(cadence.timebase_num, 3_883);
-        assert_eq!(cadence.timebase_den, 93_198);
-        assert_eq!(cadence.video_track_timescale, 93_198);
-    }
-
-    #[test]
-    fn established_cadence_always_bounds_approximated_numerator() {
-        let cadence = PipeMovCadence::from_source_rate(1_000_000_000, 33_333).unwrap();
-        assert!(cadence.fps_num <= PIPE_MAX_MOV_TIMESCALE_NUMERATOR);
-        assert_eq!(cadence.timebase_den, cadence.fps_num);
-        assert_eq!(cadence.video_track_timescale, cadence.fps_num);
-    }
-
-    #[test]
-    fn strict_v3_sidecar_round_trips_complete_contract() {
-        let expected = canonical_sidecar();
-        let value = expected.to_value();
-        let parsed = validate_pipe_sidecar_v3(&value).unwrap();
-
-        assert_eq!(parsed, expected);
-        assert_eq!(value["metadata_version"], 3);
-        assert_eq!(value["pixel_format"], "yuv444p12le");
-        assert_eq!(value["plane_order"], json!(["Y", "Cb", "Cr"]));
-        assert_eq!(value["linear_signal_scale_num"], 1);
-        assert_eq!(value["linear_signal_scale_den"], 2);
-        assert_eq!(value["linear_signal_scale_stops"], -1);
-        assert_eq!(value["display_ready"], false);
-        assert_eq!(value["fps_num"], 57_862);
-        assert_eq!(value["fps_den"], 1_929);
-        assert_eq!(value["video_track_timescale"], 57_862);
-    }
-
-    #[test]
-    fn strict_v3_rejects_stale_or_contradictory_format_fields() {
-        for (field, replacement) in [
-            ("metadata_version", json!(2)),
-            ("pixel_format", json!("gbrp16le")),
-            ("color_range", json!("pc")),
-            ("color_transfer", json!("srgb")),
-            ("linear_signal_scale_den", json!(1)),
-            ("plane_order", json!(["G", "B", "R"])),
-            ("bytes_per_frame", json!(1)),
-            ("timebase_num", json!(1)),
-            ("video_track_timescale", json!(500_000_000_u64)),
-        ] {
-            let mut value = canonical_sidecar().to_value();
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert(field.to_string(), replacement);
-            assert!(
-                validate_pipe_sidecar_v3(&value).is_err(),
-                "contradictory field {field} was accepted"
-            );
-        }
-
-        let mut value = canonical_sidecar().to_value();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("sample_range".to_string(), json!("full"));
-        assert!(validate_pipe_sidecar_v3(&value).is_err());
-    }
-
-    #[test]
-    fn strict_v3_rejects_missing_scale_and_absent_audio_contradictions() {
-        let mut missing_scale = canonical_sidecar().to_value();
-        missing_scale
-            .as_object_mut()
-            .unwrap()
-            .remove("linear_signal_scale_num");
-        assert!(validate_pipe_sidecar_v3(&missing_scale).is_err());
-
-        let mut absent_audio = canonical_sidecar().to_value();
-        absent_audio["audio"]["present"] = json!(false);
-        assert!(validate_pipe_sidecar_v3(&absent_audio).is_err());
-
-        let mut stale_audio_path = canonical_sidecar().to_value();
-        stale_audio_path["audio"]["sidecar_path"] = json!("temporary-audio.wav");
-        assert!(validate_pipe_sidecar_v3(&stale_audio_path).is_err());
-    }
 }

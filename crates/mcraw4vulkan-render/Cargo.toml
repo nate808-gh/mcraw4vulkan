@@ -19,5 +19,3 @@ mcraw4vulkan-vignette = { path = "../mcraw4vulkan-vignette" }
 thiserror.workspace = true
 wgpu.workspace = true
 
-[dev-dependencies]
-pollster.workspace = true

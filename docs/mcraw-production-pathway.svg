@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2560 1440" role="img" aria-labelledby="diagram-title diagram-description">
   <title id="diagram-title">mcraw4vulkan — from RAW recording to output</title>
-  <desc id="diagram-description">A left-to-right diagram of the main production image and audio pathways. The .mcraw file has separate metadata, image payload, and audio payload rectangles. The CPU reads camera and frame settings, reads frame data, and prepares decoding. The GPU decodes raw sensor pixels, then the selected workflow follows one of three branches. Display optionally corrects lens shading, rebuilds color, and presents the image on the GPU. DNG optionally corrects lens shading while retaining the raw sensor mosaic, transfers the pixels to the CPU, and packages raw pixels with camera metadata as virtual DNG frames on demand. PIPE prepares linear raw values, optionally corrects lens shading, reconstructs color, converts and packs 12-bit scene-linear YUV on the GPU, then transfers frames to the CPU for writing to a stream or file. Blue outlines and arrows represent CPU image work; green represents GPU work. Dashed blue arrows carry image settings and metadata. Gray outlines and arrows represent CPU audio work. When audio is present, the CPU reads recorded samples and track details. Display aligns the sound to video timing and plays it when sound is enabled. DNG and PIPE package the original recorded samples as WAV: a virtual audio file beside the DNG images or a separate audio file beside PIPE video. Audio is not embedded in DNG images or in the raw video stream. Solid arrows carry image or audio data, with arrow color following the stage supplying it. Each output is a separate workflow, not a simultaneous fan-out. CPU image decoding and small supporting operations are omitted.</desc>
+  <desc id="diagram-description">A left-to-right diagram of the main production image and audio pathways. The .mcraw file has separate metadata, image payload, and audio payload rectangles. The CPU reads camera and frame settings, reads frame data, and prepares decoding. The GPU decodes raw sensor pixels, then the selected workflow follows one of three branches. Display optionally corrects lens shading, rebuilds color, and presents the image on the GPU. DNG optionally corrects lens shading while retaining the raw sensor mosaic, transfers the pixels to the CPU, and packages raw pixels with camera metadata as virtual DNG frames on demand. PIPE prepares linear raw values, optionally corrects lens shading, reconstructs color, encodes original Apple Log and packs 12-bit BT.2020 YUV on the GPU, then transfers frames to the CPU for writing to a stream or file. Blue outlines and arrows represent CPU image work; green represents GPU work. Dashed blue arrows carry image settings and metadata. Gray outlines and arrows represent CPU audio work. When audio is present, the CPU reads recorded samples and track details. Display aligns the sound to video timing and plays it when sound is enabled. DNG and PIPE package the original recorded samples as WAV: a virtual audio file beside the DNG images or a separate audio file beside PIPE video. Audio is not embedded in DNG images or in the raw video stream. Solid arrows carry image or audio data, with arrow color following the stage supplying it. Each output is a separate workflow, not a simultaneous fan-out. CPU image decoding and small supporting operations are omitted.</desc>
 
   <!--
     Source-checked against the current production code, 2026-09-04.
@@ -46,8 +46,8 @@
       Display correction also uses GPU histogram statistics and a small CPU
       brightness calculation; those supporting operations are omitted here.
       PIPE's CPU-resolved color transform includes recorded white balance.
-      GPU PIPE packs yuv444p12le: BT.2020, linear, TV range, fixed 1/2 signal
-      scale. There is no display exposure, OETF, or tone mapping on this branch.
+      GPU PIPE packs yuv444p12le: BT.2020, original Apple Log, TV range, unity signal
+      scale. There is no added display exposure or tone mapping on this branch.
       CPU decoding is a manual selection, not an automatic GPU failure fallback.
       Defaults: Display lens correction off; DNG and PIPE correction on.
       Audio is CPU work, drawn gray to distinguish it from the image pathway.
@@ -294,7 +294,7 @@
       <text x="1786" y="1073" class="tag gpu-text">GPU</text>
       <text x="1786" y="1118" class="heading">Build video</text>
       <text x="1786" y="1162" class="body">Rebuild &amp; balance color</text>
-      <text x="1786" y="1196" class="body">Pack 12-bit YUV video</text>
+      <text x="1786" y="1196" class="body">Apple Log / 12-bit YUV</text>
     </g>
     <g id="pipe-sink">
       <rect x="2230" y="1040" width="255" height="200" rx="19" class="cpu-box"/>
@@ -303,7 +303,7 @@
       <text x="2256" y="1171" class="body">Write video</text>
       <text x="2256" y="1205" class="body">Stream or file</text>
     </g>
-    <text x="1310" y="1286" class="small">Scene-linear video for grading; add exposure and a viewing transform.</text>
+    <text x="1310" y="1286" class="small">Original Apple Log / BT.2020 for grading; assign the matching input transform.</text>
   </g>
 
   <g id="audio-path">

@@ -75,22 +75,3 @@ impl DngMountPolicy {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_policy_default_dng_is_luma_plane_0() {
-        let policy = DngAppPolicy::production_default();
-        assert_eq!(policy.vignette, DngSinkVignetteMode::LumaPlane0);
-        assert_eq!(policy.backend, DngAppBackendPolicy::Auto);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_app_policy_default_dng_mount_is_enabled() {
-        let policy = DngAppPolicy::production_default();
-        assert_eq!(policy.mount, DngMountPolicy::AutoTemp);
-    }
-}

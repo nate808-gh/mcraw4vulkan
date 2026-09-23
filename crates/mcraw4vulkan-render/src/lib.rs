@@ -10,7 +10,7 @@ pub mod shader;
 pub mod stats;
 
 pub use direct_yuv12::{
-    DIRECT_YUV12_NONFINITE_CAMERA, DIRECT_YUV12_NONFINITE_MAPPED, DIRECT_YUV12_NONFINITE_NCL,
+    DIRECT_YUV12_NONFINITE_CAMERA, DIRECT_YUV12_NONFINITE_COLOR, DIRECT_YUV12_NONFINITE_MAPPED,
     DIRECT_YUV12_STATUS_BYTE_LEN, DirectYuv12ColorTransform, DirectYuv12Error,
     GpuDirectYuv12Dispatch, GpuDirectYuv12DispatchStats, GpuDirectYuv12EncodeInput,
     GpuDirectYuv12Stage, GpuDirectYuv12View, Yuv444p12leNumericDomain, Yuv444p12lePackPolicy,

@@ -18,20 +18,6 @@ use super::{
 pub struct ClipSourceSha256([u8; 32]);
 
 impl ClipSourceSha256 {
-    /// Streams the complete source exactly once. Retain and reuse the result;
-    /// no per-frame API accepts a filesystem path.
-    #[allow(dead_code)] // retained for bounded source-hash regression coverage
-    pub fn read_once(path: impl AsRef<Path>) -> Result<Self, StrictMotionCamColorError> {
-        Self::read_once_until_cancelled(path, &AtomicBool::new(false))?.map_or_else(
-            || {
-                Err(StrictMotionCamColorError::SourceShaIo {
-                    detail: "source SHA-256 was unexpectedly cancelled".to_string(),
-                })
-            },
-            |(digest, _)| Ok(digest),
-        )
-    }
-
     pub(crate) fn read_once_until_cancelled(
         path: impl AsRef<Path>,
         cancelled: &AtomicBool,
@@ -76,11 +62,6 @@ impl ClipSourceSha256 {
     /// digest before sidecar construction.
     pub(crate) const fn deferred_stream_identity() -> Self {
         Self([0xa5; 32])
-    }
-
-    #[cfg(test)]
-    pub(super) const fn from_frozen_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
     }
 }
 
@@ -160,17 +141,6 @@ impl VerifiedStrictPipeColorContextV2 {
 }
 
 impl StrictMotionCamForwardMatrixColorV2 {
-    #[allow(dead_code)] // retained for portable atomic-context scheduler tests
-    pub fn resolve_context(
-        &self,
-        profile: &StrictMotionCamColorProfile,
-        frame: &StrictMotionCamFrameColorInput,
-        facts: ColorContextFingerprintFacts,
-    ) -> Result<VerifiedStrictPipeColorContextV2, StrictMotionCamColorError> {
-        let (verified, _) = self.resolve_stream_context(profile, frame, facts)?;
-        Ok(verified)
-    }
-
     pub(crate) fn resolve_stream_context(
         &self,
         profile: &StrictMotionCamColorProfile,
@@ -200,19 +170,6 @@ impl StrictMotionCamForwardMatrixColorV2 {
                 source_sha256_offset,
             },
         ))
-    }
-
-    #[allow(dead_code)] // retained for portable context-identity regression coverage
-    pub fn color_context_fingerprint(
-        &self,
-        profile: &StrictMotionCamColorProfile,
-        frame: &StrictMotionCamFrameColorInput,
-        resolved: &ResolvedStrictPipeColor,
-        facts: ColorContextFingerprintFacts,
-    ) -> Result<ColorContextFingerprintV2, StrictMotionCamColorError> {
-        let (record, _) =
-            self.context_record_with_source_offset(profile, frame, resolved, facts)?;
-        Ok(ColorContextFingerprintV2(Sha256::digest(&record)))
     }
 
     fn context_record_with_source_offset(
@@ -351,68 +308,4 @@ fn append_values<const N: usize>(output: &mut Vec<u8>, values: [f64; N]) {
 
 fn append_matrix(output: &mut Vec<u8>, values: [f64; 9]) {
     append_values(output, values);
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-
-    #[test]
-    fn hashes_source_once_into_reusable_value() {
-        let path = std::env::temp_dir().join(format!(
-            "mcraw4vulkan-color-sha-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::write(&path, b"source clip bytes").unwrap();
-        let source = ClipSourceSha256::read_once(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        assert_eq!(
-            source.bytes(),
-            Sha256::digest(b"source clip bytes"),
-            "cached digest remains usable after source path disappears"
-        );
-    }
-
-    #[test]
-    fn deferred_fingerprint_rebinds_only_the_source_digest_bytes() {
-        let final_source = ClipSourceSha256::from_frozen_digest([0x3c; 32]);
-        let mut expected_record = b"prefix".to_vec();
-        let source_sha256_offset = expected_record.len();
-        expected_record.extend_from_slice(&final_source.bytes());
-        expected_record.extend_from_slice(b"suffix");
-
-        let mut deferred_record = b"prefix".to_vec();
-        deferred_record.extend_from_slice(&ClipSourceSha256::deferred_stream_identity().bytes());
-        deferred_record.extend_from_slice(b"suffix");
-        let deferred = DeferredColorContextFingerprintV2 {
-            policy_name: "StrictMotionCamForwardMatrixColorV2",
-            policy_digest: super::super::policy::EXPECTED_POLICY_DIGEST,
-            record: deferred_record,
-            source_sha256_offset,
-        };
-
-        assert_eq!(
-            deferred.finalize(final_source).unwrap().bytes(),
-            Sha256::digest(&expected_record)
-        );
-    }
-
-    #[test]
-    fn cancellable_source_hash_stops_before_reading() {
-        let path = std::env::temp_dir().join(format!(
-            "mcraw4vulkan-cancelled-color-sha-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::write(&path, b"source clip bytes").unwrap();
-        let cancelled = AtomicBool::new(true);
-        assert_eq!(
-            ClipSourceSha256::read_once_until_cancelled(&path, &cancelled).unwrap(),
-            None
-        );
-        fs::remove_file(&path).unwrap();
-    }
 }

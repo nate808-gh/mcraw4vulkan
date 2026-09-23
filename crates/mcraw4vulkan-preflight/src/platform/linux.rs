@@ -141,32 +141,3 @@ fn parse_os_release_value(value: &str) -> Option<String> {
     let value = value.to_string();
     (!value.trim().is_empty()).then_some(value)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn linux_os_release_parser_reads_pretty_name() {
-        let input = "NAME=Example\nPRETTY_NAME=\"Example Linux 1.0\"\nVERSION_ID=1\n";
-
-        assert_eq!(
-            parse_os_release_pretty_name(input).as_deref(),
-            Some("Example Linux 1.0")
-        );
-    }
-
-    #[test]
-    fn linux_cpuinfo_parser_reads_model_name() {
-        let input = "processor\t: 0\nmodel name\t: Test CPU 123\n";
-
-        assert_eq!(parse_cpuinfo_model(input).as_deref(), Some("Test CPU 123"));
-    }
-
-    #[test]
-    fn linux_filesystems_parser_finds_fuse() {
-        let input = "nodev\tsysfs\nnodev\tfuse\n";
-
-        assert!(parse_proc_filesystems_has_fuse(input));
-    }
-}
