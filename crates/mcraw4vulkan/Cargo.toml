@@ -19,6 +19,7 @@ name = "mcraw4vulkan"
 path = "src/main.rs"
 
 [dependencies]
+ctrlc = "=3.5.2"
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

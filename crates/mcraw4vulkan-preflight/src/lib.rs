@@ -1,9 +1,9 @@
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-mod child_process;
 mod format;
 pub mod launcher;
 mod notifications;
 mod platform;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod process_control;
 mod ram;
 mod vulkan;
 

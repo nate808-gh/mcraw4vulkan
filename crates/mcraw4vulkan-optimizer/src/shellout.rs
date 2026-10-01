@@ -240,7 +240,7 @@ impl OptimizerShelloutRunner {
     }
 
     fn run_with_report_dir(&self, report_dir: &Path) -> OptimizerResult<OptimizerRunOutcome> {
-        // One deadline covers warmup and every scored row, so no later child can
+        // One deadline covers warmup and every scored row, so no later process can
         // acquire a fresh timeout after earlier work consumed the run budget.
         let deadline = Instant::now() + self.config.hard_timeout;
         let commands =
@@ -248,7 +248,7 @@ impl OptimizerShelloutRunner {
         let progress_total_steps = optimizer_progress_total_steps(&commands);
 
         let warmup = optimizer_gpu_warmup_command(&self.config.input_path, report_dir);
-        let _ = self.run_child_measurement_report(&warmup, deadline);
+        let _ = self.run_process_measurement_report(&warmup, deadline);
         let _ = fs::remove_file(&warmup.report_path);
         print_progress_step(1, progress_total_steps, "gpu warmup complete");
 
@@ -259,10 +259,12 @@ impl OptimizerShelloutRunner {
                 break;
             }
 
-            rows.push(match self.run_child_measurement_report(command, deadline) {
-                Ok(report) => CandidateMeasurementRow::from_report(command, &report),
-                Err(error) => command.failure_row(error.to_string()),
-            });
+            rows.push(
+                match self.run_process_measurement_report(command, deadline) {
+                    Ok(report) => CandidateMeasurementRow::from_report(command, &report),
+                    Err(error) => command.failure_row(error.to_string()),
+                },
+            );
             print_progress_step(index + 2, progress_total_steps, command.id.label());
         }
 
@@ -280,12 +282,12 @@ impl OptimizerShelloutRunner {
         })
     }
 
-    fn run_child_measurement_report(
+    fn run_process_measurement_report(
         &self,
-        command: &ChildMeasurementCommand,
+        command: &MeasurementCommand,
         deadline: Instant,
     ) -> OptimizerResult<MeasurementReport> {
-        run_child_measurement(
+        run_process_measurement(
             &self.config.mcraw4vulkan_exe,
             command,
             &self.config.input_path,
@@ -298,27 +300,27 @@ impl OptimizerShelloutRunner {
     }
 }
 
-fn run_child_measurement(
+fn run_process_measurement(
     exe: &Path,
-    command: &ChildMeasurementCommand,
+    command: &MeasurementCommand,
     input_path: &Path,
     deadline: Instant,
 ) -> OptimizerResult<()> {
-    let mut child_command = Command::new(exe);
-    child_command
+    let mut process_command = Command::new(exe);
+    process_command
         .args(&command.argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(temp_dir) = command.report_path.parent() {
-        child_command
+        process_command
             .env("TMPDIR", temp_dir)
             .env("TEMP", temp_dir)
             .env("TMP", temp_dir);
     }
-    let mut child = child_command.spawn()?;
+    let mut process = process_command.spawn()?;
     loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
+        if process.try_wait()?.is_some() {
+            let output = process.wait_with_output()?;
             if output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr_mentions_warning(&stderr) {
@@ -334,7 +336,7 @@ fn run_child_measurement(
             return Err(invalid_report(
                 command.id.label(),
                 format!(
-                    "child failed with status {:?}: {}",
+                    "process failed with status {:?}: {}",
                     output.status.code(),
                     stderr_tail(&sanitize_for_input(&stderr, input_path))
                 ),
@@ -342,10 +344,10 @@ fn run_child_measurement(
         }
 
         if Instant::now() >= deadline {
-            // The runner owns exactly one child here: kill requests termination,
-            // then wait_with_output reaps it before the timeout error escapes.
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
+            // The runner owns exactly one process here: kill requests termination,
+            // then wait_with_output collects the exit status of it before the timeout error escapes.
+            let _ = process.kill();
+            let output = process.wait_with_output()?;
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(invalid_report(
                 command.id.label(),
@@ -442,7 +444,7 @@ fn print_progress_step(step: usize, total: usize, label: impl AsRef<str>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildMeasurementCommand {
+pub struct MeasurementCommand {
     pub id: MeasurementId,
     pub argv: Vec<String>,
     pub report_path: PathBuf,
@@ -451,7 +453,7 @@ pub struct ChildMeasurementCommand {
     repetition: usize,
 }
 
-impl ChildMeasurementCommand {
+impl MeasurementCommand {
     fn failure_row(&self, reason: String) -> CandidateMeasurementRow {
         CandidateMeasurementRow {
             sink: self.sink,
@@ -469,10 +471,7 @@ impl ChildMeasurementCommand {
     }
 }
 
-pub fn optimizer_gpu_warmup_command(
-    input_path: &Path,
-    report_dir: &Path,
-) -> ChildMeasurementCommand {
+pub fn optimizer_gpu_warmup_command(input_path: &Path, report_dir: &Path) -> MeasurementCommand {
     display_command_with_warmup(
         MeasurementId::GpuWarmupUnscored,
         RecommendedPayloadProfile::DefaultChunked64,
@@ -488,7 +487,7 @@ pub fn optimizer_measurement_commands(
     input_path: &Path,
     report_dir: &Path,
     frames: usize,
-) -> Vec<ChildMeasurementCommand> {
+) -> Vec<MeasurementCommand> {
     let mut commands = Vec::with_capacity(2 * 2 * OPTIMIZER_REPETITIONS);
     for repetition in 1..=OPTIMIZER_REPETITIONS {
         // The middle repetition reverses sink and profile order so one fixed
@@ -531,7 +530,7 @@ pub fn optimizer_measurement_commands(
     commands
 }
 
-pub fn optimizer_progress_total_steps(commands: &[ChildMeasurementCommand]) -> usize {
+pub fn optimizer_progress_total_steps(commands: &[MeasurementCommand]) -> usize {
     commands.len() + 1
 }
 
@@ -542,7 +541,7 @@ fn display_command(
     input_path: &Path,
     report_dir: &Path,
     frames: usize,
-) -> ChildMeasurementCommand {
+) -> MeasurementCommand {
     display_command_with_warmup(
         id,
         profile,
@@ -562,9 +561,9 @@ fn display_command_with_warmup(
     report_dir: &Path,
     frames: usize,
     display_warmup_frames: usize,
-) -> ChildMeasurementCommand {
+) -> MeasurementCommand {
     let report_path = report_dir.join(id.report_file());
-    ChildMeasurementCommand {
+    MeasurementCommand {
         id,
         argv: vec![
             "display".to_string(),
@@ -597,9 +596,9 @@ fn pipe_command(
     input_path: &Path,
     report_dir: &Path,
     frames: usize,
-) -> ChildMeasurementCommand {
+) -> MeasurementCommand {
     let report_path = report_dir.join(id.report_file());
-    ChildMeasurementCommand {
+    MeasurementCommand {
         id,
         argv: vec![
             "pipe".to_string(),
@@ -634,7 +633,7 @@ pub struct CandidateMeasurementRow {
 }
 
 impl CandidateMeasurementRow {
-    fn from_report(command: &ChildMeasurementCommand, report: &MeasurementReport) -> Self {
+    fn from_report(command: &MeasurementCommand, report: &MeasurementReport) -> Self {
         Self {
             sink: command.sink,
             profile: command.profile,
@@ -872,9 +871,9 @@ impl PipeReport {
 
 fn validate_report_for_spec(
     report: &MeasurementReport,
-    command: &ChildMeasurementCommand,
+    command: &MeasurementCommand,
 ) -> OptimizerResult<()> {
-    // Child JSON is an untrusted measurement boundary. Policy sees a row only after
+    // ProcessHandle JSON is an untrusted measurement boundary. Policy sees a row only after
     // its report version and status, frame-count floor, payload profile, and
     // sink-specific output contract are validated.
     let measurement_id = command.id.label();

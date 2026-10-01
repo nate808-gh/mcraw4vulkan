@@ -22,6 +22,75 @@ pub const STATUS_FONT_SIZE: f32 = 22.0;
 pub const DETAIL_FONT_SIZE: f32 = 20.0;
 pub const LINE_FONT_SIZE: f32 = 20.0;
 
+/// Density is selected from the full client in logical points, before local layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Density {
+    #[default]
+    Normal,
+    Compact,
+}
+
+impl Density {
+    pub fn for_client(size: Vec2) -> Self {
+        if size.x >= 1664.0 && size.y >= 1012.0 {
+            Self::Normal
+        } else {
+            Self::Compact
+        }
+    }
+    pub fn font(self, normal: f32) -> f32 {
+        normal * if self == Self::Compact { 0.9 } else { 1.0 }
+    }
+    pub fn margin(self) -> f32 {
+        if self == Self::Compact { 4.0 } else { 24.0 }
+    }
+    pub fn inset(self) -> f32 {
+        if self == Self::Compact { 4.0 } else { 18.0 }
+    }
+    pub fn gutter(self) -> f32 {
+        if self == Self::Compact { 4.0 } else { 16.0 }
+    }
+    pub fn item_gap(self) -> f32 {
+        if self == Self::Compact { 4.0 } else { 8.0 }
+    }
+    pub fn row_padding(self) -> f32 {
+        if self == Self::Compact { 0.0 } else { 8.0 }
+    }
+    pub fn list_inset(self) -> f32 {
+        if self == Self::Compact { 8.0 } else { 16.0 }
+    }
+    pub fn body_inset(self) -> f32 {
+        if self == Self::Compact { 12.0 } else { 24.0 }
+    }
+    pub fn space(self, normal: f32) -> f32 {
+        if self == Self::Normal {
+            return normal;
+        }
+        match normal {
+            18.0 | 16.0 | 14.0 | 12.0 | 8.0 => 4.0,
+            6.0 => 3.0,
+            _ => normal * 0.9,
+        }
+    }
+}
+
+fn density_id() -> egui::Id {
+    egui::Id::new("layout-density")
+}
+pub fn density(context: &egui::Context) -> Density {
+    context.data(|data| data.get_temp::<Density>(density_id()).unwrap_or_default())
+}
+pub fn metrics(ui: &egui::Ui) -> Density {
+    density(ui.ctx())
+}
+
+pub fn select_density(context: &egui::Context) {
+    let next = Density::for_client(context.input(|input| input.screen_rect().size()));
+    if next != density(context) {
+        apply_density(context, next);
+    }
+}
+
 pub fn background() -> Color32 {
     rgb(BACKGROUND_RGB)
 }
@@ -83,28 +152,41 @@ pub fn apply_orange_emphasis_button_visuals(visuals: &mut Visuals) {
 }
 
 pub fn apply_project_style(context: &egui::Context) {
+    apply_density(context, Density::Normal);
+}
+
+pub fn apply_density(context: &egui::Context, density: Density) {
     let mut style = Style::default();
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(HEADING_FONT_SIZE, FontFamily::Proportional),
+        FontId::new(density.font(HEADING_FONT_SIZE), FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Body,
-        FontId::new(BODY_FONT_SIZE, FontFamily::Proportional),
+        FontId::new(density.font(BODY_FONT_SIZE), FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(BUTTON_FONT_SIZE, FontFamily::Proportional),
+        FontId::new(density.font(BUTTON_FONT_SIZE), FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Small,
-        FontId::new(SMALL_FONT_SIZE, FontFamily::Proportional),
+        FontId::new(density.font(SMALL_FONT_SIZE), FontFamily::Proportional),
     );
-    style.spacing.item_spacing = vec2(8.0, 8.0);
-    style.spacing.button_padding = vec2(12.0, 6.0);
-    style.spacing.interact_size = vec2(56.0, 32.0);
+    style.spacing.item_spacing = Vec2::splat(density.item_gap());
+    style.spacing.button_padding = if density == Density::Compact {
+        vec2(6.0, 4.0)
+    } else {
+        vec2(12.0, 6.0)
+    };
+    style.spacing.interact_size = if density == Density::Compact {
+        vec2(50.4, 30.6)
+    } else {
+        vec2(56.0, 32.0)
+    };
     style.visuals = project_visuals();
     context.set_style(style);
+    context.data_mut(|data| data.insert_temp(density_id(), density));
 }
 
 pub fn project_visuals() -> Visuals {

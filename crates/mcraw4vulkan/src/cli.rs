@@ -31,6 +31,7 @@ pub enum Mcraw4VulkanCommand {
     Pipe(PipeCommand),
     PipeHelp,
     PipeMetadata(PipeMetadataCommand),
+    PipeAction(PipeAction, PipeCommand),
     Optimizer(OptimizerCommand),
 }
 
@@ -86,6 +87,13 @@ pub struct PipeMetadataCommand {
     pub settings: SettingsSourceChoice,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeAction {
+    Example,
+    Export,
+    ExportFolder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptimizerCommand {
     Run { input: PathBuf },
@@ -137,7 +145,15 @@ pub struct DngMountNaming {
 
 impl Cli {
     pub fn parse_production_env() -> Result<Mcraw4VulkanCommand> {
-        Self::parse_command_from(std::env::args().skip(1))
+        let args = std::env::args_os()
+            .skip(1)
+            .map(|arg| {
+                arg.into_string().map_err(|_| {
+                    anyhow!("command arguments must be valid UTF-8; unsupported filename")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::parse_command_from(args)
     }
 
     pub fn parse_command_from<I, S>(args: I) -> Result<Mcraw4VulkanCommand>
@@ -167,11 +183,11 @@ impl Cli {
     }
 
     pub fn usage() -> &'static str {
-        "mcraw4vulkan\n\nUsage:\n  mcraw4vulkan display [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--vsync|--no-vsync] [--with-sound] [--default|--optimized] [--with-overlay|--no-overlay] FILE.mcraw\n  mcraw4vulkan dng [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nCommands:\n  display     show the 8-bit preview in a window; press F to toggle fullscreen\n  dng         mount or unmount mcraw4vulkan-owned virtual DNG plus audio folders\n  pipe        write direct yuv444p12le rawvideo or print PIPE metadata JSON\n  optimizer   measure and optionally save optimized settings\n\nDefaults:\n  display:   --gpu --no-vig-correction --vsync --default --with-overlay\n  dng:       --gpu --with-vig-correction --default\n  pipe:      --gpu --with-vig-correction --default\n\nPIPE output contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n  Diagnostics, progress, and warnings use stderr only.\n\nDisplay audio:\n  display --with-sound plays synced clip audio and is valid only with Vsync display.\n  display --with-sound cannot be combined with --no-vsync.\n\nDNG mounts:\n  dng FILE.mcraw mounts one virtual DNG and audio folder; it does not export DNGs directly.\n  The command serves one foreground per-file mountpoint under the mcraw4vulkan folder in your home directory.\n  Start one dng command per mounted clip; press Ctrl-C to stop a foreground mount.\n\nDNG unmounts:\n  dng unmount FILE.mcraw  unmount the per-file DNG mount for FILE.mcraw\n  dng unmount all         unmount all mcraw4vulkan-owned DNG mounts\n\nExamples:\n  mcraw4vulkan display --gpu --no-vig-correction --vsync --with-overlay --default FILE.mcraw\n  mcraw4vulkan display --with-sound FILE.mcraw\n  mcraw4vulkan display --cpu --no-vsync --no-overlay FILE.mcraw\n  mcraw4vulkan dng --gpu --with-vig-correction --default FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe --gpu --with-vig-correction --output clip.yuv444p12le FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
+        "mcraw4vulkan\n\nUsage:\n  mcraw4vulkan display [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--vsync|--no-vsync] [--with-sound] [--default|--optimized] [--with-overlay|--no-overlay] FILE.mcraw\n  mcraw4vulkan dng [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nCommands:\n  display     show the 8-bit preview in a window; press F to toggle fullscreen\n  dng         mount or unmount mcraw4vulkan-owned virtual DNG plus audio folders\n  pipe        write direct yuv444p12le rawvideo or print PIPE metadata JSON\n  optimizer   measure and optionally save optimized settings\n\nDefaults:\n  display:   --gpu --no-vig-correction --vsync --default --with-overlay\n  dng:       --gpu --with-vig-correction --default\n  pipe:      --gpu --with-vig-correction --default\n\nPIPE output contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n  Diagnostics, progress, and warnings use stderr only.\n\nDisplay audio:\n  display --with-sound plays synced clip audio and is valid only with Vsync display.\n  display --with-sound cannot be combined with --no-vsync.\n\nDNG mounts:\n  dng FILE.mcraw mounts one virtual DNG and audio folder; it does not export DNGs directly.\n  The command serves one foreground per-file mountpoint under the mcraw4vulkan folder in your home directory.\n  Start one dng command per mounted clip; press Ctrl-C to stop a foreground mount.\n\nDNG unmounts:\n  dng unmount FILE.mcraw  unmount the per-file DNG mount for FILE.mcraw\n  dng unmount all         unmount all mcraw4vulkan-owned DNG mounts\n\nExamples:\n  mcraw4vulkan display --gpu --no-vig-correction --vsync --with-overlay --default FILE.mcraw\n  mcraw4vulkan display --with-sound FILE.mcraw\n  mcraw4vulkan display --cpu --no-vsync --no-overlay FILE.mcraw\n  mcraw4vulkan dng --gpu --with-vig-correction --default FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe --gpu --with-vig-correction --output clip.yuv444p12le FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
     }
 
     pub fn pipe_usage() -> &'static str {
-        "mcraw4vulkan pipe\n\nUsage:\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n\nOptions:\n  --metadata   print strict PIPE sidecar version 4 JSON without rendering video\n  --output     write raw yuv444p12le video bytes to FILE\n\nOutput contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
+        "mcraw4vulkan pipe\n\nUsage:\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n\nOptions:\n  --pipe-example   print the existing complete FFmpeg recipe only\n  --export         export one movie to home/mcraw4vulkan/exported_movies\n  --export-folder  export direct .mcraw files from FOLDER to the same home destination\n  --metadata   print strict PIPE sidecar version 4 JSON without rendering video\n  --output     write raw yuv444p12le video bytes to FILE\n\nOutput contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
     }
 }
 
@@ -232,7 +248,80 @@ pub fn run_production_command(command: Mcraw4VulkanCommand) -> Result<()> {
             let mut writer = stdout.lock();
             write_pipe_metadata_json_for_config(&config, &mut writer)
         }
+        Mcraw4VulkanCommand::PipeAction(action, command) => run_pipe_action(action, command),
         Mcraw4VulkanCommand::Optimizer(command) => run_optimizer_command(command),
+    }
+}
+
+fn run_pipe_action(action: PipeAction, command: PipeCommand) -> Result<()> {
+    use crate::movie_export::{
+        ExportHandle, ExportInputs, ExportOptions, ExportRequest, ProducerLocation,
+    };
+    let options = ExportOptions {
+        backend: command.backend,
+        settings: command.settings,
+        vignette: command.vignette == VignetteCorrectionChoice::WithCorrection,
+    };
+    if action == PipeAction::Example {
+        let facts = crate::pipe_example_facts_for_input(&command.input)?;
+        let example = crate::pipe_example::build_pipe_example(
+            &command.input,
+            facts,
+            options.backend,
+            options.settings,
+            options.vignette,
+            crate::pipe_example::current_command_target(),
+        );
+        println!("{}", example.command);
+        return Ok(());
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = std::sync::Arc::clone(&cancel);
+    ctrlc::try_set_handler(move || signal.store(true, std::sync::atomic::Ordering::Relaxed))
+        .map_err(|e| anyhow!("could not register export Ctrl-C handler: {e}"))?;
+    let inputs = if action == PipeAction::ExportFolder {
+        ExportInputs::Folder(command.input)
+    } else {
+        ExportInputs::Files(vec![command.input])
+    };
+    let mut handle = ExportHandle::start(
+        ExportRequest {
+            inputs,
+            options,
+            producer: ProducerLocation::ThisCli,
+            ffmpeg: None,
+        },
+        cancel,
+    )?;
+    let mut previous = String::new();
+    loop {
+        if let Some(result) = handle.poll() {
+            for job in &result.jobs {
+                eprintln!(
+                    "{}: {}: {}",
+                    job.outcome.label(),
+                    job.source.display(),
+                    job.reason
+                );
+            }
+            eprintln!("{}", result.snapshot.status_text());
+            if let Some(problem) = &result.problem {
+                eprintln!("{problem}");
+            }
+            if result.is_success() {
+                return Ok(());
+            }
+            if let Some(message) = result.cancellation_message() {
+                bail!("{message}");
+            }
+            bail!("export did not complete successfully");
+        }
+        let status = handle.snapshot().status_text();
+        if status != previous {
+            eprintln!("{status}");
+            previous = status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
@@ -622,7 +711,38 @@ fn parse_pipe_command(args: &[String]) -> Result<Mcraw4VulkanCommand> {
         return Ok(Mcraw4VulkanCommand::PipeHelp);
     }
 
-    if args.iter().any(|arg| arg == "--metadata") {
+    let options = args.iter().take_while(|arg| arg.as_str() != "--");
+    let actions: Vec<_> = options
+        .clone()
+        .enumerate()
+        .filter_map(|(index, arg)| match arg.as_str() {
+            "--pipe-example" => Some((index, PipeAction::Example)),
+            "--export" => Some((index, PipeAction::Export)),
+            "--export-folder" => Some((index, PipeAction::ExportFolder)),
+            _ => None,
+        })
+        .collect();
+    if !actions.is_empty() {
+        if actions.len() != 1 {
+            bail!("PIPE action selectors are mutually exclusive and may appear only once");
+        }
+        if options.clone().any(|arg| {
+            arg == "--metadata"
+                || arg == "--output"
+                || arg.starts_with("--output=")
+                || is_internal_measurement_option(arg)
+        }) {
+            bail!(
+                "PIPE example/export cannot be combined with metadata, raw output, or internal measurements"
+            );
+        }
+        let (index, action) = actions[0];
+        let mut raw_args = args.to_vec();
+        raw_args.remove(index);
+        let parsed = parse_pipe(&raw_args)?;
+        return Ok(Mcraw4VulkanCommand::PipeAction(action, parsed));
+    }
+    if options.clone().any(|arg| arg == "--metadata") {
         return parse_pipe_metadata(args).map(Mcraw4VulkanCommand::PipeMetadata);
     }
 
@@ -637,6 +757,12 @@ fn parse_pipe_metadata(args: &[String]) -> Result<PipeMetadataCommand> {
     let mut input: Option<PathBuf> = None;
     let mut index = 0usize;
     while index < args.len() {
+        if args[index] == "--" {
+            for value in &args[index + 1..] {
+                set_input(&mut input, value, "pipe --metadata")?;
+            }
+            break;
+        }
         match args[index].as_str() {
             "--metadata" => {
                 if metadata_seen {
@@ -644,6 +770,12 @@ fn parse_pipe_metadata(args: &[String]) -> Result<PipeMetadataCommand> {
                 }
                 metadata_seen = true;
                 index += 1;
+                if args.get(index).is_some_and(|s| s == "--") {
+                    for value in &args[index + 1..] {
+                        set_input(&mut input, value, "pipe --metadata")?;
+                    }
+                    break;
+                }
                 let path = next_value(args, index, "--metadata")?;
                 set_input(&mut input, path, "pipe --metadata")?;
             }
@@ -701,6 +833,12 @@ fn parse_pipe(args: &[String]) -> Result<PipeCommand> {
 
     let mut index = 0usize;
     while index < args.len() {
+        if args[index] == "--" {
+            for value in &args[index + 1..] {
+                set_input(&mut input, value, "pipe")?;
+            }
+            break;
+        }
         if is_internal_measurement_option(args[index].as_str()) {
             index = consume_internal_measurement_flag(args, index, &mut internal_measurement)?;
             index += 1;

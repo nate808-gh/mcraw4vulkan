@@ -197,6 +197,88 @@ pub const MAIN_SKELETON_LABELS: &[&str] = &[
     "No files in playlist.",
 ];
 
+pub fn client_layout(mode: MainLayoutMode, width: f32, density: style::Density) -> MainLayout {
+    let (primary, options) = if density == style::Density::Compact {
+        let extra = (width - 1280.0).clamp(0.0, 40.0);
+        (544.0 + 0.4 * extra, 336.0 + 0.6 * extra)
+    } else {
+        let extra = (width - 1656.0).clamp(0.0, 120.0);
+        (648.0 + 2.0 * extra / 3.0, 432.0 + extra / 3.0)
+    };
+    let options = if mode == MainLayoutMode::Expanded {
+        options
+    } else {
+        0.0
+    };
+    let margin = density.margin();
+    let gap = density.gutter();
+    MainLayout {
+        mode,
+        primary_controls_width: primary,
+        more_options_width: options,
+        display_width: (non_negative_finite(width)
+            - 2.0 * margin
+            - primary
+            - options
+            - gap * active_gap_count(mode) as f32)
+            .max(0.0),
+        outer_margin: margin,
+        column_gap: gap,
+    }
+}
+
+/// Required section allocations, measured without input through the shared widgets.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlHeights {
+    pub playlist_fixed: f32,
+    pub settings: f32,
+    pub quick: f32,
+    pub dng: f32,
+    pub status: f32,
+    pub footer: f32,
+}
+
+impl ControlHeights {
+    pub fn rows(
+        self,
+        available: f32,
+        density: style::Density,
+        roomy: bool,
+    ) -> SharedControlsRowLayout {
+        let available_height = non_negative_finite(available);
+        let roomy = roomy && density == style::Density::Normal;
+        let gap = if density == style::Density::Compact {
+            8.0
+        } else if roomy {
+            25.0
+        } else {
+            20.0
+        };
+        let quick = self.quick.max(if roomy { 142.0 } else { 0.0 });
+        let dng = self.dng.max(if roomy { 206.0 } else { 0.0 });
+        let status = self.status.max(if roomy { 72.0 } else { 0.0 });
+        let lower = quick + dng + status + self.footer + 4.0 * gap;
+        let list_min = if density == style::Density::Compact {
+            119.4
+        } else {
+            120.0
+        };
+        let top = (available_height - lower).max(self.settings.max(self.playlist_fixed + list_min));
+        SharedControlsRowLayout {
+            available_height,
+            gap,
+            top_height: top,
+            playlist_list_height: (top - self.playlist_fixed).max(0.0),
+            quick_preview_height: quick,
+            dng_height: dng,
+            status_height: status,
+            footer_height: self.footer,
+            total_used_height: top + lower,
+            outer_scroll_required: top + lower > available_height + 0.01,
+        }
+    }
+}
+
 pub fn target_main_layout(mode: MainLayoutMode, available_width: f32) -> MainLayout {
     let content_width = (non_negative_finite(available_width) - MAIN_OUTER_MARGIN * 2.0).max(0.0);
     let fixed_region_width = fixed_region_width(mode);
@@ -355,6 +437,7 @@ impl ControlRowBounds {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SharedControlsRowLayout {
+    pub gap: f32,
     pub available_height: f32,
     pub top_height: f32,
     pub playlist_list_height: f32,
@@ -368,18 +451,22 @@ pub struct SharedControlsRowLayout {
 
 impl SharedControlsRowLayout {
     pub fn fixed_lower_control_height(self) -> f32 {
-        shared_fixed_lower_control_height()
+        self.quick_preview_height
+            + self.dng_height
+            + self.status_height
+            + self.footer_height
+            + 4.0 * self.gap
     }
 
     pub fn row_bounds(self, row: ControlRow) -> ControlRowBounds {
         let top_bottom = self.top_height;
-        let quick_top = top_bottom + SHARED_CONTROL_ROW_GAP;
+        let quick_top = top_bottom + self.gap;
         let quick_bottom = quick_top + self.quick_preview_height;
-        let dng_top = quick_bottom + SHARED_CONTROL_ROW_GAP;
+        let dng_top = quick_bottom + self.gap;
         let dng_bottom = dng_top + self.dng_height;
-        let status_top = dng_bottom + SHARED_CONTROL_ROW_GAP;
+        let status_top = dng_bottom + self.gap;
         let status_bottom = status_top + self.status_height;
-        let footer_top = status_bottom + SHARED_CONTROL_ROW_GAP;
+        let footer_top = status_bottom + self.gap;
 
         match row {
             ControlRow::Top => ControlRowBounds {
@@ -432,6 +519,7 @@ pub fn shared_controls_row_layout(available_height: f32) -> SharedControlsRowLay
     let total_used_height = top_height + fixed_lower_control_height;
 
     SharedControlsRowLayout {
+        gap: SHARED_CONTROL_ROW_GAP,
         available_height,
         top_height,
         playlist_list_height: (top_height - PRIMARY_PLAYLIST_FIXED_HEIGHT).max(0.0),

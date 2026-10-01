@@ -1890,3 +1890,22 @@ fn path_stem(path: &Path) -> Result<String> {
     }
     Ok(stem.to_string())
 }
+
+// Narrow orchestration adapters retain production metadata/layout/publication owners.
+pub(crate) fn pipe_sidecar_paths(input: &Path, directory: &Path) -> Result<(PathBuf, PathBuf)> {
+    let outputs = resolve_pipe_visible_outputs(input, None, directory)?;
+    Ok((outputs.audio_sidecar_path, outputs.metadata_sidecar_path))
+}
+pub(crate) fn publish_movie_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    publish_temp_no_replace(source, destination).map(|_| ())
+}
+pub(crate) fn pipe_export_facts_for_input(
+    input: &Path,
+) -> Result<(crate::PipeExampleFacts, u64, bool)> {
+    let container = McrawContainer::open_for_display_with_audio(input)?;
+    Ok((
+        pipe_example_facts_from_container(&container)?,
+        u64::try_from(container.frame_count())?,
+        container.audio_info().is_some(),
+    ))
+}

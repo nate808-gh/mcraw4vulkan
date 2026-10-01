@@ -7,7 +7,7 @@ mcraw4vulkan is a Rust application for displaying and processing MotionCam RAW
 
 ## Public Beta status
 
-This source tree is Beta 0.9.1. Preserve original recordings and validate
+This source tree is Beta 0.9.2. Preserve original recordings and validate
 outputs before relying on them in a production workflow. Interfaces and package
 details may change as Beta feedback is incorporated.
 

@@ -2,8 +2,9 @@
 
 pub mod app;
 pub mod dng_actions;
+mod export_actions;
 pub mod file_chooser;
-mod gui_child_process;
+mod gui_process;
 pub mod gui_settings;
 pub mod lazy_loop;
 pub mod main_view;

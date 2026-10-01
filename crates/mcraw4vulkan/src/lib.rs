@@ -8,8 +8,10 @@ pub mod dng_mount_registry;
 pub(crate) mod measurement;
 mod measurement_cli;
 mod measurement_report;
+pub mod movie_export;
 mod pipe_cli;
 mod pipe_contract;
+pub mod pipe_example;
 pub(crate) mod strict_motioncam_color;
 
 pub use app_policy::{DngAppBackendPolicy, DngAppPolicy, DngMountPolicy};

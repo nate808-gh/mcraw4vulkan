@@ -81,7 +81,10 @@ impl WindowSize {
     }
 
     pub fn is_zero(self) -> bool {
-        self.drawable_width == 0 || self.drawable_height == 0
+        self.window_width == 0
+            || self.window_height == 0
+            || self.drawable_width == 0
+            || self.drawable_height == 0
     }
 
     pub fn scale_factor(self) -> f64 {
@@ -392,6 +395,13 @@ impl Sdl2WgpuSurface {
         self.alpha_mode
     }
 
+    /// Refresh this window, retaining no inferred desktop or monitor dimensions.
+    /// The established drawable getter is retained for the Metal-view contract.
+    pub fn refresh_window_size(&mut self) -> WindowSize {
+        self.size = WindowSize::from_window(&self.window);
+        self.size
+    }
+
     pub fn size(&self) -> WindowSize {
         self.size
     }
@@ -453,7 +463,27 @@ impl Sdl2WgpuSurface {
         &mut self,
         render: impl FnOnce(RenderFrameContext<'_>),
     ) -> Result<RenderFrameStatus, Sdl2WgpuSurfaceError> {
-        self.size = WindowSize::from_window(&self.window);
+        self.render_frame_checked(None, render)
+    }
+
+    /// Submit only when acquisition agrees with the client's layout/input snapshot.
+    pub fn render_frame_at_size(
+        &mut self,
+        expected: WindowSize,
+        render: impl FnOnce(RenderFrameContext<'_>),
+    ) -> Result<RenderFrameStatus, Sdl2WgpuSurfaceError> {
+        self.render_frame_checked(Some(expected), render)
+    }
+
+    fn render_frame_checked(
+        &mut self,
+        expected: Option<WindowSize>,
+        render: impl FnOnce(RenderFrameContext<'_>),
+    ) -> Result<RenderFrameStatus, Sdl2WgpuSurfaceError> {
+        self.refresh_window_size();
+        if expected.is_some_and(|size| size != self.size) {
+            return Ok(RenderFrameStatus::SurfaceChanged);
+        }
 
         if self.size.is_zero() {
             self.config = None;
@@ -489,6 +519,11 @@ impl Sdl2WgpuSurface {
             texture_size.width,
             texture_size.height,
         );
+        if expected.is_some_and(|size| size != frame_size) {
+            // Drop this acquisition without submitting shapes for a different size.
+            self.config = None;
+            return Ok(RenderFrameStatus::SurfaceChanged);
+        }
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());

@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use egui::emath::GuiRounding;
 use egui::{
     Align, Align2, CentralPanel, ColorImage, Context, Event as EguiEvent, FontId, Frame, Image,
     Layout, Modifiers, MouseWheelUnit, OutputCommand, PlatformOutput, PointerButton, Pos2,
@@ -57,7 +58,6 @@ const SPLASH_IMAGE_BYTES: &[u8] = include_bytes!("../../../packaging/splash.png"
 const SPLASH_IMAGE_WIDTH: usize = 1600;
 const SPLASH_IMAGE_HEIGHT: usize = 347;
 const SPLASH_VERSION_LABEL: &str = concat!("Version ", env!("CARGO_PKG_VERSION"));
-const MAIN_MIN_COLUMN_HEIGHT: f32 = 520.0;
 const PREFLIGHT_SPLASH_MIN_VISIBLE_MS: u64 = 5_000;
 const FILE_CHOOSER_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const DNG_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -232,6 +232,14 @@ impl From<Sdl2WgpuSurfaceError> for GuiError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PipeBody {
+    #[default]
+    About,
+    Example,
+    Export,
+}
+
 struct GuiApp {
     phase: AppPhase,
     preflight: PreflightViewModel,
@@ -247,14 +255,18 @@ struct GuiApp {
     dng_binary: PathBuf,
     optimizer: GuiOptimizer,
     optimizer_binary: PathBuf,
+    movie_export: crate::export_actions::GuiMovieExport,
     preview_area: Option<PreviewLogicalRect>,
     preview_fullscreen: bool,
     preview_fullscreen_exit_pending: bool,
     splash_window_size_pending: bool,
     main_window_maximize_pending: bool,
     defer_preview_advance_once: bool,
+    control_heights: Option<((style::Density, f32, f32, f32), main_view::ControlHeights)>,
     more_options_visible: bool,
     pipe_example: Option<PipeExamplePanel>,
+    pipe_body: PipeBody,
+    pipe_vignette: bool,
     right_pane_owner: RightPaneOwner,
     right_pane_frame_owner: RightPaneOwner,
     pending_right_pane_request: Option<RightPaneRequest>,
@@ -402,7 +414,7 @@ enum AppPhase {
 }
 
 // Only one functional owner may use the right pane at a time. A replacement
-// waits until the current owner's renderer or child process has finished teardown.
+// waits until the current owner's renderer or process has finished teardown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightPaneOwner {
     Idle,
@@ -414,6 +426,7 @@ enum RightPaneOwner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RightPaneRequest {
     StartPreview(PreparedPreviewRequest),
+    ShowPipeAbout,
     ShowPipeExample(PreparedPipeRequest),
     StartOptimizer(PreparedOptimizerRequest),
 }
@@ -461,14 +474,18 @@ impl GuiApp {
             dng_binary: resolve_mcraw4vulkan_binary(),
             optimizer: GuiOptimizer::default(),
             optimizer_binary: resolve_mcraw4vulkan_binary(),
+            movie_export: crate::export_actions::GuiMovieExport::default(),
             preview_area: None,
             preview_fullscreen: false,
             preview_fullscreen_exit_pending: false,
             splash_window_size_pending: true,
             main_window_maximize_pending: false,
             defer_preview_advance_once: false,
+            control_heights: None,
             more_options_visible: false,
             pipe_example: None,
+            pipe_body: PipeBody::About,
+            pipe_vignette: true,
             right_pane_owner: RightPaneOwner::Idle,
             right_pane_frame_owner: RightPaneOwner::Idle,
             pending_right_pane_request: None,
@@ -505,6 +522,21 @@ impl GuiApp {
 
     fn quit_requested(&self) -> bool {
         self.quit_requested
+            && self.pending_file_chooser.is_none()
+            && !self.movie_export.needs_poll()
+    }
+
+    fn request_close(&mut self) -> bool {
+        self.quit_requested = true;
+        if let Some(chooser) = &mut self.pending_file_chooser {
+            chooser.cancel();
+        }
+        self.movie_export.cancel();
+        if !self.quit_requested() {
+            // Keep the ordinary status UI visible if cleanup needs attention.
+            self.request_preview_fullscreen_exit();
+        }
+        self.quit_requested()
     }
 
     fn main_layout_mode(&self) -> main_view::MainLayoutMode {
@@ -554,6 +586,11 @@ impl GuiApp {
     }
 
     fn ui(&mut self, context: &Context, now: Instant) {
+        style::select_density(context);
+        if self.movie_export.needs_poll() {
+            context.request_repaint_after(FILE_CHOOSER_POLL_INTERVAL);
+        }
+        self.movie_export.recovery_dialog(context);
         if let Some(repaint_after) = self.preflight_repaint_after(now) {
             context.request_repaint_after(repaint_after);
         }
@@ -579,51 +616,57 @@ impl GuiApp {
             CentralPanel::default()
                 .frame(Frame::new().fill(style::background()))
                 .show(context, |_ui| {});
+            self.admit_movie_export_retry();
             return;
         }
 
         CentralPanel::default()
             .frame(Frame::new().fill(style::background()))
-            .show(context, |ui| match self.phase {
-                AppPhase::MainSkeleton => self.main_gui(ui),
-                AppPhase::PreflightStarting
-                | AppPhase::PreflightReadyVisible { .. }
-                | AppPhase::PreflightNotReady => self.preflight_splash(ui),
+            .show(context, |ui| {
+                if self.quit_requested {
+                    ui.disable();
+                }
+                match self.phase {
+                    AppPhase::MainSkeleton => self.main_gui(ui),
+                    AppPhase::PreflightStarting
+                    | AppPhase::PreflightReadyVisible { .. }
+                    | AppPhase::PreflightNotReady => self.preflight_splash(ui),
+                }
             });
         self.draw_macos_mount_limit_warning(context);
+        // Deliver only after this frame's Cancel/close controls have invalidated stale work.
+        self.admit_movie_export_retry();
     }
 
     fn main_gui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(style::OUTER_MARGIN);
+        ui.add_space(style::metrics(ui).margin());
         ui.horizontal(|ui| {
-            ui.add_space(style::OUTER_MARGIN);
+            ui.add_space(style::metrics(ui).margin());
             ui.vertical(|ui| {
-                ui.add_space(2.0);
+                ui.add_space(style::metrics(ui).space(2.0));
                 ui.label(
                     RichText::new(WINDOW_TITLE)
-                        .size(style::HEADING_FONT_SIZE)
+                        .size(style::metrics(ui).font(style::HEADING_FONT_SIZE))
                         .color(style::header_text()),
                 );
                 ui.label(
                     RichText::new(SUBTITLE)
-                        .size(style::BODY_FONT_SIZE)
+                        .size(style::metrics(ui).font(style::BODY_FONT_SIZE))
                         .color(style::body_text()),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(style::OUTER_MARGIN);
-                if ui
-                    .add_sized(
-                        vec2(header_quit_button_width(), ui.spacing().interact_size.y),
-                        egui::Button::new("Quit"),
-                    )
-                    .clicked()
-                {
-                    self.quit_requested = true;
+                ui.add_space(style::metrics(ui).margin());
+                let response = ui.add_sized(
+                    vec2(header_quit_button_width(), ui.spacing().interact_size.y),
+                    egui::Button::new("Quit"),
+                );
+                if response.clicked() {
+                    self.request_close();
                 }
             });
         });
-        ui.add_space(14.0);
+        ui.add_space(style::metrics(ui).space(14.0));
         draw_divider(ui);
         self.main_skeleton(ui);
     }
@@ -656,12 +699,12 @@ impl GuiApp {
     fn preflight_panel(&self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(PREFLIGHT_PANEL_TITLE)
-                .size(style::PANEL_TITLE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::PANEL_TITLE_FONT_SIZE))
                 .color(style::header_text()),
         );
-        ui.add_space(6.0);
+        ui.add_space(style::metrics(ui).space(6.0));
         draw_divider(ui);
-        ui.add_space(14.0);
+        ui.add_space(style::metrics(ui).space(14.0));
 
         let status_color = if self.preflight.ready {
             style::bright_blue()
@@ -670,140 +713,183 @@ impl GuiApp {
         };
         ui.label(
             RichText::new(&self.preflight.status_line)
-                .size(style::STATUS_FONT_SIZE)
+                .size(style::metrics(ui).font(style::STATUS_FONT_SIZE))
                 .color(status_color),
         );
         ui.label(
             RichText::new(SPLASH_VERSION_LABEL)
-                .size(style::SMALL_FONT_SIZE)
+                .size(style::metrics(ui).font(style::SMALL_FONT_SIZE))
                 .color(style::body_text()),
         );
         ui.label(
             RichText::new(&self.preflight.detail_line)
-                .size(style::DETAIL_FONT_SIZE)
+                .size(style::metrics(ui).font(style::DETAIL_FONT_SIZE))
                 .color(style::muted_text()),
         );
-        ui.add_space(16.0);
+        ui.add_space(style::metrics(ui).space(16.0));
         draw_detail_line(ui, &self.ram_line, LineStatus::Informational);
         for line in &self.preflight.lines {
             draw_detail_line(ui, &line.text, line.status);
         }
     }
 
-    fn main_skeleton(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(18.0);
-        let layout = main_view::target_main_layout(self.main_layout_mode(), ui.available_width());
-        let column_height =
-            (ui.available_height() - style::OUTER_MARGIN).max(MAIN_MIN_COLUMN_HEIGHT);
-
-        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-            ui.add_space(layout.outer_margin);
-            if layout.mode == main_view::MainLayoutMode::Expanded {
-                self.draw_expanded_controls_region(ui, layout, column_height);
-                ui.add_space(layout.column_gap);
-            } else {
-                self.draw_condensed_controls_region(ui, layout, column_height);
-                ui.add_space(layout.column_gap);
-            }
-            draw_column_frame(
-                ui,
-                layout.display_width,
-                column_height,
-                |ui, content_height| {
-                    self.draw_display_playback_region(ui, content_height);
-                },
-            );
-            ui.add_space(layout.outer_margin);
-        });
-    }
-
-    fn draw_condensed_controls_region(
+    fn control_rows(
         &mut self,
         ui: &mut egui::Ui,
         layout: main_view::MainLayout,
-        column_height: f32,
-    ) {
-        let content_height = main_view::column_content_height(column_height);
-        let row_layout = main_view::shared_controls_row_layout(content_height);
-        if row_layout.outer_scroll_required {
-            self.draw_scrolled_primary_controls(ui, layout.primary_controls_width, column_height);
-        } else {
-            self.draw_primary_controls_frame(ui, layout.primary_controls_width, column_height);
-        }
-    }
-
-    fn draw_expanded_controls_region(
-        &mut self,
-        ui: &mut egui::Ui,
-        layout: main_view::MainLayout,
-        column_height: f32,
-    ) {
-        let content_height = main_view::column_content_height(column_height);
-        let row_layout = main_view::shared_controls_row_layout(content_height);
-        let controls_width =
-            layout.primary_controls_width + layout.column_gap + layout.more_options_width;
-
-        if row_layout.outer_scroll_required {
-            ui.allocate_ui_with_layout(
-                vec2(controls_width, column_height),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt(SHARED_CONTROLS_SCROLL_ID)
-                        .auto_shrink([false, false])
-                        .max_height(column_height)
-                        .show(ui, |ui| {
-                            ui.set_width(controls_width);
-                            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                                self.draw_primary_controls_frame_for_rows(
-                                    ui,
-                                    layout.primary_controls_width,
-                                    row_layout,
-                                );
-                                ui.add_space(layout.column_gap);
-                                self.draw_more_options_frame_for_rows(
-                                    ui,
-                                    layout.more_options_width,
-                                    row_layout,
-                                );
-                            });
-                        });
-                },
-            );
-        } else {
-            self.draw_primary_controls_frame(ui, layout.primary_controls_width, column_height);
-            ui.add_space(layout.column_gap);
-            self.draw_more_options_frame(ui, layout.more_options_width, column_height);
-        }
-    }
-
-    fn draw_scrolled_primary_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        width: f32,
-        column_height: f32,
-    ) {
-        let content_height = main_view::column_content_height(column_height);
-        let row_layout = main_view::shared_controls_row_layout(content_height);
-        ui.allocate_ui_with_layout(
-            vec2(width, column_height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt(SHARED_CONTROLS_SCROLL_ID)
-                    .auto_shrink([false, false])
-                    .max_height(column_height)
-                    .show(ui, |ui| {
-                        self.draw_primary_controls_frame_for_rows(ui, width, row_layout);
-                    });
-            },
+        height: f32,
+        roomy: bool,
+    ) -> main_view::SharedControlsRowLayout {
+        let density = style::metrics(ui);
+        // Options width is determined by client policy even when its column is hidden.
+        let expanded = main_view::client_layout(
+            main_view::MainLayoutMode::Expanded,
+            ui.available_width(),
+            density,
         );
+        let primary = (layout.primary_controls_width - 2.0 * density.inset()).max(0.0);
+        let options = (expanded.more_options_width - 2.0 * density.inset()).max(0.0);
+        let key = (density, primary, options, ui.ctx().pixels_per_point());
+        // Keep parent widget IDs stable when the cached measurement is reused.
+        let mut measure_root = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("control-measure-root")
+                .invisible(),
+        );
+        if self
+            .control_heights
+            .as_ref()
+            .is_none_or(|(old, _)| *old != key)
+        {
+            let mut sizes = [0.0; 7];
+            for (section, size) in sizes.iter_mut().enumerate() {
+                let width = if matches!(section, 0 | 2 | 3 | 5) {
+                    primary
+                } else {
+                    options
+                };
+                let mut measure = measure_root.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("control-measure", section))
+                        .sizing_pass()
+                        .invisible()
+                        .max_rect(Rect::from_min_size(Pos2::ZERO, vec2(width, 4096.0)))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                measure.set_width_range(width..=width);
+                match section {
+                    0 => self.draw_playlist_section(&mut measure, 0.0),
+                    1 => {
+                        draw_more_options_top_settings(&mut measure, &mut self.settings, false);
+                    }
+                    2 => self.draw_quick_preview_primary_section(&mut measure),
+                    3 => self.draw_dng_primary_section(&mut measure),
+                    4 => {
+                        draw_quick_preview_options(&mut measure, &mut self.settings);
+                    }
+                    5 => {
+                        draw_playlist_status_area(&mut measure, None);
+                    }
+                    _ => {
+                        draw_optimizer_settings(&mut measure, &mut self.settings, false);
+                    }
+                }
+                *size = measure.min_rect().height();
+            }
+            let padding = 2.0 * density.row_padding();
+            self.control_heights = Some((
+                key,
+                main_view::ControlHeights {
+                    playlist_fixed: sizes[0],
+                    settings: sizes[1].ceil() + 1.0,
+                    quick: sizes[2].max(sizes[4]).ceil() + padding + 1.0,
+                    dng: sizes[3]
+                        .max(if density == style::Density::Compact {
+                            sizes[6]
+                        } else {
+                            0.0
+                        })
+                        .ceil()
+                        + padding
+                        + 1.0,
+                    status: sizes[5].ceil(),
+                    footer: density.font(34.0).ceil() + padding,
+                },
+            ));
+        }
+        let heights = self
+            .control_heights
+            .as_ref()
+            .expect("measured control heights")
+            .1;
+        let available = (height - 2.0 * density.inset()).max(0.0);
+        let constrained = heights.rows(available, density, false);
+        let generous = heights.rows(available, density, roomy);
+        if generous.outer_scroll_required {
+            constrained
+        } else {
+            generous
+        }
     }
 
-    fn draw_primary_controls_frame(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
-        draw_column_frame(ui, width, height, |ui, content_height| {
-            let row_layout = main_view::shared_controls_row_layout(content_height);
-            self.draw_primary_controls_column(ui, row_layout);
+    fn main_skeleton(&mut self, ui: &mut egui::Ui) {
+        let density = style::metrics(ui);
+        ui.add_space(density.space(18.0));
+        let client = ui.ctx().input(|input| input.screen_rect().size());
+        let layout =
+            main_view::client_layout(self.main_layout_mode(), ui.available_width(), density);
+        let column_height = (ui.available_height() - density.margin()).max(0.0);
+        let rows = self.control_rows(ui, layout, column_height, client.y >= 1040.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                ui.add_space(layout.outer_margin);
+                let controls_width = layout.primary_controls_width
+                    + layout.more_options_width
+                    + if layout.mode == main_view::MainLayoutMode::Expanded {
+                        layout.column_gap
+                    } else {
+                        0.0
+                    };
+                let mut controls = |ui: &mut egui::Ui| {
+                    self.draw_primary_controls_frame_for_rows(
+                        ui,
+                        layout.primary_controls_width,
+                        rows,
+                    );
+                    if layout.mode == main_view::MainLayoutMode::Expanded {
+                        ui.add_space(layout.column_gap);
+                        self.draw_more_options_frame_for_rows(ui, layout.more_options_width, rows);
+                    }
+                };
+                if rows.outer_scroll_required {
+                    // Existing below-envelope fallback. Supported clients never take it.
+                    ui.allocate_ui_with_layout(
+                        vec2(controls_width, column_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(SHARED_CONTROLS_SCROLL_ID)
+                                .auto_shrink([false, false])
+                                .max_height(column_height)
+                                .show(ui, |ui| {
+                                    ui.set_width(controls_width);
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.with_layout(
+                                        Layout::left_to_right(Align::Min),
+                                        &mut controls,
+                                    );
+                                });
+                        },
+                    );
+                } else {
+                    controls(ui);
+                }
+                ui.add_space(layout.column_gap);
+                draw_column_frame(ui, layout.display_width, column_height, |ui, height| {
+                    self.draw_display_playback_region(ui, height)
+                });
+            });
         });
     }
 
@@ -813,17 +899,9 @@ impl GuiApp {
         width: f32,
         row_layout: main_view::SharedControlsRowLayout,
     ) {
-        let frame_height =
-            row_layout.total_used_height + main_view::COLUMN_FRAME_INNER_MARGIN * 2.0;
+        let frame_height = row_layout.total_used_height + style::metrics(ui).inset() * 2.0;
         draw_column_frame(ui, width, frame_height, |ui, _content_height| {
             self.draw_primary_controls_column(ui, row_layout);
-        });
-    }
-
-    fn draw_more_options_frame(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
-        draw_column_frame(ui, width, height, |ui, content_height| {
-            let row_layout = main_view::shared_controls_row_layout(content_height);
-            self.draw_more_options_column(ui, row_layout);
         });
     }
 
@@ -833,8 +911,7 @@ impl GuiApp {
         width: f32,
         row_layout: main_view::SharedControlsRowLayout,
     ) {
-        let frame_height =
-            row_layout.total_used_height + main_view::COLUMN_FRAME_INNER_MARGIN * 2.0;
+        let frame_height = row_layout.total_used_height + style::metrics(ui).inset() * 2.0;
         draw_column_frame(ui, width, frame_height, |ui, _content_height| {
             self.draw_more_options_column(ui, row_layout);
         });
@@ -842,12 +919,26 @@ impl GuiApp {
 
     fn draw_display_playback_region(&mut self, ui: &mut egui::Ui, content_height: f32) {
         let owner = self.right_pane_frame_owner;
+        let before = ui.cursor().top();
+        if owner == RightPaneOwner::PipeExample {
+            self.draw_movie_export_actions(ui);
+        }
+        let content_height = (content_height - (ui.cursor().top() - before)).max(
+            if owner == RightPaneOwner::PipeExample {
+                0.0
+            } else {
+                180.0
+            },
+        );
         let response = draw_display_playback_column(
             ui,
             content_height,
             DisplayPlaybackState {
                 owner,
+                pipe_body: self.pipe_body,
                 pipe_example: self.pipe_example.as_ref(),
+                movie_export: (self.pipe_body == PipeBody::Export).then_some(&self.movie_export),
+                export_cancel_available: self.movie_export.options_locked(),
                 optimizer: &self.optimizer,
                 playback_control: self.preview.playback_control(),
                 preview_running: self.preview.is_running(),
@@ -870,6 +961,9 @@ impl GuiApp {
             self.seek_preview_to_frame(frame_index);
             ui.ctx().request_repaint();
         }
+        if response.export_cancel_clicked {
+            self.movie_export.cancel();
+        }
         if response.pipe_close_clicked {
             self.close_pipe_example();
             ui.ctx().request_repaint();
@@ -887,8 +981,185 @@ impl GuiApp {
             ui.ctx().request_repaint();
         }
     }
+    fn draw_movie_export_actions(&mut self, ui: &mut egui::Ui) {
+        draw_section_title(ui, pipe_example::HEADER);
+        ui.add_space(style::metrics(ui).space(16.0));
+        let available = self.movie_export_admission().is_ok();
+        let live_results = self.movie_export.is_running();
+        let gap = ui.spacing().item_spacing.x;
+        let ordinary_width = main_view::ordinary_primary_three_button_width(gap);
+        let cells = [
+            ButtonCell::new(
+                "Export Movie",
+                false,
+                live_results || (available && self.playlist.selected_path().is_some()),
+            )
+            .orange_emphasis(),
+            ButtonCell::new(
+                "Export All",
+                false,
+                live_results || (available && !self.playlist.is_empty()),
+            ),
+            ButtonCell::new("Pipe example", false, true),
+        ];
+        // Equal targets stay within the pane; below-envelope labels may clip,
+        // but cannot enlarge a target beyond its parent allocation.
+        let width = grid_width(
+            ui,
+            ((ui.available_width() - 2.0 * gap) / 3.0).min(ordinary_width),
+        );
+        let clicks = ui
+            .horizontal(|ui| {
+                cells.map(|cell| {
+                    let sense = if cell.enabled {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    };
+                    draw_button_cell_with_sense(ui, cell, width, sense).clicked()
+                })
+            })
+            .inner;
+        let vignette_clicked = draw_button_cell_with_sense(
+            ui,
+            ButtonCell::new(
+                "Vignette Correction",
+                self.pipe_vignette,
+                !self.movie_export.options_locked(),
+            ),
+            ordinary_width,
+            if self.movie_export.options_locked() {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
+        )
+        .clicked();
+        ui.add_space(style::metrics(ui).space(16.0));
+        if clicks[0] {
+            self.show_movie_export(false);
+        }
+        if clicks[1] {
+            self.show_movie_export(true);
+        }
+        if clicks[2] {
+            self.show_pipe_example();
+        }
+        if vignette_clicked {
+            self.toggle_pipe_vignette();
+        }
+    }
+
+    fn show_movie_export(&mut self, all: bool) {
+        if self.movie_export.is_running() {
+            if self.right_pane_owner == RightPaneOwner::PipeExample
+                && self.pending_right_pane_request.is_none()
+            {
+                self.pipe_body = PipeBody::Export;
+            }
+            return;
+        }
+        self.start_movie_export(all);
+    }
+
+    fn toggle_pipe_vignette(&mut self) {
+        if self.movie_export.options_locked() {
+            return;
+        }
+        self.pipe_vignette = !self.pipe_vignette;
+        if self.pipe_body == PipeBody::Example {
+            if let Some(request) = self.prepare_pipe_request() {
+                self.pipe_example = Some(request.panel);
+            }
+        }
+    }
+
+    fn movie_export_paths(&self, all: bool) -> Vec<PathBuf> {
+        if all {
+            // This is the active model saved by PlaylistStore to playlist.json.
+            // Preserve its order, including missing entries for explicit results.
+            self.playlist
+                .entries()
+                .iter()
+                .filter(|e| mcraw4vulkan::movie_export::is_mcraw(&e.source_path))
+                .map(|e| e.source_path.clone())
+                .collect()
+        } else {
+            self.playlist
+                .selected_path()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect()
+        }
+    }
+
+    fn start_movie_export(&mut self, all: bool) {
+        let paths = self.movie_export_paths(all);
+        if paths.is_empty() {
+            self.set_status("No playlist file is available for export.");
+            return;
+        }
+        let options = pipe_example::export_options(
+            self.settings.decode_mode(),
+            self.settings.optimizer_profile,
+            self.pipe_vignette,
+        );
+        let request = self.movie_export.new_request(paths, options);
+        self.admit_movie_export(request);
+    }
+
+    fn movie_export_admission(&self) -> Result<(), &'static str> {
+        if self.quit_requested || !self.movie_export.can_start() {
+            return Err(
+                "Export cannot start while closing, canceling, exporting or choosing an executable.",
+            );
+        }
+        if self.optimizer.is_running()
+            || !self.preview.right_pane_handoff_ready()
+            || self.pending_right_pane_request.is_some()
+        {
+            return Err(
+                "Export did not start: finish the current Preview, Optimizer or pane transition, then retry.",
+            );
+        }
+        Ok(())
+    }
+    fn admit_movie_export(&mut self, request: mcraw4vulkan::movie_export::ExportRequest) {
+        let result = self
+            .movie_export_admission()
+            .map_err(str::to_owned)
+            .and_then(|()| self.movie_export.start_snapshot(request));
+        if result.is_ok() {
+            self.pipe_body = PipeBody::Export;
+        }
+        if let Err(error) = result {
+            self.movie_export.message = Some(error.clone());
+            self.set_status(error);
+        }
+    }
+    fn admit_movie_export_retry(&mut self) {
+        if let Some(request) = self.movie_export.take_retry() {
+            self.admit_movie_export(request);
+        }
+    }
+
     fn show_pipe_example(&mut self) {
         self.request_pipe_owner();
+    }
+
+    fn open_pipe_pane(&mut self) {
+        if !self.pipe_navigation_available() {
+            return;
+        }
+        self.request_right_pane_owner(RightPaneRequest::ShowPipeAbout);
+    }
+
+    fn pipe_navigation_available(&mut self) -> bool {
+        if self.pending_right_pane_request.is_some() {
+            self.set_status("Wait for the pending right-pane transition, then retry.");
+            return false;
+        }
+        true
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -896,6 +1167,10 @@ impl GuiApp {
     }
 
     fn prepare_preview_request(&mut self) -> Option<PreparedPreviewRequest> {
+        if self.movie_export.is_running() {
+            self.set_status("Wait for movie export to finish or cancel it.");
+            return None;
+        }
         if self.mount_all_dngs_active() {
             self.set_status("Wait for Mount all DNGs to finish.");
             return None;
@@ -921,7 +1196,7 @@ impl GuiApp {
             Some(entry.source_path.as_path()),
             self.settings.decode_mode(),
             self.settings.optimizer_profile,
-            self.settings.dng_vignette,
+            self.pipe_vignette,
         );
         if let PipeExamplePanel::Error(message) = &panel {
             self.set_status(message.clone());
@@ -931,6 +1206,10 @@ impl GuiApp {
     }
 
     fn prepare_optimizer_request(&mut self) -> Option<PreparedOptimizerRequest> {
+        if self.movie_export.is_running() {
+            self.set_status("Wait for movie export to finish or cancel it.");
+            return None;
+        }
         if self.optimizer.is_running() {
             self.set_status("Optimizer is already running.");
             return None;
@@ -967,9 +1246,14 @@ impl GuiApp {
     }
 
     fn request_pipe_owner(&mut self) {
-        let Some(request) = self.prepare_pipe_request() else {
+        if !self.pipe_navigation_available() {
             return;
-        };
+        }
+        let request = self
+            .prepare_pipe_request()
+            .unwrap_or_else(|| PreparedPipeRequest {
+                panel: PipeExamplePanel::Message(pipe_example::NO_SELECTED_FILE_MESSAGE.to_owned()),
+            });
         self.request_right_pane_owner(RightPaneRequest::ShowPipeExample(request));
     }
 
@@ -981,6 +1265,15 @@ impl GuiApp {
     }
 
     fn request_right_pane_owner(&mut self, request: RightPaneRequest) {
+        if self.movie_export.is_running()
+            && !matches!(
+                request,
+                RightPaneRequest::ShowPipeAbout | RightPaneRequest::ShowPipeExample(_)
+            )
+        {
+            self.set_status("Wait for movie export to finish or cancel it.");
+            return;
+        }
         match self.right_pane_owner {
             RightPaneOwner::Preview if !self.preview.right_pane_handoff_ready() => {
                 self.pending_right_pane_request = Some(request);
@@ -1036,7 +1329,15 @@ impl GuiApp {
             RightPaneRequest::StartPreview(request) => {
                 self.start_prepared_preview(request, activation)
             }
+            RightPaneRequest::ShowPipeAbout => {
+                self.pipe_body = PipeBody::About;
+                self.optimizer.release_panel();
+                self.right_pane_owner = RightPaneOwner::PipeExample;
+                self.set_status("About mcraw4vulkan Pipe");
+                true
+            }
             RightPaneRequest::ShowPipeExample(request) => {
+                self.pipe_body = PipeBody::Example;
                 self.pipe_example = Some(request.panel);
                 self.optimizer.release_panel();
                 self.right_pane_owner = RightPaneOwner::PipeExample;
@@ -1107,6 +1408,9 @@ impl GuiApp {
     }
 
     fn advance_right_pane_transition(&mut self) -> bool {
+        if self.quit_requested {
+            return false;
+        }
         if self.right_pane_owner == RightPaneOwner::Preview
             && self.preview.right_pane_handoff_ready()
         {
@@ -1129,6 +1433,10 @@ impl GuiApp {
     }
 
     fn close_pipe_example(&mut self) {
+        if self.movie_export.is_running() {
+            self.set_status("Cancel or finish movie export before closing this pane.");
+            return;
+        }
         self.clear_pipe_example();
         self.right_pane_owner = RightPaneOwner::Idle;
         self.set_status("Pipe Example closed.");
@@ -1190,6 +1498,9 @@ impl GuiApp {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
+        if self.quit_requested {
+            return false;
+        }
         if self.mount_all_dngs_active() {
             self.set_status("Wait for Mount all DNGs to finish.");
             return false;
@@ -1528,7 +1839,7 @@ impl GuiApp {
             .open(&mut open)
             .show(context, |ui| {
                 draw_body_line(ui, &macos_mount_limit_warning_body(warning.playlist_count));
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 ui.vertical_centered(|ui| {
                     ok_clicked = ui.button(MACOS_MOUNT_LIMIT_WARNING_BUTTON).clicked();
                 });
@@ -1968,11 +2279,21 @@ impl GuiApp {
     }
 
     fn add_files_from_chooser(&mut self) -> bool {
-        if self.pending_file_chooser.is_some() {
-            self.set_status("File chooser is already open.");
-            return true;
+        if !self.admit_file_chooser() {
+            return false;
         }
         self.apply_file_chooser_start(file_chooser::start_mcraw_file_chooser())
+    }
+
+    fn admit_file_chooser(&mut self) -> bool {
+        if self.quit_requested {
+            return false;
+        }
+        if self.pending_file_chooser.is_some() {
+            self.set_status("File chooser is already open.");
+            return false;
+        }
+        true
     }
 
     fn apply_file_chooser_start(&mut self, start: FileChooserStart) -> bool {
@@ -1993,6 +2314,13 @@ impl GuiApp {
 
         match pending.poll() {
             FileChooserPoll::Pending => false,
+            FileChooserPoll::CleanupPending(message) => {
+                if self.status_message.as_ref() == Some(&message) {
+                    return false;
+                }
+                self.set_status(message);
+                true
+            }
             FileChooserPoll::Ready(outcome) => {
                 self.pending_file_chooser = None;
                 self.apply_file_chooser_outcome(outcome)
@@ -2002,7 +2330,10 @@ impl GuiApp {
 
     fn apply_file_chooser_outcome(&mut self, outcome: FileChooserOutcome) -> bool {
         match outcome {
-            FileChooserOutcome::Selected(paths) => self.add_dropped_paths(paths),
+            FileChooserOutcome::Selected(paths) if !self.quit_requested => {
+                self.add_dropped_paths(paths)
+            }
+            FileChooserOutcome::Selected(_) => false,
             FileChooserOutcome::Cancelled => {
                 self.set_status("File chooser cancelled.");
                 true
@@ -2105,7 +2436,7 @@ impl GuiApp {
         draw_controls_row(ui, row_layout.top_height, |ui| {
             self.draw_playlist_section(ui, row_layout.playlist_list_height);
         });
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_padded_controls_row(
             ui,
             row_layout.quick_preview_height,
@@ -2115,7 +2446,7 @@ impl GuiApp {
                 self.draw_quick_preview_primary_section(ui);
             },
         );
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_padded_controls_row(
             ui,
             row_layout.dng_height,
@@ -2125,11 +2456,11 @@ impl GuiApp {
                 self.draw_dng_primary_section(ui);
             },
         );
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_controls_row(ui, row_layout.status_height, |ui| {
             self.draw_status_section(ui);
         });
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_padded_controls_row(
             ui,
             row_layout.footer_height,
@@ -2143,7 +2474,7 @@ impl GuiApp {
 
     fn draw_playlist_section(&mut self, ui: &mut egui::Ui, playlist_height: f32) {
         draw_section_title(ui, "Playlist");
-        ui.add_space(8.0);
+        ui.add_space(style::metrics(ui).space(8.0));
         let response = draw_playlist_action_row(
             ui,
             self.pending_file_chooser.is_none() && self.playlist_mutation_controls_enabled(),
@@ -2161,9 +2492,9 @@ impl GuiApp {
             self.remove_all_playlist_entries();
             ui.ctx().request_repaint();
         }
-        ui.add_space(12.0);
+        ui.add_space(style::metrics(ui).space(12.0));
         draw_divider(ui);
-        ui.add_space(12.0);
+        ui.add_space(style::metrics(ui).space(12.0));
         draw_playlist_box(ui, playlist_height, &mut self.playlist);
     }
 
@@ -2173,7 +2504,7 @@ impl GuiApp {
             ui,
             "8 bit medium-quality preview. Toggle F key for full screen preview.",
         );
-        ui.add_space(8.0);
+        ui.add_space(style::metrics(ui).space(8.0));
         let response = draw_quick_preview_primary_row(
             ui,
             self.preview.is_running(),
@@ -2201,7 +2532,7 @@ impl GuiApp {
             ui,
             "DNG vignette correction avoids the magenta shift of Quick Preview",
         );
-        ui.add_space(8.0);
+        ui.add_space(style::metrics(ui).space(8.0));
         let dng_actions_enabled = self.dng_action_controls_enabled();
         let response = draw_dng_primary_grid(
             ui,
@@ -2252,7 +2583,7 @@ impl GuiApp {
                 draw_more_options_top_settings(ui, &mut self.settings, self.optimizer.is_active());
             self.handle_more_options_response(ui, response);
         });
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_padded_controls_row(
             ui,
             row_layout.quick_preview_height,
@@ -2263,11 +2594,19 @@ impl GuiApp {
                 self.handle_more_options_response(ui, response);
             },
         );
-        draw_shared_row_gap(ui);
-        draw_empty_controls_row(ui, row_layout.dng_height);
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
+        if style::metrics(ui) == style::Density::Compact {
+            draw_controls_row(ui, row_layout.dng_height, |ui| {
+                let response =
+                    draw_optimizer_settings(ui, &mut self.settings, self.optimizer.is_active());
+                self.handle_more_options_response(ui, response);
+            });
+        } else {
+            draw_empty_controls_row(ui, row_layout.dng_height);
+        }
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_empty_controls_row(ui, row_layout.status_height);
-        draw_shared_row_gap(ui);
+        draw_shared_row_gap(ui, row_layout.gap);
         draw_padded_controls_row(
             ui,
             row_layout.footer_height,
@@ -2292,13 +2631,12 @@ impl GuiApp {
             ui.ctx().request_repaint();
         }
         if response.pipe_example_clicked {
-            self.show_pipe_example();
+            self.open_pipe_pane();
             ui.ctx().request_repaint();
         }
     }
 }
 
-#[cfg_attr(test, allow(unreachable_code))]
 fn default_playlist_store() -> PlaylistStore {
     PlaylistStore::from_default_config()
 }
@@ -2426,7 +2764,7 @@ fn draw_column_frame(
         ui,
         width,
         height,
-        standard_column_frame_insets(),
+        ColumnFrameInsets::symmetric(style::metrics(ui).inset()),
         |ui, content_height, _geometry| {
             add_contents(ui, content_height);
         },
@@ -2460,10 +2798,6 @@ struct ColumnFrameGeometry {
     insets: ColumnFrameInsets,
 }
 
-fn standard_column_frame_insets() -> ColumnFrameInsets {
-    ColumnFrameInsets::symmetric(main_view::COLUMN_FRAME_INNER_MARGIN)
-}
-
 fn draw_column_frame_with_insets<T>(
     ui: &mut egui::Ui,
     width: f32,
@@ -2485,7 +2819,7 @@ fn draw_column_frame_with_insets<T>(
     let geometry = ColumnFrameGeometry {
         outer_rect: rect,
         inner_rect: content_rect,
-        clip_rect: content_rect,
+        clip_rect: bounded_clip(ui.clip_rect(), content_rect),
         insets,
     };
     let mut child_ui = ui.new_child(
@@ -2493,13 +2827,24 @@ fn draw_column_frame_with_insets<T>(
             .max_rect(content_rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(content_rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
+    child_ui.spacing_mut().item_spacing = Vec2::splat(style::metrics(ui).item_gap());
     child_ui.set_width(content_rect.width());
     child_ui.set_height(content_height);
     child_ui.set_width_range(content_rect.width()..=content_rect.width());
     child_ui.set_height_range(content_height..=content_height);
     let output = add_contents(&mut child_ui, content_height, geometry);
     (geometry, output)
+}
+
+fn bounded_clip(parent: Rect, child: Rect) -> Rect {
+    let clip = parent.intersect(child);
+    Rect::from_min_size(clip.min, clip.size().max(Vec2::ZERO))
+}
+
+fn grid_width(ui: &egui::Ui, width: f32) -> f32 {
+    let scale = ui.ctx().pixels_per_point();
+    (width.max(0.0) * scale).floor() / scale
 }
 
 fn inset_rect(rect: Rect, margin: f32) -> Rect {
@@ -2521,6 +2866,7 @@ fn inset_rect_by(rect: Rect, insets: ColumnFrameInsets) -> Rect {
 }
 
 struct DisplayPlaybackColumnResponse {
+    export_cancel_clicked: bool,
     copy_clicked: bool,
     play_pause_clicked: bool,
     stop_clicked: bool,
@@ -2533,8 +2879,11 @@ struct DisplayPlaybackColumnResponse {
 }
 
 struct DisplayPlaybackState<'a> {
+    export_cancel_available: bool,
+    pipe_body: PipeBody,
     owner: RightPaneOwner,
     pipe_example: Option<&'a PipeExamplePanel>,
+    movie_export: Option<&'a crate::export_actions::GuiMovieExport>,
     optimizer: &'a GuiOptimizer,
     playback_control: PreviewPlaybackControl,
     preview_running: bool,
@@ -2546,24 +2895,45 @@ fn draw_display_playback_column(
     content_height: f32,
     state: DisplayPlaybackState<'_>,
 ) -> DisplayPlaybackColumnResponse {
-    let display_height = (content_height - 74.0).max(260.0);
+    let display_height =
+        (content_height - 74.0).max(if state.owner == RightPaneOwner::PipeExample {
+            0.0
+        } else {
+            260.0
+        });
     let (copy_clicked, preview_rect) = draw_display_area(
         ui,
         display_height,
         state.owner,
+        state.pipe_body,
         state.pipe_example,
+        state.movie_export,
         state.optimizer,
     );
-    ui.add_space(14.0);
-    let footer = draw_right_pane_footer(
-        ui,
-        state.owner,
-        state.optimizer,
-        state.playback_control,
-        state.preview_running,
-        state.playback_position,
-    );
+    ui.add_space(style::metrics(ui).space(14.0));
+    let mut export_cancel_clicked = false;
+    let footer = if state.owner == RightPaneOwner::PipeExample && state.export_cancel_available {
+        let clicked = draw_footer_button_row(
+            ui,
+            [FooterButton::new("Close"), FooterButton::new("Cancel")],
+        );
+        export_cancel_clicked = clicked[1];
+        RightPaneFooterResponse {
+            pipe_close_clicked: clicked[0],
+            ..Default::default()
+        }
+    } else {
+        draw_right_pane_footer(
+            ui,
+            state.owner,
+            state.optimizer,
+            state.playback_control,
+            state.preview_running,
+            state.playback_position,
+        )
+    };
     DisplayPlaybackColumnResponse {
+        export_cancel_clicked,
         copy_clicked,
         play_pause_clicked: footer.play_pause_clicked,
         stop_clicked: footer.stop_clicked,
@@ -2580,7 +2950,9 @@ fn draw_display_area(
     ui: &mut egui::Ui,
     height: f32,
     owner: RightPaneOwner,
+    pipe_body: PipeBody,
     pipe_example: Option<&PipeExamplePanel>,
+    movie_export: Option<&crate::export_actions::GuiMovieExport>,
     optimizer: &GuiOptimizer,
 ) -> (bool, Option<PreviewLogicalRect>) {
     let size = vec2(ui.available_width(), height);
@@ -2606,6 +2978,14 @@ fn draw_display_area(
         }
         RightPaneOwner::Preview => (false, preview_rect),
         RightPaneOwner::PipeExample => {
+            if pipe_body == PipeBody::About {
+                draw_pipe_about_panel(ui, rect);
+                return (false, None);
+            }
+            if let Some(export) = movie_export {
+                draw_movie_export_panel(ui, rect, export);
+                return (false, None);
+            }
             let copy_clicked = pipe_example
                 .map(|panel| draw_pipe_example_panel(ui, rect, panel))
                 .unwrap_or_else(|| {
@@ -2621,65 +3001,186 @@ fn draw_display_area(
     }
 }
 
+fn draw_movie_export_panel(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    export: &crate::export_actions::GuiMovieExport,
+) {
+    let content_rect = inset_rect(rect, style::metrics(ui).body_inset());
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    body_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
+    body_ui.set_width(content_rect.width());
+    body_ui.set_height(content_rect.height());
+    let snapshot = export.snapshot();
+    egui::ScrollArea::both()
+        .id_salt("pipe-export-scroll")
+        .auto_shrink([false, false])
+        .max_height(content_rect.height())
+        .show(&mut body_ui, |ui| {
+            let gray = style::body_text();
+            let white = style::header_text();
+            let blue = style::bright_blue();
+            if !snapshot.destination.as_os_str().is_empty() {
+                draw_export_line(
+                    ui,
+                    &[(
+                        format!("Exported to {}", snapshot.destination.display()).as_str(),
+                        gray,
+                    )],
+                );
+            } else if export.message.is_none() {
+                draw_export_line(ui, &[("Preparing export…", gray)]);
+            }
+            ui.add_space(style::metrics(ui).space(12.0));
+            use mcraw4vulkan::movie_export::ExportActivity;
+            draw_export_line(
+                ui,
+                &[
+                    (ExportActivity::VIDEO_LABEL, white),
+                    (" ", gray),
+                    (&format!("[{}]", snapshot.activity.video_word()), blue),
+                    ("  ", gray),
+                    (ExportActivity::FINALIZER_LABEL, white),
+                    (" ", gray),
+                    (&format!("[{}]", snapshot.activity.finalizer_word()), blue),
+                ],
+            );
+            draw_export_line(
+                ui,
+                &[
+                    ("Succeeded", white),
+                    (" ", gray),
+                    (&format!("[{}]", snapshot.succeeded), blue),
+                    (", failed ", gray),
+                    (&format!("[{}]", snapshot.failed), blue),
+                    (", skipped ", gray),
+                    (&format!("[{}]", snapshot.skipped), blue),
+                    (", canceled ", gray),
+                    (&format!("[{}]", snapshot.canceled), blue),
+                ],
+            );
+            if let Some(message) = &export.message {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(message)
+                            .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
+                            .color(gray),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_space(style::metrics(ui).space(12.0));
+            for row in snapshot.rows.iter().filter(|row| row.visible()) {
+                let status = row
+                    .outcome
+                    .filter(|outcome| *outcome != mcraw4vulkan::movie_export::Outcome::Succeeded)
+                    .map(|outcome| format!("  {}", outcome.label()))
+                    .unwrap_or_default();
+                let response = draw_export_line(
+                    ui,
+                    &[
+                        (&row.source.display().to_string(), gray),
+                        ("  ", gray),
+                        (&row.rate_text(), blue),
+                        (&status, gray),
+                    ],
+                );
+                if !row.reason.is_empty() || row.duplicate_selections > 0 {
+                    response.on_hover_ui(|ui| {
+                        if !row.reason.is_empty() {
+                            ui.label(RichText::new(&row.reason).color(gray));
+                        }
+                        if row.duplicate_selections > 0 {
+                            ui.label(format!(
+                                "{} duplicate selection(s) skipped.",
+                                row.duplicate_selections
+                            ));
+                        }
+                    });
+                }
+            }
+        });
+}
+
+fn draw_export_line(ui: &mut egui::Ui, spans: &[(&str, egui::Color32)]) -> egui::Response {
+    let mut text = egui::text::LayoutJob::default();
+    for &(span, color) in spans {
+        text.append(
+            span,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(style::metrics(ui).font(style::LINE_FONT_SIZE)),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+    ui.add(egui::Label::new(text).selectable(true).extend())
+}
+
 fn draw_idle_display_area(ui: &mut egui::Ui, rect: Rect) {
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         "No clip playing",
-        FontId::proportional(style::STATUS_FONT_SIZE),
+        FontId::proportional(style::metrics(ui).font(style::STATUS_FONT_SIZE)),
         style::muted_text(),
     );
 }
 
 fn draw_optimizer_panel(ui: &mut egui::Ui, rect: Rect, optimizer: &GuiOptimizer) {
-    let content_rect = inset_rect(rect, 24.0);
+    let content_rect = inset_rect(rect, style::metrics(ui).body_inset());
     let mut child_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(content_rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(content_rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
     child_ui.set_width(content_rect.width());
     child_ui.set_height(content_rect.height());
 
     child_ui.label(
         RichText::new("mcraw4vulkan Optimizer")
-            .size(style::STATUS_FONT_SIZE)
+            .size(style::metrics(ui).font(style::STATUS_FONT_SIZE))
             .color(style::header_text()),
     );
-    child_ui.add_space(8.0);
+    child_ui.add_space(style::metrics(ui).space(8.0));
     child_ui.add(
         egui::Label::new(
             RichText::new(OPTIMIZER_PANEL_BODY)
-                .size(style::LINE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                 .color(style::body_text()),
         )
         .wrap(),
     );
-    child_ui.add_space(12.0);
+    child_ui.add_space(style::metrics(ui).space(12.0));
     draw_divider(&mut child_ui);
-    child_ui.add_space(10.0);
+    child_ui.add_space(style::metrics(ui).space(10.0));
 
     if let Some(result) = optimizer.terminal_result() {
         child_ui.add(
             egui::Label::new(
                 RichText::new(result.message())
-                    .size(style::STATUS_FONT_SIZE)
+                    .size(style::metrics(ui).font(style::STATUS_FONT_SIZE))
                     .color(style::header_text()),
             )
             .wrap(),
         );
-        child_ui.add_space(10.0);
+        child_ui.add_space(style::metrics(ui).space(10.0));
         draw_divider(&mut child_ui);
-        child_ui.add_space(10.0);
+        child_ui.add_space(style::metrics(ui).space(10.0));
         return;
     }
 
     let width = child_ui.available_width().max(0.0);
     draw_optimizer_progress_bar(&mut child_ui, width, optimizer.progress());
-    child_ui.add_space(10.0);
+    child_ui.add_space(style::metrics(ui).space(10.0));
     draw_divider(&mut child_ui);
-    child_ui.add_space(10.0);
+    child_ui.add_space(style::metrics(ui).space(10.0));
 
     let output_height = child_ui.available_height().max(80.0);
     child_ui.allocate_ui_with_layout(
@@ -2696,7 +3197,7 @@ fn draw_optimizer_panel(ui: &mut egui::Ui, rect: Rect, optimizer: &GuiOptimizer)
                     ui.add(
                         egui::Label::new(
                             RichText::new(optimizer.output())
-                                .size(style::LINE_FONT_SIZE)
+                                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                                 .color(style::body_text()),
                         )
                         .selectable(true)
@@ -2726,6 +3227,50 @@ fn draw_optimizer_progress_bar(ui: &mut egui::Ui, width: f32, progress: f32) {
 
 const OPTIMIZER_PANEL_BODY: &str = "The optimizer compares the Default and Offset payload profiles for this system using Display / Quick Preview and PIPE throughput.\n\nTo run the optimizer, select a typical file from the playlist that is at least 600 frames. Resolution and storage location affect the measurements.";
 
+fn draw_pipe_about_panel(ui: &mut egui::Ui, rect: Rect) {
+    let content_rect = inset_rect(rect, style::metrics(ui).body_inset());
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    body_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
+    body_ui.set_width(content_rect.width());
+    body_ui.set_height(content_rect.height());
+    egui::ScrollArea::vertical()
+        .id_salt("pipe-about-scroll")
+        .auto_shrink([false, false])
+        .max_height(content_rect.height())
+        .show(&mut body_ui, |ui| {
+            ui.label(RichText::new("About mcraw4vulkan Pipe")
+                .size(style::metrics(ui).font(style::STATUS_FONT_SIZE))
+                .color(style::bright_blue()));
+            ui.add_space(style::metrics(ui).space(16.0));
+            ui.add(egui::Label::new(RichText::new(
+                "mcraw4vulkan Pipe decodes a MotionCam RAW file and converts it to a 12 bit YUV 444 video bytestream with BT2020 color gamut and the AppleLog transfer function"
+            ).size(style::metrics(ui).font(style::LINE_FONT_SIZE)).color(style::header_text())).selectable(true).wrap());
+            ui.add(egui::Label::new(RichText::new(
+                "FFmpeg must be already installed on your computer for this function to work"
+            ).size(style::metrics(ui).font(style::LINE_FONT_SIZE)).color(style::body_text())).selectable(true).wrap());
+            for (label, remainder) in [
+                ("Export Movie", " - Quickly export a file from the playlist to a ProRes 4444 movie file"),
+                ("Export All", " - Quickly export all of the files in the playlist to ProRes 4444 movie files"),
+                ("Pipe Example", " - See how to use the mcraw4vulkan pipe video bytestream with the command line to customize the export into any format"),
+            ] {
+                ui.add_space(style::metrics(ui).space(16.0));
+                let mut job = egui::text::LayoutJob::default();
+                for (text, color) in [(label, style::header_text()), (remainder, style::body_text())] {
+                    job.append(text, 0.0, egui::TextFormat {
+                        font_id: FontId::proportional(style::metrics(ui).font(style::LINE_FONT_SIZE)),
+                        color,
+                        ..Default::default()
+                    });
+                }
+                ui.add(egui::Label::new(job).selectable(true).wrap());
+            }
+        });
+}
+
 fn draw_pipe_example_panel(ui: &mut egui::Ui, rect: Rect, panel: &PipeExamplePanel) -> bool {
     match panel {
         PipeExamplePanel::Message(message) => {
@@ -2733,17 +3278,17 @@ fn draw_pipe_example_panel(ui: &mut egui::Ui, rect: Rect, panel: &PipeExamplePan
                 rect.center(),
                 Align2::CENTER_CENTER,
                 message,
-                FontId::proportional(style::STATUS_FONT_SIZE),
+                FontId::proportional(style::metrics(ui).font(style::STATUS_FONT_SIZE)),
                 style::muted_text(),
             );
             false
         }
         PipeExamplePanel::Error(message) => {
-            let content_rect = inset_rect(rect, 24.0);
+            let content_rect = inset_rect(rect, style::metrics(ui).body_inset());
             draw_pipe_example_text_panel(ui, content_rect, Some(message), None)
         }
         PipeExamplePanel::Example(example) => {
-            let content_rect = inset_rect(rect, 24.0);
+            let content_rect = inset_rect(rect, style::metrics(ui).body_inset());
             draw_pipe_example_text_panel(ui, content_rect, None, Some(example))
         }
     }
@@ -2760,7 +3305,7 @@ fn draw_pipe_example_text_panel(
             .max_rect(content_rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(content_rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
     child_ui.set_width(content_rect.width());
     child_ui.set_height(content_rect.height());
 
@@ -2772,20 +3317,14 @@ fn draw_pipe_example_text_panel(
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .max_height(content_rect.height())
         .show(&mut child_ui, |ui| {
-            ui.label(
-                RichText::new(pipe_example::HEADER)
-                    .size(style::STATUS_FONT_SIZE)
-                    .color(style::header_text()),
-            );
-            ui.add_space(16.0);
             draw_pipe_example_paragraph(ui, pipe_example::BODY);
 
             if let Some(error) = error {
-                ui.add_space(16.0);
+                ui.add_space(style::metrics(ui).space(16.0));
                 ui.add(
                     egui::Label::new(
                         RichText::new(error)
-                            .size(style::LINE_FONT_SIZE)
+                            .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                             .color(style::header_text()),
                     )
                     .wrap(),
@@ -2793,27 +3332,27 @@ fn draw_pipe_example_text_panel(
             }
 
             if let Some(example) = example {
-                ui.add_space(32.0);
+                ui.add_space(style::metrics(ui).space(32.0));
                 draw_pipe_example_paragraph(ui, example.target.terminal_label());
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 draw_pipe_example_simple_command(ui, &example.simple_command);
-                ui.add_space(32.0);
+                ui.add_space(style::metrics(ui).space(32.0));
                 draw_pipe_example_paragraph(ui, pipe_example::COMPLICATED_EXAMPLE_LABEL);
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 draw_pipe_example_paragraph(ui, example.target.hardware_text());
                 if let Some(prerequisite_text) = example.target.ffmpeg_prerequisite_text() {
-                    ui.add_space(16.0);
+                    ui.add_space(style::metrics(ui).space(16.0));
                     draw_pipe_example_paragraph(ui, prerequisite_text);
                 }
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 draw_pipe_example_paragraph(ui, pipe_example::USEFUL_TEXT);
-                ui.add_space(32.0);
+                ui.add_space(style::metrics(ui).space(32.0));
                 draw_pipe_example_paragraph(ui, pipe_example::COPY_COMMAND_TEXT);
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 if ui
                     .button(
                         RichText::new("Copy command")
-                            .size(style::BUTTON_FONT_SIZE)
+                            .size(style::metrics(ui).font(style::BUTTON_FONT_SIZE))
                             .color(style::header_text()),
                     )
                     .clicked()
@@ -2821,7 +3360,7 @@ fn draw_pipe_example_text_panel(
                     copy_clicked = true;
                     ui.ctx().request_repaint();
                 }
-                ui.add_space(8.0);
+                ui.add_space(style::metrics(ui).space(8.0));
                 draw_pipe_example_command_text(ui, &example.command);
             }
         });
@@ -2833,7 +3372,7 @@ fn draw_pipe_example_paragraph(ui: &mut egui::Ui, text: &str) {
     ui.add(
         egui::Label::new(
             RichText::new(text)
-                .size(style::LINE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                 .color(style::body_text()),
         )
         .wrap(),
@@ -2844,7 +3383,7 @@ fn draw_pipe_example_command_text(ui: &mut egui::Ui, command: &str) {
     ui.add(
         egui::Label::new(
             RichText::new(command)
-                .size(style::LINE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                 .color(style::header_text()),
         )
         .selectable(true)
@@ -2852,9 +3391,12 @@ fn draw_pipe_example_command_text(ui: &mut egui::Ui, command: &str) {
     );
 }
 
-fn pipe_example_simple_command_layout(command: &str) -> egui::text::LayoutJob {
+fn pipe_example_simple_command_layout_at_size(
+    command: &str,
+    font_size: f32,
+) -> egui::text::LayoutJob {
     let mut layout = egui::text::LayoutJob::default();
-    let font_id = FontId::proportional(style::LINE_FONT_SIZE);
+    let font_id = FontId::proportional(font_size);
     let remainder = if let Some(remainder) = command.strip_prefix(pipe_example::SIMPLE_COMMAND_PIPE)
     {
         layout.append(
@@ -2884,9 +3426,12 @@ fn pipe_example_simple_command_layout(command: &str) -> egui::text::LayoutJob {
 
 fn draw_pipe_example_simple_command(ui: &mut egui::Ui, command: &str) {
     ui.add(
-        egui::Label::new(pipe_example_simple_command_layout(command))
-            .selectable(true)
-            .wrap(),
+        egui::Label::new(pipe_example_simple_command_layout_at_size(
+            command,
+            style::metrics(ui).font(style::LINE_FONT_SIZE),
+        ))
+        .selectable(true)
+        .wrap(),
     );
 }
 
@@ -3013,7 +3558,7 @@ fn draw_footer_button_row<const N: usize>(
         clicked[index] = transport_button_in_rect(
             ui,
             row_rect,
-            transport_row_rect(row_rect, left, right, TRANSPORT_BUTTON_HEIGHT),
+            transport_row_rect(row_rect, left, right, transport_target_height(ui)),
             button.label,
             true,
         );
@@ -3039,12 +3584,15 @@ fn draw_footer_status_row(ui: &mut egui::Ui, label: &str) {
             .max_rect(rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    child_ui.set_clip_rect(transport_widget_clip_rect(row_rect, rect));
+    child_ui.set_clip_rect(bounded_clip(
+        ui.clip_rect(),
+        transport_widget_clip_rect(row_rect, rect),
+    ));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
     child_ui.label(
         RichText::new(label)
-            .size(style::LINE_FONT_SIZE)
+            .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
             .color(style::body_text()),
     );
 }
@@ -3066,7 +3614,6 @@ const TRANSPORT_ROW_GAP: f32 = 8.0;
 const TRANSPORT_FRAME_LABEL_WIDTH: f32 = 224.0;
 const TRANSPORT_BASE_BUTTON_WIDTH: f32 = 112.0;
 const TRANSPORT_BUTTON_HEIGHT: f32 = 32.0;
-const TRANSPORT_SCRUBBER_HEIGHT: f32 = TRANSPORT_BUTTON_HEIGHT;
 const TRANSPORT_ROW_VERTICAL_PADDING: f32 = 4.0;
 const TRANSPORT_ROW_HEIGHT: f32 = TRANSPORT_BUTTON_HEIGHT + TRANSPORT_ROW_VERTICAL_PADDING * 2.0;
 
@@ -3111,6 +3658,69 @@ fn transport_row_geometry(row_width: f32) -> TransportRowGeometry {
     }
 }
 
+fn fitted_transport_geometry(
+    ui: &egui::Ui,
+    row_width: f32,
+    frame_label: &str,
+) -> TransportRowGeometry {
+    // Preserve the roomy reservation. At narrow widths reserve the real counter,
+    // a useful scrubber, and equal buttons sized above their label/padding minima.
+    let label_min = ui
+        .painter()
+        .layout_no_wrap(
+            frame_label.to_owned(),
+            FontId::proportional(style::metrics(ui).font(style::LINE_FONT_SIZE)),
+            style::body_text(),
+        )
+        .size()
+        .x
+        .ceil()
+        + 8.0;
+    let label_width = TRANSPORT_FRAME_LABEL_WIDTH.min(label_min.max(0.0));
+    let ordinary = transport_row_geometry(row_width);
+    if ordinary.scrubber_width() >= 56.0 {
+        return ordinary;
+    }
+    let gap = style::metrics(ui).item_gap();
+    let minimum_button = ["Pause", "Stop"]
+        .into_iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
+                    style::body_text(),
+                )
+                .size()
+                .x
+                + 2.0 * ui.spacing().button_padding.x
+        })
+        .fold(0.0_f32, f32::max);
+    let scale = ui.ctx().pixels_per_point();
+    let minimum_button = (minimum_button * scale).ceil() / scale;
+    let width = grid_width(
+        ui,
+        ((row_width - 2.0 * TRANSPORT_ROW_SIDE_MARGIN - 3.0 * gap - label_width - 56.0) / 2.0)
+            .max(minimum_button)
+            .min(transport_button_width()),
+    );
+    let mut geometry = ordinary;
+    geometry.play_right = geometry.play_left + width;
+    geometry.stop_left = geometry.play_right + gap;
+    geometry.stop_right = geometry.stop_left + width;
+    geometry.scrubber_left = geometry.stop_right + gap;
+    geometry.frame_label_left = (geometry.frame_label_right - label_width).max(0.0);
+    geometry.scrubber_right = (geometry.frame_label_left - gap).max(geometry.scrubber_left);
+    geometry
+}
+
+fn transport_target_height(ui: &egui::Ui) -> f32 {
+    style::metrics(ui)
+        .font(TRANSPORT_BUTTON_HEIGHT)
+        .max(ui.spacing().interact_size.y)
+        .ceil()
+}
+
 fn draw_transport_row(
     ui: &mut egui::Ui,
     playback_control: PreviewPlaybackControl,
@@ -3120,8 +3730,9 @@ fn draw_transport_row(
     let row_width = ui.available_width().max(0.0);
     let (row_rect, _) =
         ui.allocate_exact_size(vec2(row_width, TRANSPORT_ROW_HEIGHT), Sense::hover());
-    let geometry = transport_row_geometry(row_width);
-    debug_assert!(geometry.scrubber_left >= geometry.stop_right + TRANSPORT_ROW_GAP);
+    let frame_label = frame_counter_label(playback_position);
+    let geometry = fitted_transport_geometry(ui, row_width, &frame_label);
+    debug_assert!(geometry.scrubber_left >= geometry.stop_right + style::metrics(ui).item_gap());
     debug_assert!(geometry.frame_label_left <= geometry.frame_label_right);
     debug_assert!(geometry.frame_label_right <= row_width.max(0.0));
 
@@ -3132,7 +3743,7 @@ fn draw_transport_row(
             row_rect,
             geometry.play_left,
             geometry.play_right,
-            TRANSPORT_BUTTON_HEIGHT,
+            transport_target_height(ui),
         ),
         playback_control.label(),
         playback_control.enabled(),
@@ -3144,7 +3755,7 @@ fn draw_transport_row(
             row_rect,
             geometry.stop_left,
             geometry.stop_right,
-            TRANSPORT_BUTTON_HEIGHT,
+            transport_target_height(ui),
         ),
         "Stop",
         preview_running,
@@ -3157,7 +3768,7 @@ fn draw_transport_row(
             geometry.frame_label_right,
             TRANSPORT_ROW_HEIGHT,
         ),
-        &frame_counter_label(playback_position),
+        &frame_label,
     );
 
     let mut seek_target = None;
@@ -3167,7 +3778,7 @@ fn draw_transport_row(
             row_rect,
             geometry.scrubber_left,
             geometry.scrubber_right,
-            TRANSPORT_SCRUBBER_HEIGHT,
+            transport_target_height(ui),
         );
         if let Some(position) = playback_position.filter(|position| position.frame_count > 0) {
             let mut scrubber_value = scrubber_value_for_position(position);
@@ -3194,10 +3805,13 @@ fn draw_transport_row(
 fn transport_row_rect(row_rect: Rect, left: f32, right: f32, height: f32) -> Rect {
     let width = (right - left).max(0.0);
     let top = row_rect.center().y - height.max(0.0) * 0.5;
+    // Manual child allocations use the same 1/32-point grid as locked egui.
+    // Derive their clips from that allocation, rather than a differently rounded rect.
     Rect::from_min_size(
         pos2(row_rect.min.x + left, top),
         vec2(width, height.max(0.0)),
     )
+    .round_ui()
 }
 
 fn transport_widget_clip_rect(row_rect: Rect, widget_rect: Rect) -> Rect {
@@ -3213,12 +3827,12 @@ fn draw_transport_frame_label(ui: &mut egui::Ui, rect: Rect, frame_label: &str) 
             .max_rect(rect)
             .layout(Layout::right_to_left(Align::Center)),
     );
-    child_ui.set_clip_rect(rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), rect));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
-    child_ui.label(
+    let _response = child_ui.label(
         RichText::new(frame_label)
-            .size(style::LINE_FONT_SIZE)
+            .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
             .color(style::body_text()),
     );
 }
@@ -3236,7 +3850,10 @@ fn draw_transport_scrubber(
             .max_rect(rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    child_ui.set_clip_rect(transport_widget_clip_rect(row_rect, rect));
+    child_ui.set_clip_rect(bounded_clip(
+        ui.clip_rect(),
+        transport_widget_clip_rect(row_rect, rect),
+    ));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
     child_ui.spacing_mut().slider_width = scrubber_width;
@@ -3255,7 +3872,10 @@ fn transport_button_in_rect(
             .max_rect(rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    child_ui.set_clip_rect(transport_widget_clip_rect(row_rect, rect));
+    child_ui.set_clip_rect(bounded_clip(
+        ui.clip_rect(),
+        transport_widget_clip_rect(row_rect, rect),
+    ));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
     transport_button(&mut child_ui, label, enabled)
@@ -3306,7 +3926,7 @@ fn draw_more_options_top_settings(
     let mut response = MoreOptionsResponse::default();
 
     draw_section_title(ui, "Decoding Settings");
-    ui.add_space(8.0);
+    ui.add_space(style::metrics(ui).space(8.0));
     let decode_mode = settings.decode_mode();
     draw_option_pair(
         ui,
@@ -3323,13 +3943,26 @@ fn draw_more_options_top_settings(
         |selected| settings.select_decode_mode(selected),
     );
 
-    ui.add_space(14.0);
+    if style::metrics(ui) == style::Density::Normal {
+        response = draw_optimizer_settings(ui, settings, optimizer_active);
+    }
+
+    response
+}
+
+fn draw_optimizer_settings(
+    ui: &mut egui::Ui,
+    settings: &mut GuiSettings,
+    optimizer_active: bool,
+) -> MoreOptionsResponse {
+    let mut response = MoreOptionsResponse::default();
+    ui.add_space(style::metrics(ui).space(14.0));
     draw_section_title(ui, "Optimized Decode Settings");
     draw_body_line(
         ui,
         "Compares Default and Offset payload profiles for this system",
     );
-    ui.add_space(8.0);
+    ui.add_space(style::metrics(ui).space(8.0));
     if draw_single_option_row(
         ui,
         "Run optimizer now",
@@ -3337,7 +3970,7 @@ fn draw_more_options_top_settings(
     ) {
         response.run_optimizer_clicked = true;
     }
-    ui.add_space(6.0);
+    ui.add_space(style::metrics(ui).space(6.0));
     let optimizer_profile = settings.optimizer_profile;
     draw_option_pair(
         ui,
@@ -3369,7 +4002,7 @@ fn draw_quick_preview_options(
     let response = MoreOptionsResponse::default();
 
     draw_section_title(ui, "Quick Preview Options");
-    ui.add_space(8.0);
+    ui.add_space(style::metrics(ui).space(8.0));
     let quick_timing = settings.quick_preview_timing;
     draw_option_pair(
         ui,
@@ -3385,7 +4018,7 @@ fn draw_quick_preview_options(
         ),
         |selected| settings.select_quick_preview_timing(selected),
     );
-    ui.add_space(6.0);
+    ui.add_space(style::metrics(ui).space(6.0));
     if draw_single_option_row(ui, "FPS overlay", settings.quick_preview_fps_overlay) {
         settings.toggle_quick_preview_fps_overlay();
     }
@@ -3395,7 +4028,7 @@ fn draw_quick_preview_options(
 
 fn draw_pipe_example_footer(ui: &mut egui::Ui) -> MoreOptionsResponse {
     let mut response = MoreOptionsResponse::default();
-    if draw_single_option_row(ui, "Pipe Example", false) {
+    if draw_single_option_row(ui, "mcraw4vulkan PIPE", false) {
         response.pipe_example_clicked = true;
     }
     response
@@ -3412,13 +4045,13 @@ fn draw_playlist_box(ui: &mut egui::Ui, height: f32, playlist: &mut Playlist) {
         StrokeKind::Inside,
     );
 
-    let content_rect = inset_rect(rect, 16.0);
+    let content_rect = inset_rect(rect, style::metrics(ui).list_inset());
     let mut child_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(content_rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(content_rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), content_rect));
     child_ui.set_width(content_rect.width());
     child_ui.set_height(content_rect.height());
     child_ui.set_width_range(content_rect.width()..=content_rect.width());
@@ -3432,7 +4065,7 @@ fn draw_playlist_box(ui: &mut egui::Ui, height: f32, playlist: &mut Playlist) {
             if playlist.is_empty() {
                 ui.label(
                     RichText::new("No files in playlist.")
-                        .size(style::LINE_FONT_SIZE)
+                        .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                         .color(style::muted_text()),
                 );
             } else {
@@ -3448,7 +4081,7 @@ fn draw_playlist_box(ui: &mut egui::Ui, height: f32, playlist: &mut Playlist) {
                     if response.clicked() {
                         clicked_index = Some(index);
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(style::metrics(ui).space(4.0));
                 }
 
                 if let Some(index) = clicked_index {
@@ -3463,7 +4096,7 @@ fn draw_playlist_box(ui: &mut egui::Ui, height: f32, playlist: &mut Playlist) {
 fn draw_section_title(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
-            .size(style::STATUS_FONT_SIZE)
+            .size(style::metrics(ui).font(style::STATUS_FONT_SIZE))
             .color(style::header_text()),
     );
 }
@@ -3472,7 +4105,7 @@ fn draw_body_line(ui: &mut egui::Ui, text: &str) {
     ui.add(
         egui::Label::new(
             RichText::new(text)
-                .size(style::LINE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                 .color(style::body_text()),
         )
         .wrap(),
@@ -3533,6 +4166,9 @@ fn run_optimizer_button_selected(optimizer_active: bool) -> bool {
 
 fn preview_transition_status(request: Option<&RightPaneRequest>) -> &'static str {
     match request {
+        Some(RightPaneRequest::ShowPipeAbout) => {
+            "Stopping Preview to show About mcraw4vulkan Pipe..."
+        }
         Some(RightPaneRequest::ShowPipeExample(_)) => "Stopping Preview to show Pipe Example...",
         Some(RightPaneRequest::StartOptimizer(_)) => "Stopping Preview to run Optimizer...",
         Some(RightPaneRequest::StartPreview(_)) => "Stopping Preview to start Preview...",
@@ -3543,6 +4179,9 @@ fn preview_transition_status(request: Option<&RightPaneRequest>) -> &'static str
 fn optimizer_transition_status(request: Option<&RightPaneRequest>) -> &'static str {
     match request {
         Some(RightPaneRequest::StartPreview(_)) => "Stopping Optimizer to start Preview...",
+        Some(RightPaneRequest::ShowPipeAbout) => {
+            "Stopping Optimizer to show About mcraw4vulkan Pipe..."
+        }
         Some(RightPaneRequest::ShowPipeExample(_)) => "Stopping Optimizer to show Pipe Example...",
         Some(RightPaneRequest::StartOptimizer(_)) => "Stopping Optimizer...",
         None => "Stopping Optimizer...",
@@ -3654,7 +4293,7 @@ fn draw_dng_primary_grid(
             ButtonCell::new("Vignette Correction", vignette_selected, true),
         ],
     );
-    ui.add_space(6.0);
+    ui.add_space(style::metrics(ui).space(6.0));
     let bottom = draw_dng_batch_action_row(ui, mount_all_enabled, dng_actions_enabled);
 
     DngPrimaryGridResponse {
@@ -3705,7 +4344,10 @@ fn draw_dng_batch_action_row(
 
 fn draw_blank_button_cell(ui: &mut egui::Ui, width: f32) {
     let _ = ui.allocate_exact_size(
-        vec2(width.max(0.0), main_view::ORDINARY_BUTTON_HEIGHT),
+        vec2(
+            width.max(0.0),
+            style::metrics(ui).font(main_view::ORDINARY_BUTTON_HEIGHT),
+        ),
         Sense::empty(),
     );
 }
@@ -3785,11 +4427,17 @@ fn draw_full_width_selected_button(ui: &mut egui::Ui, label: &str, selected: boo
 }
 
 fn equal_three_button_widths(ui: &egui::Ui) -> [f32; 3] {
-    main_view::equal_three_button_widths(ui.available_width(), ui.spacing().item_spacing.x)
+    [grid_width(
+        ui,
+        (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0,
+    ); 3]
 }
 
 fn equal_button_widths(ui: &egui::Ui) -> [f32; 2] {
-    main_view::equal_button_widths(ui.available_width(), ui.spacing().item_spacing.x)
+    [grid_width(
+        ui,
+        (ui.available_width() - ui.spacing().item_spacing.x) / 2.0,
+    ); 2]
 }
 
 fn draw_clickable_visual_button(
@@ -3861,7 +4509,7 @@ fn draw_visual_button_with_stroke_style(
     sense: Sense,
     stroke_style: VisualButtonStrokeStyle,
 ) -> egui::Response {
-    let height = ordinary_button_height();
+    let height = style::metrics(ui).font(ordinary_button_height());
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), sense);
     let paint = visual_button_paint(selected, stroke_style);
 
@@ -3872,7 +4520,7 @@ fn draw_visual_button_with_stroke_style(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(style::BUTTON_FONT_SIZE),
+        FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
         paint.text_color,
     );
 
@@ -3912,7 +4560,16 @@ fn playlist_status_reserved_line_count() -> usize {
 }
 
 fn playlist_status_reserved_height(ui: &egui::Ui) -> f32 {
-    playlist_status_reserved_height_for_line_height(ui.text_style_height(&egui::TextStyle::Small))
+    // Font-grid rounding across multiple lines can exceed three nominal heights.
+    let font = FontId::proportional(style::metrics(ui).font(style::SMALL_FONT_SIZE));
+    let measured = ui
+        .painter()
+        .layout_no_wrap("M\nM\nM".into(), font, playlist_status_color())
+        .size()
+        .y;
+    measured.max(playlist_status_reserved_height_for_line_height(
+        ui.text_style_height(&egui::TextStyle::Small),
+    ))
 }
 
 fn playlist_status_reserved_height_for_line_height(line_height: f32) -> f32 {
@@ -3938,7 +4595,9 @@ fn draw_padded_controls_row(
 ) {
     let height = height.max(0.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    let content_rect = controls_row_content_rect(rect, top_padding, bottom_padding);
+    let padding = style::metrics(ui).row_padding();
+    let content_rect =
+        controls_row_content_rect(rect, top_padding.min(padding), bottom_padding.min(padding));
     draw_controls_row_contents(ui, content_rect, add_contents);
 }
 
@@ -3960,7 +4619,7 @@ fn draw_controls_row_contents(
             .max_rect(rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), rect));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
     child_ui.set_width_range(rect.width()..=rect.width());
@@ -3972,10 +4631,10 @@ fn draw_empty_controls_row(ui: &mut egui::Ui, height: f32) {
     let _ = ui.allocate_exact_size(vec2(ui.available_width(), height.max(0.0)), Sense::hover());
 }
 
-fn draw_shared_row_gap(ui: &mut egui::Ui) {
+fn draw_shared_row_gap(ui: &mut egui::Ui, gap: f32) {
     let implicit_spacing = ui.spacing().item_spacing.y.max(0.0);
-    let gap_height = (main_view::SHARED_CONTROL_ROW_GAP - implicit_spacing * 2.0).max(0.0);
-    let divider_top_padding = (12.0 - implicit_spacing).max(0.0);
+    let gap_height = (gap - implicit_spacing * 2.0).max(0.0);
+    let divider_top_padding = (style::metrics(ui).space(12.0) - implicit_spacing).max(0.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), gap_height), Sense::hover());
     ui.painter().hline(
         rect.left()..=rect.right(),
@@ -3995,13 +4654,13 @@ fn draw_playlist_status_area(ui: &mut egui::Ui, text: Option<&str>) {
             .max_rect(rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    child_ui.set_clip_rect(rect);
+    child_ui.set_clip_rect(bounded_clip(ui.clip_rect(), rect));
     child_ui.set_width(rect.width());
     child_ui.set_height(rect.height());
     child_ui.add(
         egui::Label::new(
             RichText::new(text)
-                .size(style::SMALL_FONT_SIZE)
+                .size(style::metrics(ui).font(style::SMALL_FONT_SIZE))
                 .color(playlist_status_color()),
         )
         .wrap(),
@@ -4014,7 +4673,7 @@ fn draw_playlist_entry_row(
     selected: bool,
     visual_state: main_view::PlaylistEntryVisualState,
 ) -> egui::Response {
-    let height = 32.0;
+    let height = style::metrics(ui).font(32.0);
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let fill = if selected {
@@ -4043,7 +4702,7 @@ fn draw_playlist_entry_row(
         rect.left_center() + vec2(8.0, 0.0),
         Align2::LEFT_CENTER,
         display_name,
-        FontId::proportional(style::LINE_FONT_SIZE),
+        FontId::proportional(style::metrics(ui).font(style::LINE_FONT_SIZE)),
         text_color,
     );
 
@@ -4059,16 +4718,19 @@ fn playlist_text_color(tone: main_view::PlaylistEntryTextTone) -> egui::Color32 
 }
 
 fn transport_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
-    ui.add_enabled(
+    let response = ui.add_enabled(
         enabled,
         egui::Button::new(
             RichText::new(label)
-                .size(style::BUTTON_FONT_SIZE)
+                .size(style::metrics(ui).font(style::BUTTON_FONT_SIZE))
                 .color(style::body_text()),
         )
-        .min_size(vec2(transport_button_width(), TRANSPORT_BUTTON_HEIGHT)),
-    )
-    .clicked()
+        .min_size(vec2(
+            transport_button_width().min(ui.available_width()).max(0.0),
+            transport_target_height(ui),
+        )),
+    );
+    response.clicked()
 }
 
 struct EguiInputState {
@@ -4077,6 +4739,12 @@ struct EguiInputState {
     modifiers: Modifiers,
     focused: bool,
     minimized: bool,
+    layout_snapshot: Option<(WindowSize, f32, Rect)>,
+    prepared_events: bool,
+    event_snapshot: Option<WindowSize>,
+    changed_surface_snapshot: Option<WindowSize>,
+    delivered_buttons: [bool; 5],
+    suppressed_buttons: [bool; 5],
 }
 
 impl EguiInputState {
@@ -4087,11 +4755,90 @@ impl EguiInputState {
             modifiers: Modifiers::NONE,
             focused: true,
             minimized: false,
+            layout_snapshot: None,
+            prepared_events: false,
+            event_snapshot: None,
+            changed_surface_snapshot: None,
+            delivered_buttons: [false; 5],
+            suppressed_buttons: [false; 5],
         }
     }
 
     fn push_event(&mut self, event: EguiEvent) {
         self.events.push(event);
+    }
+
+    fn push_sdl_pointer(&mut self, event: &Event, size: WindowSize) {
+        self.observe_window_size(size);
+        match *event {
+            Event::MouseMotion { x, y, .. } => {
+                self.push_event(EguiEvent::PointerMoved(pos2(x as f32, y as f32)))
+            }
+            Event::MouseButtonDown {
+                mouse_btn, x, y, ..
+            }
+            | Event::MouseButtonUp {
+                mouse_btn, x, y, ..
+            } => {
+                if let Some(button) = pointer_button_from_sdl(mouse_btn) {
+                    let index = button as usize;
+                    if self.suppressed_buttons[index] {
+                        if matches!(event, Event::MouseButtonUp { .. }) {
+                            self.suppressed_buttons[index] = false;
+                        }
+                        return;
+                    }
+                    self.push_event(EguiEvent::PointerButton {
+                        pos: pos2(x as f32, y as f32),
+                        button,
+                        pressed: matches!(event, Event::MouseButtonDown { .. }),
+                        modifiers: self.modifiers,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_window_size(&mut self, size: WindowSize) {
+        if size.is_zero() {
+            return;
+        }
+        if self.event_snapshot.is_some_and(|old| old != size) {
+            // Queued gestures belong to their observed client. Keep releases for
+            // already-delivered presses, but cancel unconsumed old gestures as pairs.
+            let mut down = self.delivered_buttons;
+            self.events = std::mem::take(&mut self.events)
+                .into_iter()
+                .filter(|event| match event {
+                    EguiEvent::PointerButton {
+                        button, pressed, ..
+                    } => {
+                        let index = *button as usize;
+                        if *pressed {
+                            self.suppressed_buttons[index] = true;
+                            false
+                        } else if down[index] {
+                            down[index] = false;
+                            true
+                        } else {
+                            self.suppressed_buttons[index] = false;
+                            false
+                        }
+                    }
+                    EguiEvent::PointerMoved(_) | EguiEvent::MouseWheel { .. } => false,
+                    _ => true,
+                })
+                .collect();
+            self.prepared_events = false;
+        }
+        self.event_snapshot = Some(size);
+    }
+
+    fn retry_changed_surface(&mut self, size: WindowSize) -> bool {
+        let retry = self.changed_surface_snapshot != Some(size);
+        self.changed_surface_snapshot = Some(size);
+        retry
     }
 
     fn set_modifiers(&mut self, keymod: Mod) {
@@ -4107,20 +4854,68 @@ impl EguiInputState {
         self.minimized = minimized;
     }
 
-    fn raw_input(&mut self, surface: &Sdl2WgpuSurface, now: Instant) -> RawInput {
-        let size = surface.size();
-        let points_per_pixel = pixels_per_point(size);
-        let screen_rect = egui::Rect::from_min_size(
-            Pos2::ZERO,
-            Vec2::new(
-                size.drawable_width as f32 / points_per_pixel,
-                size.drawable_height as f32 / points_per_pixel,
-            ),
-        );
+    fn raw_input(&mut self, size: WindowSize, context: &Context, now: Instant) -> RawInput {
+        self.observe_window_size(size);
+        let native_scale = pixels_per_point(size);
+        let points_per_pixel = native_scale * context.zoom_factor();
+        let logical_rect =
+            normalized_client_rect(size, points_per_pixel).expect("validated window metrics");
+        let changed = self.layout_snapshot != Some((size, points_per_pixel, logical_rect));
+        let has_press = self
+            .events
+            .iter()
+            .any(|event| matches!(event, EguiEvent::PointerButton { pressed: true, .. }));
+        // egui hit-tests the previous pass. Before a fresh press, publish current
+        // geometry without delivering the gesture. A move/resize also cancels a
+        // held gesture's click ownership with PointerGone; its release still arrives.
+        let prepare = changed || (has_press && !self.prepared_events);
+        let events = if prepare {
+            self.prepared_events = true;
+            if changed {
+                vec![EguiEvent::PointerGone]
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.prepared_events = false;
+            let factor = vec2(
+                size.drawable_width as f32 / size.window_width as f32,
+                size.drawable_height as f32 / size.window_height as f32,
+            ) / points_per_pixel;
+            for event in &self.events {
+                if let EguiEvent::PointerButton {
+                    button, pressed, ..
+                } = event
+                {
+                    self.delivered_buttons[*button as usize] = *pressed;
+                }
+            }
+            std::mem::take(&mut self.events)
+                .into_iter()
+                .map(|event| match event {
+                    EguiEvent::PointerMoved(pos) => {
+                        EguiEvent::PointerMoved((pos.to_vec2() * factor).to_pos2())
+                    }
+                    EguiEvent::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } => EguiEvent::PointerButton {
+                        pos: (pos.to_vec2() * factor).to_pos2(),
+                        button,
+                        pressed,
+                        modifiers,
+                    },
+                    event => event,
+                })
+                .collect()
+        };
+        let screen_rect = logical_rect;
 
         let viewport = ViewportInfo {
             title: Some(WINDOW_TITLE.to_string()),
-            native_pixels_per_point: Some(points_per_pixel),
+            native_pixels_per_point: Some(native_scale),
             inner_rect: Some(screen_rect),
             outer_rect: Some(screen_rect),
             minimized: Some(self.minimized),
@@ -4132,7 +4927,7 @@ impl EguiInputState {
             screen_rect: Some(screen_rect),
             time: Some(now.duration_since(self.start).as_secs_f64()),
             modifiers: self.modifiers,
-            events: std::mem::take(&mut self.events),
+            events,
             focused: self.focused,
             system_theme: Some(egui::Theme::Dark),
             ..RawInput::default()
@@ -4150,14 +4945,19 @@ fn render_splash_frame(
     input: &mut EguiInputState,
     app: &mut GuiApp,
     scheduler: &mut LazyRepaintState,
-    start: Instant,
+    _start: Instant,
 ) -> Result<(), GuiError> {
     let now = Instant::now();
     app.advance_startup_phase(now);
     if consume_main_window_maximize_request(app, || surface.maximize_window()) {
         scheduler.mark_resize();
     }
-    if app.poll_file_chooser() {
+    if app.movie_export.poll() {
+        if app.quit_requested || app.movie_export.needs_poll() {
+            if let Some(message) = app.movie_export.message.clone() {
+                app.set_status(message);
+            }
+        }
         scheduler.mark_dirty();
     }
     if app.poll_dng_processes() {
@@ -4170,8 +4970,26 @@ fn render_splash_frame(
         surface.set_fullscreen_desktop(false)?;
         scheduler.mark_resize();
     }
-    let raw_input = input.raw_input(surface, now);
+    let snapshot = surface.refresh_window_size();
+    if input.minimized || normalized_client_rect(snapshot, pixels_per_point(snapshot) * context.zoom_factor()).is_none() {
+        // No invalid density/input snapshot or render; owned completions still poll.
+        if app.poll_file_chooser() { scheduler.mark_dirty(); }
+        let retry = if app.quit_requested || app.movie_export.needs_poll() || app.pending_file_chooser.is_some() {
+            FILE_CHOOSER_POLL_INTERVAL
+        } else if app.dng_processes.has_active_work() { DNG_PROCESS_POLL_INTERVAL }
+        else if app.optimizer.is_running() { OPTIMIZER_REPAINT_INTERVAL }
+        else { Duration::MAX };
+        scheduler.after_frame(now, retry);
+        return Ok(());
+    }
+    let raw_input = input.raw_input(snapshot, context, now);
     let full_output = context.run(raw_input, |context| app.ui(context, now));
+    input.layout_snapshot = Some((snapshot, full_output.pixels_per_point, context.input(|i| i.screen_rect())));
+    if !input.events.is_empty() { context.request_repaint(); }
+    // This frame's Quit control invalidates selection before result delivery.
+    if app.poll_file_chooser() {
+        scheduler.mark_dirty();
+    }
     let egui::FullOutput {
         platform_output,
         textures_delta,
@@ -4211,14 +5029,26 @@ fn render_splash_frame(
         let _reconfigure_status = surface.reconfigure()?;
     }
 
-    let surface_result = surface.render_frame(|mut frame| {
+    // Texture updates must survive a deferred acquisition: egui may not emit
+    // an atlas delta again on the next coherent frame.
+    for (id, delta) in &textures_delta.set {
+        renderer.update_texture(surface.device(), surface.queue(), *id, delta);
+    }
+    if normalized_client_rect(snapshot, pixels_per_point) != Some(context.input(|i| i.screen_rect())) {
+        // A pending egui zoom can derive this pass's rect from its previous input.
+        // Publish another coherent layout before submitting or delivering input.
+        for id in &textures_delta.free { renderer.free_texture(id); }
+        scheduler.mark_dirty();
+        return Ok(());
+    }
+    let surface_result = surface.render_frame_at_size(snapshot, |mut frame| {
         let render_size = frame.size;
         let screen_descriptor = screen_descriptor(render_size, pixels_per_point);
         let preview_target = app.preview_target_for_surface(render_size, pixels_per_point);
         render_egui_frame(
             renderer,
             &mut frame,
-            &textures_delta.set,
+            &[],
             &paint_jobs,
             &screen_descriptor,
         );
@@ -4266,6 +5096,7 @@ fn render_splash_frame(
 
     match status {
         RenderFrameStatus::Submitted { .. } => {
+            input.changed_surface_snapshot = None;
             if let Some(message) = app
                 .preview
                 .after_surface_submit(preview_outcome.video_advanced)
@@ -4295,15 +5126,39 @@ fn render_splash_frame(
             );
         }
         RenderFrameStatus::SkippedZeroSize | RenderFrameStatus::Timeout => {
-            scheduler.after_frame(start, Duration::MAX);
+            scheduler.after_frame(now, deferred_surface_poll_delay(app));
         }
-        RenderFrameStatus::SurfaceChanged => scheduler.mark_dirty(),
+        RenderFrameStatus::SurfaceChanged => {
+            if input.retry_changed_surface(snapshot) { scheduler.mark_dirty(); }
+            else {
+                // One immediate coherent retry, then existing owner deadlines or
+                // SDL wakeups. A persistent acquisition mismatch must not spin.
+                scheduler.after_frame(now, deferred_surface_poll_delay(app));
+            }
+        }
+    }
+    if !input.events.is_empty() && matches!(status, RenderFrameStatus::Submitted { .. }) {
+        scheduler.mark_dirty();
     }
     if preview_outcome.dirty {
         scheduler.mark_dirty();
     }
 
     Ok(())
+}
+
+fn deferred_surface_poll_delay(app: &GuiApp) -> Duration {
+    if app.quit_requested || app.movie_export.needs_poll() || app.pending_file_chooser.is_some() {
+        FILE_CHOOSER_POLL_INTERVAL
+    } else if app.dng_processes.has_active_work() {
+        DNG_PROCESS_POLL_INTERVAL
+    } else if app.optimizer.is_running() {
+        OPTIMIZER_REPAINT_INTERVAL
+    } else if app.preview.needs_frame_work() {
+        preview::PREVIEW_REPAINT_INTERVAL
+    } else {
+        Duration::MAX
+    }
 }
 
 fn submitted_frame_repaint_after(
@@ -4425,12 +5280,22 @@ fn handle_platform_output(
 fn screen_descriptor(size: WindowSize, pixels_per_point: f32) -> ScreenDescriptor {
     ScreenDescriptor {
         size_in_pixels: [size.drawable_width, size.drawable_height],
-        pixels_per_point: pixels_per_point.max(1.0),
+        pixels_per_point: pixels_per_point.max(f32::MIN_POSITIVE),
     }
 }
 
+fn normalized_client_rect(size: WindowSize, effective_scale: f32) -> Option<Rect> {
+    if size.is_zero() || !effective_scale.is_finite() || effective_scale <= 0.0 {
+        return None;
+    }
+    let extent = vec2(size.drawable_width as f32, size.drawable_height as f32) / effective_scale;
+    extent
+        .is_finite()
+        .then(|| Rect::from_min_size(Pos2::ZERO, extent))
+}
+
 fn pixels_per_point(size: WindowSize) -> f32 {
-    size.scale_factor().max(1.0) as f32
+    size.scale_factor() as f32
 }
 
 fn clear_color() -> wgpu::Color {
@@ -4451,7 +5316,7 @@ fn draw_divider(ui: &mut egui::Ui) {
         y,
         Stroke::new(1.0, style::divider()),
     );
-    ui.add_space(1.0);
+    ui.add_space(style::metrics(ui).space(1.0));
 }
 
 fn drain_ready_events(
@@ -4480,8 +5345,22 @@ fn handle_event(
     if event_targets_window(&event, window_id) {
         app.defer_preview_advance();
     }
+    if app.quit_requested && !matches!(event, Event::Quit { .. } | Event::Window { .. }) {
+        return Ok(false);
+    }
     match event {
-        Event::Quit { .. } => return Ok(true),
+        Event::Quit { .. } => {
+            scheduler.mark_dirty();
+            return Ok(app.request_close());
+        }
+        Event::Window {
+            window_id: event_window_id,
+            win_event: WindowEvent::Close,
+            ..
+        } if event_window_id == window_id => {
+            scheduler.mark_dirty();
+            return Ok(app.request_close());
+        }
         Event::Window {
             window_id: event_window_id,
             win_event,
@@ -4499,7 +5378,8 @@ fn handle_event(
         } if event_window_id == window_id => {
             input.set_modifiers(keymod);
             if keycode == Some(Keycode::Escape) {
-                return Ok(true);
+                scheduler.mark_dirty();
+                return Ok(app.request_close());
             }
             if app.handle_optimizer_answer_key(keycode, repeat) {
                 scheduler.mark_sdl_event();
@@ -4548,52 +5428,27 @@ fn handle_event(
             input.push_event(EguiEvent::Text(text));
             scheduler.mark_sdl_event();
         }
-        Event::MouseMotion {
+        event @ (Event::MouseMotion {
             window_id: event_window_id,
-            mousestate,
-            x,
-            y,
             ..
-        } if event_window_id == window_id => {
-            input.push_event(EguiEvent::PointerMoved(pos2(x as f32, y as f32)));
-            if mouse_motion_requests_immediate_repaint(
-                app.preview.active_vsync_cadence().is_some(),
-                mousestate,
-            ) {
-                scheduler.mark_sdl_event();
-            }
         }
-        Event::MouseButtonDown {
+        | Event::MouseButtonDown {
             window_id: event_window_id,
-            mouse_btn,
-            x,
-            y,
             ..
-        } if event_window_id == window_id => {
-            if let Some(button) = pointer_button_from_sdl(mouse_btn) {
-                input.push_event(EguiEvent::PointerButton {
-                    pos: pos2(x as f32, y as f32),
-                    button,
-                    pressed: true,
-                    modifiers: input.modifiers,
-                });
-                scheduler.mark_sdl_event();
-            }
         }
-        Event::MouseButtonUp {
+        | Event::MouseButtonUp {
             window_id: event_window_id,
-            mouse_btn,
-            x,
-            y,
             ..
-        } if event_window_id == window_id => {
-            if let Some(button) = pointer_button_from_sdl(mouse_btn) {
-                input.push_event(EguiEvent::PointerButton {
-                    pos: pos2(x as f32, y as f32),
-                    button,
-                    pressed: false,
-                    modifiers: input.modifiers,
-                });
+        }) if event_window_id == window_id => {
+            let immediate = match &event {
+                Event::MouseMotion { mousestate, .. } => mouse_motion_requests_immediate_repaint(
+                    app.preview.active_vsync_cadence().is_some(),
+                    *mousestate,
+                ),
+                _ => true,
+            };
+            input.push_sdl_pointer(&event, surface.refresh_window_size());
+            if immediate {
                 scheduler.mark_sdl_event();
             }
         }
@@ -4706,12 +5561,21 @@ fn handle_window_event(
 ) -> Result<bool, GuiError> {
     match event {
         WindowEvent::Close => return Ok(true),
-        WindowEvent::Resized(_, _) | WindowEvent::SizeChanged(_, _) | WindowEvent::Restored => {
+        WindowEvent::Resized(_, _)
+        | WindowEvent::SizeChanged(_, _)
+        | WindowEvent::Restored
+        | WindowEvent::Moved(_, _)
+        | WindowEvent::DisplayChanged(_)
+        | WindowEvent::Maximized => {
+            input.changed_surface_snapshot = None;
             input.set_minimized(false);
             surface.reconfigure()?;
+            input.observe_window_size(surface.size());
             scheduler.mark_resize();
         }
-        WindowEvent::Exposed | WindowEvent::Shown | WindowEvent::Maximized => {
+        WindowEvent::Exposed | WindowEvent::Shown => {
+            surface.refresh_window_size();
+            input.changed_surface_snapshot = None;
             input.set_minimized(false);
             scheduler.mark_sdl_event();
         }
@@ -4832,7 +5696,7 @@ fn draw_detail_line(ui: &mut egui::Ui, text: &str, status: LineStatus) {
     ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(text)
-                .size(style::LINE_FONT_SIZE)
+                .size(style::metrics(ui).font(style::LINE_FONT_SIZE))
                 .color(line_color(status)),
         );
     });

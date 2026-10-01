@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[cfg(windows)]
-pub(crate) fn configure_gui_child_process(command: &mut Command) {
+pub(crate) fn configure_gui_process(command: &mut Command) {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -9,4 +9,4 @@ pub(crate) fn configure_gui_child_process(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn configure_gui_child_process(_command: &mut Command) {}
+pub(crate) fn configure_gui_process(_command: &mut Command) {}

@@ -1,5 +1,5 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::child_process::configure_preflight_child_process;
+use crate::process_control::configure_preflight_process;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemRamSnapshot {
@@ -78,7 +78,7 @@ fn collect_system_ram_platform() -> SystemRamSnapshot {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     let mut command = std::process::Command::new(program);
-    configure_preflight_child_process(&mut command);
+    configure_preflight_process(&mut command);
     let output = command.args(args).output().ok()?;
     output
         .status

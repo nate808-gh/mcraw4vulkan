@@ -2,12 +2,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child as ProcessHandle, ChildStdin as ProcessInput, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::gui_child_process::configure_gui_child_process;
+use crate::gui_process::configure_gui_process;
 
 pub const OPTIMIZER_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 pub const OPTIMIZER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
@@ -138,7 +138,7 @@ enum ReaderMessage {
     Output(String),
 }
 
-// The GUI owns the optimizer child, its stdin, reader threads, and run directory
+// The GUI owns the optimizer process, its stdin, reader threads, and run directory
 // as one lifecycle; exit and cancellation join readers before deleting the directory.
 #[derive(Debug)]
 pub struct GuiOptimizer {
@@ -150,16 +150,16 @@ pub struct GuiOptimizer {
     choice_sent: bool,
     sent_answer: Option<OptimizerAnswer>,
     progress: f32,
-    child: Option<OptimizerChild>,
+    process: Option<OptimizerProcess>,
     last_exit_success: Option<bool>,
     cancelling: bool,
     terminal_result: Option<OptimizerTerminalResult>,
 }
 
 #[derive(Debug)]
-struct OptimizerChild {
-    child: Child,
-    stdin: Option<ChildStdin>,
+struct OptimizerProcess {
+    process: ProcessHandle,
+    stdin: Option<ProcessInput>,
     reader_threads: Vec<JoinHandle<()>>,
     rx: Receiver<ReaderMessage>,
     temp_dir: PathBuf,
@@ -176,7 +176,7 @@ impl Default for GuiOptimizer {
             choice_sent: false,
             sent_answer: None,
             progress: 0.0,
-            child: None,
+            process: None,
             last_exit_success: None,
             cancelling: false,
             terminal_result: None,
@@ -194,7 +194,7 @@ impl GuiOptimizer {
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some()
+        self.process.is_some()
     }
 
     pub fn is_cancelling(&self) -> bool {
@@ -247,7 +247,7 @@ impl GuiOptimizer {
 
         let temp_dir = create_optimizer_temp_dir()?;
         let mut command = Command::new(&spec.program);
-        configure_gui_child_process(&mut command);
+        configure_gui_process(&mut command);
         command
             .args(&spec.args)
             .stdin(Stdio::piped())
@@ -256,13 +256,13 @@ impl GuiOptimizer {
             .env("TMPDIR", &temp_dir)
             .env("TEMP", &temp_dir)
             .env("TMP", &temp_dir);
-        let mut child = command
+        let mut process = command
             .spawn()
             .map_err(|error| format!("failed to run {}: {error}", spec.program.display()))?;
 
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdin = process.stdin.take();
+        let stdout = process.stdout.take();
+        let stderr = process.stderr.take();
         let (tx, rx) = mpsc::channel();
         let mut reader_threads = Vec::new();
         if let Some(stdout) = stdout {
@@ -272,8 +272,8 @@ impl GuiOptimizer {
             reader_threads.push(spawn_reader(stderr, tx));
         }
 
-        self.child = Some(OptimizerChild {
-            child,
+        self.process = Some(OptimizerProcess {
+            process,
             stdin,
             reader_threads,
             rx,
@@ -287,10 +287,10 @@ impl GuiOptimizer {
         if !self.choice_controls_visible() {
             return Err("Optimizer is not accepting input.".to_string());
         }
-        let Some(child) = self.child.as_mut() else {
+        let Some(process) = self.process.as_mut() else {
             return Err("Optimizer is not accepting input.".to_string());
         };
-        let Some(stdin) = child.stdin.as_mut() else {
+        let Some(stdin) = process.stdin.as_mut() else {
             return Err("Optimizer is not accepting input.".to_string());
         };
         stdin
@@ -309,10 +309,10 @@ impl GuiOptimizer {
         if self.cancelling {
             return Ok(OptimizerCancelRequest::AlreadyCancelling);
         }
-        let Some(child) = self.child.as_mut() else {
+        let Some(process) = self.process.as_mut() else {
             return Ok(OptimizerCancelRequest::AlreadyExited);
         };
-        match child.child.try_wait() {
+        match process.process.try_wait() {
             Ok(Some(_)) => return Ok(OptimizerCancelRequest::AlreadyExited),
             Ok(None) => {}
             Err(error) => {
@@ -321,9 +321,9 @@ impl GuiOptimizer {
                 ));
             }
         }
-        child.stdin = None;
-        child
-            .child
+        process.stdin = None;
+        process
+            .process
             .kill()
             .map_err(|error| format!("failed to stop optimizer: {error}"))?;
         self.cancelling = true;
@@ -336,10 +336,10 @@ impl GuiOptimizer {
         let mut exited = None;
         let mut chunks = Vec::new();
 
-        if let Some(child) = self.child.as_mut() {
-            chunks.extend(drain_reader_messages(&child.rx, &mut events));
+        if let Some(process) = self.process.as_mut() {
+            chunks.extend(drain_reader_messages(&process.rx, &mut events));
 
-            match child.child.try_wait() {
+            match process.process.try_wait() {
                 Ok(Some(status)) => {
                     exited = Some((status.success(), status.to_string()));
                 }
@@ -355,12 +355,12 @@ impl GuiOptimizer {
 
         if let Some((success, status)) = exited {
             let cancelled = self.cancelling;
-            let mut child = self.child.take().expect("child exists after exit");
-            join_readers(&mut child.reader_threads);
-            for chunk in drain_reader_messages(&child.rx, &mut events) {
+            let mut process = self.process.take().expect("process exists after exit");
+            join_readers(&mut process.reader_threads);
+            for chunk in drain_reader_messages(&process.rx, &mut events) {
                 self.handle_output_chunk(&chunk);
             }
-            cleanup_temp_dir(&child.temp_dir);
+            cleanup_temp_dir(&process.temp_dir);
             self.cancelling = false;
             self.last_exit_success = Some(success);
             if success {
@@ -402,11 +402,11 @@ impl GuiOptimizer {
     }
 
     pub fn cleanup_on_exit(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.child.kill();
-            let _ = child.child.wait();
-            join_readers(&mut child.reader_threads);
-            cleanup_temp_dir(&child.temp_dir);
+        if let Some(mut process) = self.process.take() {
+            let _ = process.process.kill();
+            let _ = process.process.wait();
+            join_readers(&mut process.reader_threads);
+            cleanup_temp_dir(&process.temp_dir);
         }
         self.release_panel();
     }

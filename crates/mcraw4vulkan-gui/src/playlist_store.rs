@@ -256,7 +256,7 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
 }
 
 // Persist desired state only. Session-local live state is not restored because
-// the child handles that established it do not survive a GUI restart.
+// the process handles that established it do not survive a GUI restart.
 fn render_playlist_json(playlist: &Playlist) -> String {
     let entries = playlist
         .entries()

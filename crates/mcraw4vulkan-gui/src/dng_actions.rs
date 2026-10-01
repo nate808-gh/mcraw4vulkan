@@ -1,12 +1,12 @@
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child as ProcessHandle, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::gui_child_process::configure_gui_child_process;
+use crate::gui_process::configure_gui_process;
 use crate::gui_settings::{DecodeMode, OptimizerProfile};
 
 const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -67,9 +67,9 @@ impl DngCommandSpec {
         }
     }
 
-    pub fn spawn_silent(&self) -> Result<Child, String> {
+    pub fn spawn_silent(&self) -> Result<ProcessHandle, String> {
         let mut command = Command::new(&self.program);
-        configure_gui_child_process(&mut command);
+        configure_gui_process(&mut command);
         command
             .args(&self.args)
             .stdin(Stdio::null())
@@ -79,23 +79,23 @@ impl DngCommandSpec {
             .map_err(|error| format!("failed to run {}: {error}", self.program.display()))
     }
 
-    pub fn spawn_capture(&self) -> Result<(Child, DngProcessOutputReader), String> {
+    pub fn spawn_capture(&self) -> Result<(ProcessHandle, DngProcessOutputReader), String> {
         let mut command = Command::new(&self.program);
-        configure_gui_child_process(&mut command);
-        let mut child = command
+        configure_gui_process(&mut command);
+        let mut process = command
             .args(&self.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("failed to run {}: {error}", self.program.display()))?;
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = process.stdout.take().ok_or_else(|| {
             format!(
                 "failed to capture DNG command stdout from {}",
                 self.program.display()
             )
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = process.stderr.take().ok_or_else(|| {
             format!(
                 "failed to capture DNG command stderr from {}",
                 self.program.display()
@@ -103,29 +103,29 @@ impl DngCommandSpec {
         })?;
 
         Ok((
-            child,
+            process,
             DngProcessOutputReader::from_stdout_stderr(stdout, stderr),
         ))
     }
 
-    pub fn spawn_mount(&self) -> Result<(Child, DngProcessOutputReader), String> {
+    pub fn spawn_mount(&self) -> Result<(ProcessHandle, DngProcessOutputReader), String> {
         let mut command = Command::new(&self.program);
-        configure_gui_child_process(&mut command);
-        let mut child = command
+        configure_gui_process(&mut command);
+        let mut process = command
             .args(&self.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("failed to run {}: {error}", self.program.display()))?;
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = process.stderr.take().ok_or_else(|| {
             format!(
                 "failed to capture DNG mount output from {}",
                 self.program.display()
             )
         })?;
 
-        Ok((child, DngProcessOutputReader::from_stderr(stderr)))
+        Ok((process, DngProcessOutputReader::from_stderr(stderr)))
     }
 }
 
@@ -154,19 +154,19 @@ fn resolve_mcraw4vulkan_binary_from_current_exe(current_exe: &Path, binary_name:
     PathBuf::from(binary_name)
 }
 
-// The controller retains mount and transient-action child handles so polling can
+// The controller retains mount and transient-action process handles so polling can
 // turn process status and captured output into GUI lifecycle events.
 #[derive(Debug)]
 pub struct DngProcessController {
-    mounts: Vec<DngMountChild>,
+    mounts: Vec<DngMountProcess>,
     actions: Vec<DngTransientAction>,
 }
 
 #[derive(Debug)]
-struct DngMountChild {
+struct DngMountProcess {
     entry_id: u64,
     display_name: String,
-    child: Child,
+    process: ProcessHandle,
     output: DngProcessOutputReader,
     output_tail: Vec<String>,
     mount_path: Option<PathBuf>,
@@ -240,7 +240,7 @@ fn spawn_output_reader(stream: impl Read + Send + 'static, sender: mpsc::Sender<
 #[derive(Debug)]
 struct DngTransientAction {
     kind: DngActionKind,
-    child: Child,
+    process: ProcessHandle,
     output: DngProcessOutputReader,
     output_tail: Vec<String>,
 }
@@ -308,11 +308,11 @@ impl DngProcessController {
         if self.has_mount_for_entry(entry_id) {
             return Err("DNG is already mounted for this row.".to_string());
         }
-        let (child, output) = spec.spawn_mount()?;
-        self.mounts.push(DngMountChild {
+        let (process, output) = spec.spawn_mount()?;
+        self.mounts.push(DngMountProcess {
             entry_id,
             display_name,
-            child,
+            process,
             output,
             output_tail: Vec::new(),
             mount_path: None,
@@ -328,13 +328,13 @@ impl DngProcessController {
         display_name: String,
         spec: &DngCommandSpec,
     ) -> Result<(), String> {
-        let (child, output) = spec.spawn_capture()?;
+        let (process, output) = spec.spawn_capture()?;
         self.actions.push(DngTransientAction {
             kind: DngActionKind::UnmountFile {
                 entry_id,
                 display_name,
             },
-            child,
+            process,
             output,
             output_tail: Vec::new(),
         });
@@ -343,10 +343,10 @@ impl DngProcessController {
     }
 
     pub fn start_unmount_all(&mut self, spec: &DngCommandSpec) -> Result<(), String> {
-        let (child, output) = spec.spawn_capture()?;
+        let (process, output) = spec.spawn_capture()?;
         self.actions.push(DngTransientAction {
             kind: DngActionKind::UnmountAll,
-            child,
+            process,
             output,
             output_tail: Vec::new(),
         });
@@ -375,7 +375,7 @@ impl DngProcessController {
                 }
                 push_output_tail(&mut self.mounts[index].output_tail, line);
             }
-            match self.mounts[index].child.try_wait() {
+            match self.mounts[index].process.try_wait() {
                 Ok(None)
                     if !self.mounts[index].active
                         && !self.mounts[index].stopping
@@ -437,7 +437,7 @@ impl DngProcessController {
             for line in self.actions[action_index].output.drain() {
                 push_output_tail(&mut self.actions[action_index].output_tail, line);
             }
-            match self.actions[action_index].child.try_wait() {
+            match self.actions[action_index].process.try_wait() {
                 Ok(None) => action_index += 1,
                 Ok(Some(status)) => {
                     for line in self.actions[action_index]
@@ -477,22 +477,22 @@ impl DngProcessController {
     }
 
     // Give explicit unmount a bounded chance to finish, then attempt to kill and
-    // reap each retained child before clearing the controller's ownership state.
+    // wait for exit of each retained process before clearing the controller's ownership state.
     pub fn cleanup_on_exit(&mut self, unmount_all: &DngCommandSpec) {
-        if let Ok(mut child) = unmount_all.spawn_silent() {
-            if !wait_bounded(&mut child, EXIT_CLEANUP_TIMEOUT) {
-                let _ = child.kill();
-                let _ = child.wait();
+        if let Ok(mut process) = unmount_all.spawn_silent() {
+            if !wait_bounded(&mut process, EXIT_CLEANUP_TIMEOUT) {
+                let _ = process.kill();
+                let _ = process.wait();
             }
         }
 
         for mount in &mut self.mounts {
-            let _ = mount.child.kill();
-            let _ = mount.child.wait();
+            let _ = mount.process.kill();
+            let _ = mount.process.wait();
         }
         for action in &mut self.actions {
-            let _ = action.child.kill();
-            let _ = action.child.wait();
+            let _ = action.process.kill();
+            let _ = action.process.wait();
         }
         self.mounts.clear();
         self.actions.clear();
@@ -518,10 +518,10 @@ fn format_process_status(status: &str, output_tail: &[String]) -> String {
     format!("{status}; CLI output: {}", output_tail.join(" | "))
 }
 
-fn wait_bounded(child: &mut Child, timeout: Duration) -> bool {
+fn wait_bounded(process: &mut ProcessHandle, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait() {
+        match process.try_wait() {
             Ok(Some(_)) => return true,
             Ok(None) if Instant::now() >= deadline => return false,
             Ok(None) => thread::sleep(EXIT_CLEANUP_POLL_INTERVAL),
@@ -539,12 +539,12 @@ fn parse_dng_mount_path_from_cli_line(line: &str) -> Option<PathBuf> {
 impl Drop for DngProcessController {
     fn drop(&mut self) {
         for mount in &mut self.mounts {
-            let _ = mount.child.kill();
-            let _ = mount.child.wait();
+            let _ = mount.process.kill();
+            let _ = mount.process.wait();
         }
         for action in &mut self.actions {
-            let _ = action.child.kill();
-            let _ = action.child.wait();
+            let _ = action.process.kill();
+            let _ = action.process.wait();
         }
     }
 }
