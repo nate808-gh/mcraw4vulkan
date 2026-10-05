@@ -14,6 +14,19 @@ struct DesktopNotifier;
 
 impl RequirementNotifier for DesktopNotifier {
     fn notify(&mut self, notification: &RequirementNotification) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            // Launch Services can supply the launching app's bundle identity.
+            // set_application verifies that identity without the default
+            // AppleScript application-name lookup. Unbundled launches log failure.
+            let identity = env::var("__CFBundleIdentifier")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "No application bundle identity for the preflight notification".to_string()
+                })?;
+            notify_rust::set_application(&identity).map_err(|error| error.to_string())?;
+        }
         notify_rust::Notification::new()
             .summary(&notification.title)
             .body(&notification.body)

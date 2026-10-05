@@ -12,7 +12,7 @@ use std::fmt;
 
 pub use notifications::{
     RequirementNotification, RequirementNotifier, missing_requirement_notification,
-    notification_for_report, send_requirement_notification,
+    mount_warning_for_report, notification_for_report, send_requirement_notification,
 };
 pub use platform::PlatformKind;
 pub use ram::{SystemRamSnapshot, collect_system_ram, format_system_ram_line};
@@ -29,7 +29,8 @@ pub struct PreflightOptions {
 impl PreflightOptions {
     pub fn gui_blocking_policy() -> Self {
         Self {
-            require_mount_backend: true,
+            // Mount support is optional for GUI launch; retain its readiness fact.
+            require_mount_backend: false,
             require_vulkan: true,
             probe_gpu_model: true,
             probe_vulkan: true,
@@ -127,6 +128,17 @@ pub enum MountBackendKind {
     MacosMacFuse,
     WindowsProjFs,
     Unsupported,
+}
+
+impl MountBackendKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LinuxFuse3 => "FUSE3",
+            Self::MacosMacFuse => "macFUSE",
+            Self::WindowsProjFs => "ProjFS",
+            Self::Unsupported => "Mount backend",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

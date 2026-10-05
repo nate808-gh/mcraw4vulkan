@@ -8,6 +8,7 @@
 // this crate.
 
 pub mod frame_index;
+pub mod macfuse_location;
 pub mod mount_naming;
 
 mod clip_id;

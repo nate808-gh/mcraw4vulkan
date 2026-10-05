@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::cli::{ComputeBackendChoice, SettingsSourceChoice};
-use crate::pipe_example::{self, CommandTarget};
+use crate::pipe_example::{self, CommandTarget, ProresEncoder};
 use crate::{PIPE_PRORES_FILE_SUFFIX, PIPE_PRORES_SIDECAR_SUFFIX, PipeExampleFacts};
+
+pub const FFMPEG_PRORES_UNAVAILABLE: &str = "FFmpeg ProRes Encoding not found on this system. \"Export Movie\" will not function without FFmpeg Vulkan or VideoToolbox Encoding.";
 
 const LOG_LIMIT: usize = 64 * 1024;
 const RECORD_LIMIT: usize = 8 * 1024;
@@ -522,7 +524,7 @@ fn select_ffmpeg(
             return Ok(path);
         }
     }
-    // A selected file still has to pass the existing launch and readiness probes.
+    // A selected file still has to pass the launch and encoder-list query.
     for fallback in fallbacks {
         let path = absolute(Path::new(fallback), cwd);
         if is_file(&path) {
@@ -874,178 +876,51 @@ fn probe(path: &Path, producer: &Path, args: &[&str], cancel: &AtomicBool) -> Re
     Ok(format!("{}\n{}", out.text(), process.diagnostics()))
 }
 
-// Release token grammar: optional lowercase n, major.minor[.patch...], then
-// optional -/+ build suffix. Prerelease markers are deliberately unverifiable.
-fn ffmpeg_release(version: &str) -> Option<(u32, u32)> {
-    let line = version
-        .lines()
-        .find_map(|l| l.strip_prefix("ffmpeg version "))?;
-    let token = line
-        .split_whitespace()
-        .next()?
-        .strip_prefix('n')
-        .unwrap_or(line.split_whitespace().next()?);
-    let end = token.find(['-', '+']).unwrap_or(token.len());
-    let numeric = &token[..end];
-    let mut parts = numeric.split('.');
-    let component = |s: &str| {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<u32>().ok())
-            .flatten()
-    };
-    let major = component(parts.next()?)?;
-    let minor = component(parts.next()?)?;
-    for part in parts {
-        component(part)?;
-    }
-    if end < token.len() {
-        let suffix = &token[end + 1..];
-        if suffix.is_empty()
-            || !suffix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
-        {
-            return None;
-        }
-        let lower = suffix.to_ascii_lowercase();
-        if lower.split(['.', '_', '-', '+']).any(|p| {
-            ["rc", "pre", "alpha", "beta", "dev"]
-                .iter()
-                .any(|marker| p.starts_with(marker))
-        }) {
-            return None;
-        }
-    }
-    Some((major, minor))
-}
-
-// Snapshots have no comparable release number; readiness still requires every
-// capability below. Recognize upstream N/git identities, with an optional build suffix.
-fn ffmpeg_snapshot(version: &str) -> bool {
-    let Some(token) = version
-        .lines()
-        .find_map(|line| line.strip_prefix("ffmpeg version "))
-        .and_then(|line| line.split_whitespace().next())
-    else {
-        return false;
-    };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let hash_and_suffix = if let Some(rest) = token.strip_prefix("N-") {
-        let Some((count, rest)) = rest.split_once("-g") else {
-            return false;
+fn select_prores_encoder(output: &str) -> Result<ProresEncoder> {
+    let mut vulkan = false;
+    let mut videotoolbox = false;
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(flags) = fields.next() else {
+            continue;
         };
-        if !digits(count) {
-            return false;
+        // Identify an encoder-list entry, without imposing capability flags.
+        if flags.len() != 6
+            || !flags.starts_with('V')
+            || !flags.bytes().all(|b| b == b'.' || b.is_ascii_uppercase())
+        {
+            continue;
         }
-        rest
-    } else if let Some(rest) = token.strip_prefix("git-") {
-        let fields: Vec<_> = rest.splitn(4, '-').collect();
-        if fields.len() == 4 && fields[0].len() == 4 {
-            if !digits(fields[0])
-                || fields[1].len() != 2
-                || fields[2].len() != 2
-                || !digits(fields[1])
-                || !digits(fields[2])
-                || !fields[1].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n))
-                || !fields[2].parse::<u8>().is_ok_and(|n| (1..=31).contains(&n))
-            {
-                return false;
-            }
-            fields[3]
-        } else {
-            rest
+        match fields.next() {
+            Some("prores_ks_vulkan") => vulkan = true,
+            Some("prores_videotoolbox") => videotoolbox = true,
+            _ => {}
         }
+    }
+    tracing::info!(
+        prores_ks_vulkan = vulkan,
+        prores_videotoolbox = videotoolbox,
+        "FFmpeg ProRes encoder support"
+    );
+    if videotoolbox {
+        Ok(ProresEncoder::VideoToolbox)
+    } else if vulkan {
+        Ok(ProresEncoder::Vulkan)
     } else {
-        return false;
-    };
-    let (hash, suffix) = hash_and_suffix
-        .split_once('-')
-        .map_or((hash_and_suffix, None), |(hash, suffix)| {
-            (hash, Some(suffix))
-        });
-    (7..=40).contains(&hash.len())
-        && hash.bytes().all(|b| b.is_ascii_hexdigit())
-        && suffix.is_none_or(|suffix| {
-            suffix
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_alphanumeric())
-                && suffix
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
-        })
+        bail!("{FFMPEG_PRORES_UNAVAILABLE}")
+    }
 }
 
-fn check_ffmpeg(path: &Path, producer: &Path, cancel: &AtomicBool) -> Result<()> {
-    let target = pipe_example::current_command_target();
-    let encoder = if target == CommandTarget::Macos {
-        "prores_videotoolbox"
-    } else {
-        "prores_ks_vulkan"
-    };
-    let version = probe(path, producer, &["-version"], cancel)?;
-    if target != CommandTarget::Macos {
-        if let Some(release) = ffmpeg_release(&version) {
-            ensure!(
-                release >= (8, 1),
-                "{}; found below-minimum release in {}",
-                pipe_example::VULKAN_FFMPEG_8_1_NOTICE,
-                version.lines().next().unwrap_or("version output")
-            );
-        } else {
-            ensure!(
-                ffmpeg_snapshot(&version),
-                "{}; cannot interpret FFmpeg release identity in {}",
-                pipe_example::VULKAN_FFMPEG_8_1_NOTICE,
-                version.lines().next().unwrap_or("version output")
-            );
-        }
-    }
-    let help = probe(
-        path,
-        producer,
-        &["-hide_banner", "-h", &format!("encoder={encoder}")],
-        cancel,
-    )?;
-    ensure!(
-        help.lines()
-            .any(|line| line.starts_with(&format!("Encoder {encoder} ["))),
-        "FFmpeg was found, but this build does not provide {encoder}"
-    );
-    let filters = probe(path, producer, &["-hide_banner", "-filters"], cancel)?;
-    for filter in ["setsar", "setdar", "setparams", "format"]
-        .into_iter()
-        .chain((target != CommandTarget::Macos).then_some("hwupload"))
-    {
-        ensure!(
-            filters
-                .lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(filter)),
-            "FFmpeg is missing filter {filter}"
-        );
-    }
-    let formats = probe(path, producer, &["-hide_banner", "-pix_fmts"], cancel)?;
-    for format in [
-        "yuv444p12le",
-        if target == CommandTarget::Macos {
-            "p410le"
-        } else {
-            "vulkan"
-        },
-    ] {
-        ensure!(
-            formats
-                .lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(format)),
-            "FFmpeg is missing pixel format {format}"
-        );
-    }
-    let mov = probe(path, producer, &["-hide_banner", "-h", "muxer=mov"], cancel)?;
-    ensure!(
-        mov.lines().any(|l| l.starts_with("Muxer mov [")),
-        "FFmpeg is missing the MOV muxer"
-    );
-    Ok(())
+fn check_ffmpeg_with_query(
+    mut query: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<ProresEncoder> {
+    let output = query(&["-hide_banner", "-encoders"])?;
+    select_prores_encoder(&output)
+}
+
+fn check_ffmpeg(path: &Path, producer: &Path, cancel: &AtomicBool) -> Result<ProresEncoder> {
+    tracing::info!(ffmpeg = %path.display(), "Checking FFmpeg ProRes encoder list");
+    check_ffmpeg_with_query(|args| probe(path, producer, args, cancel))
 }
 
 fn owned_directory(destination: &Path) -> Result<PathBuf> {
@@ -1237,6 +1112,7 @@ impl JobFiles {
 struct RunnerConfig {
     producer: PathBuf,
     ffmpeg: PathBuf,
+    encoder: ProresEncoder,
     cwd: PathBuf,
     options: ExportOptions,
     overlap_remux: bool,
@@ -1325,9 +1201,9 @@ impl VideoSlot {
                 .ok_or_else(|| anyhow!("producer stdout pipe missing"))?;
             let mut command = ffmpeg_command(&config.ffmpeg, &config.producer);
             command
-                .args(pipe_example::encoder_args(
+                .args(pipe_example::encoder_args_for(
                     &slot.files.job.facts,
-                    pipe_example::current_command_target(),
+                    config.encoder,
                 ))
                 .args(["-progress", "pipe:1", "-nostats"])
                 .arg(&slot.files.video)
@@ -1555,7 +1431,7 @@ fn run_batch(
         let producer = producer_path(request.producer)?;
         result.needs_ffmpeg = true;
         let ffmpeg = discover_ffmpeg(request.ffmpeg.as_deref(), &cwd)?;
-        check_ffmpeg(&ffmpeg, &producer, &cancel)?;
+        let encoder = check_ffmpeg(&ffmpeg, &producer, &cancel)?;
         result.needs_ffmpeg = false;
         result.checked_ffmpeg = Some(ffmpeg.clone());
         ensure!(!cancel.load(Ordering::Relaxed), "Export canceled.");
@@ -1564,6 +1440,7 @@ fn run_batch(
             RunnerConfig {
                 producer,
                 ffmpeg,
+                encoder,
                 cwd,
                 options: request.options,
                 overlap_remux: true,
@@ -1574,8 +1451,14 @@ fn run_batch(
     let (config, jobs) = match setup {
         Ok(value) => value,
         Err(error) => {
-            result.problem = Some(format!("{error:#}"));
             result.cancellation_requested = cancel.load(Ordering::Relaxed);
+            if result.needs_ffmpeg && !result.cancellation_requested {
+                tracing::warn!(detail = %truncate_text(&format!("{error:#}"), LOG_LIMIT),
+                    "FFmpeg export dependency unavailable");
+                result.problem = Some(FFMPEG_PRORES_UNAVAILABLE.into());
+            } else {
+                result.problem = Some(format!("{error:#}"));
+            }
             for row in pending_rows {
                 result.record(
                     row,

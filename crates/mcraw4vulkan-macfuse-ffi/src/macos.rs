@@ -9,8 +9,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
 const CLEANUP_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_OBSERVE_POLL: Duration = Duration::from_millis(25);
@@ -24,26 +27,80 @@ struct FuseArgs {
 
 enum FuseSession {}
 
-#[link(name = "fuse3")]
-unsafe extern "C" {
-    fn fuse_opt_add_arg(args: *mut FuseArgs, arg: *const c_char) -> c_int;
-    fn fuse_opt_free_args(args: *mut FuseArgs);
+struct MacFuseApi {
+    opt_add_arg: unsafe extern "C" fn(*mut FuseArgs, *const c_char) -> c_int,
+    opt_free_args: unsafe extern "C" fn(*mut FuseArgs),
+    // Exported compatibility ABI, not the newer header's versioned wrapper.
+    session_new:
+        unsafe extern "C" fn(*mut FuseArgs, *const c_void, usize, *mut c_void) -> *mut FuseSession,
+    session_mount: unsafe extern "C" fn(*mut FuseSession, *const c_char) -> c_int,
+    session_fd: unsafe extern "C" fn(*mut FuseSession) -> c_int,
+    session_exit: unsafe extern "C" fn(*mut FuseSession),
+    session_unmount: unsafe extern "C" fn(*mut FuseSession),
+    session_destroy: unsafe extern "C" fn(*mut FuseSession),
+    _library: Library,
+}
 
-    // The installed header maps source callers to a versioned constructor, but
-    // macFUSE also exports this four-argument compatibility ABI for external
-    // request dispatchers such as fuser.
-    #[link_name = "fuse_session_new"]
-    fn fuse_session_new_abi(
-        args: *mut FuseArgs,
-        operations: *const c_void,
-        operations_size: usize,
-        userdata: *mut c_void,
-    ) -> *mut FuseSession;
-    fn fuse_session_mount(session: *mut FuseSession, mountpoint: *const c_char) -> c_int;
-    fn fuse_session_fd(session: *mut FuseSession) -> c_int;
-    fn fuse_session_exit(session: *mut FuseSession);
-    fn fuse_session_unmount(session: *mut FuseSession);
-    fn fuse_session_destroy(session: *mut FuseSession);
+// macFUSE's asynchronous workers can retain session references after destroy.
+// Keep a successfully resolved library owned for the process lifetime, including
+// those workers. Failed loads/resolutions never enter this cache and may retry.
+static MACFUSE_API: OnceLock<MacFuseApi> = OnceLock::new();
+
+impl MacFuseApi {
+    fn load() -> io::Result<&'static Self> {
+        if let Some(api) = MACFUSE_API.get() {
+            return Ok(api);
+        }
+        let path = mcraw4vulkan_core::macfuse_location::library_from_environment()?;
+        // SAFETY: load only the selected installed macFUSE FUSE3 library. Its
+        // initialization is part of explicit mounting, never application startup.
+        // RTLD_NOW rejects unresolved native dependencies before any API call.
+        let library =
+            unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_LOCAL) }.map_err(|error| {
+                io::Error::other(format!(
+                    "could not load macFUSE FUSE3 library {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let api = Self::from_library(library)?;
+        Ok(MACFUSE_API.get_or_init(|| api))
+    }
+
+    fn from_library(library: Library) -> io::Result<Self> {
+        // SAFETY: these are the eight supported libfuse3 ABI functions previously
+        // linked here, with identical C signatures. Copying each typed pointer is
+        // safe because this table owns the library. Resolve all entries before
+        // any call; an error drops the library without creating a native session.
+        unsafe {
+            Ok(Self {
+                opt_add_arg: *library
+                    .get(b"fuse_opt_add_arg\0")
+                    .map_err(|error| io::Error::other(format!("fuse_opt_add_arg: {error}")))?,
+                opt_free_args: *library
+                    .get(b"fuse_opt_free_args\0")
+                    .map_err(|error| io::Error::other(format!("fuse_opt_free_args: {error}")))?,
+                session_new: *library
+                    .get(b"fuse_session_new\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_new: {error}")))?,
+                session_mount: *library
+                    .get(b"fuse_session_mount\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_mount: {error}")))?,
+                session_fd: *library
+                    .get(b"fuse_session_fd\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_fd: {error}")))?,
+                session_exit: *library
+                    .get(b"fuse_session_exit\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_exit: {error}")))?,
+                session_unmount: *library
+                    .get(b"fuse_session_unmount\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_unmount: {error}")))?,
+                session_destroy: *library
+                    .get(b"fuse_session_destroy\0")
+                    .map_err(|error| io::Error::other(format!("fuse_session_destroy: {error}")))?,
+                _library: library,
+            })
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -448,12 +505,14 @@ impl Drop for MacFuseSession {
 }
 
 struct OwnedFuseArgs {
+    api: &'static MacFuseApi,
     raw: FuseArgs,
 }
 
 impl OwnedFuseArgs {
-    fn new(options: &[String]) -> io::Result<Self> {
+    fn new(api: &'static MacFuseApi, options: &[String]) -> io::Result<Self> {
         let mut args = Self {
+            api,
             raw: FuseArgs {
                 argc: 0,
                 argv: ptr::null_mut(),
@@ -479,7 +538,7 @@ impl OwnedFuseArgs {
         // structure and `value` remains valid for the call. libfuse3 copies the
         // argument into its own mutable vector. The API documents only an
         // allocation-failure outcome, so no potentially stale errno is added.
-        if unsafe { fuse_opt_add_arg(&mut self.raw, value.as_ptr()) } == -1 {
+        if unsafe { (self.api.opt_add_arg)(&mut self.raw, value.as_ptr()) } == -1 {
             return Err(io::Error::other(
                 "libfuse3 could not allocate its argument vector",
             ));
@@ -493,7 +552,7 @@ impl Drop for OwnedFuseArgs {
         // SAFETY: this value owns the mutable argv allocated by libfuse3.
         // `fuse_opt_free_args` accepts the zero/null initial state and clears
         // partial allocation after any failed add or constructor call.
-        unsafe { fuse_opt_free_args(&mut self.raw) };
+        unsafe { (self.api.opt_free_args)(&mut self.raw) };
     }
 }
 
@@ -508,6 +567,7 @@ struct MountIdentity {
 }
 
 struct NativeSession {
+    api: &'static MacFuseApi,
     raw: Option<NonNull<FuseSession>>,
     mountpoint_c: CString,
     mountpoint_key: Vec<u8>,
@@ -529,7 +589,15 @@ impl NativeSession {
                 None,
             )
         })?;
-        let mut args = OwnedFuseArgs::new(options).map_err(|source| {
+        let api = MacFuseApi::load().map_err(|source| {
+            MacFuseSessionError::new(
+                MacFuseSessionErrorKind::NativeSetup,
+                "could not acquire the macFUSE FUSE3 API",
+                mountpoint,
+                Some(source),
+            )
+        })?;
+        let mut args = OwnedFuseArgs::new(api, options).map_err(|source| {
             MacFuseSessionError::new(
                 MacFuseSessionErrorKind::NativeSetup,
                 "could not build the native libfuse3 argument vector",
@@ -542,7 +610,7 @@ impl NativeSession {
         // compatibility ABI accepts null operations for an external dispatcher;
         // no Rust callback or userdata pointer is retained. libfuse3 parses or
         // copies the argument data before returning.
-        let raw = unsafe { fuse_session_new_abi(&mut args.raw, ptr::null(), 0, ptr::null_mut()) };
+        let raw = unsafe { (api.session_new)(&mut args.raw, ptr::null(), 0, ptr::null_mut()) };
         let Some(raw) = NonNull::new(raw) else {
             // This constructor documents null as rejection but does not promise
             // errno, so report the outcome without attaching stale errno.
@@ -555,6 +623,7 @@ impl NativeSession {
         };
 
         let mut owner = Self {
+            api,
             raw: Some(raw),
             mountpoint_c,
             mountpoint_key: mountpoint.as_os_str().as_bytes().to_vec(),
@@ -566,7 +635,8 @@ impl NativeSession {
         // SAFETY: `owner` holds the live caller reference and `mountpoint_c` is
         // a valid NUL-terminated path for the call. macFUSE copies the path when
         // accepting its deferred mount request.
-        let mount_result = unsafe { fuse_session_mount(raw.as_ptr(), owner.mountpoint_c.as_ptr()) };
+        let mount_result =
+            unsafe { (owner.api.session_mount)(raw.as_ptr(), owner.mountpoint_c.as_ptr()) };
         if mount_result != 0 {
             let cleanup = owner.cancel_and_destroy();
             // `fuse_session_mount` documents only its zero/-1 outcome, not
@@ -589,7 +659,7 @@ impl NativeSession {
         // not adopted by Rust.
         let borrowed_fd = unsafe {
             *libc::__error() = 0;
-            fuse_session_fd(raw.as_ptr())
+            (owner.api.session_fd)(raw.as_ptr())
         };
         if borrowed_fd < 0 {
             // `fuse_session_fd`'s macOS implementation reports the channel
@@ -685,7 +755,7 @@ impl NativeSession {
             // SAFETY: this object owns the live caller reference. The function
             // is void and asynchronous on macOS; callers never interpret it as
             // success. macFUSE serializes repeated requests internally.
-            unsafe { fuse_session_unmount(raw.as_ptr()) };
+            unsafe { (self.api.session_unmount)(raw.as_ptr()) };
         }
     }
 
@@ -698,8 +768,8 @@ impl NativeSession {
                 // unmount path then closes the channel and requests a forced backend
                 // unmount. No Rust pointer is shared with its native worker.
                 unsafe {
-                    fuse_session_exit(raw.as_ptr());
-                    fuse_session_unmount(raw.as_ptr());
+                    (self.api.session_exit)(raw.as_ptr());
+                    (self.api.session_unmount)(raw.as_ptr());
                 }
             }
         }
@@ -801,7 +871,7 @@ impl NativeSession {
             // Drop, forced channel shutdown precedes release. macFUSE's own
             // asynchronous workers retain separate counted references, so
             // releasing this caller reference does not invalidate their state.
-            unsafe { fuse_session_destroy(raw.as_ptr()) };
+            unsafe { (self.api.session_destroy)(raw.as_ptr()) };
             self.mount_requested = false;
         }
     }

@@ -51,8 +51,13 @@ where
 pub fn action_for_report(report: &PreflightReport, config: LauncherConfig) -> LauncherAction {
     // The report already owns blocking policy. The launcher either preserves
     // the exact GUI request or presents the report-derived requirement notice.
-    if let Some(notification) = notification_for_report(report) {
-        LauncherAction::Blocked(notification)
+    if !report.ready_to_launch || report.status != crate::PreflightStatus::ReadyToLaunch {
+        LauncherAction::Blocked(notification_for_report(report).unwrap_or_else(|| {
+            RequirementNotification {
+                title: "mcraw4vulkan requirements missing".to_string(),
+                body: "Preflight could not establish the essential GUI requirements.".to_string(),
+            }
+        }))
     } else {
         LauncherAction::Launch(config)
     }

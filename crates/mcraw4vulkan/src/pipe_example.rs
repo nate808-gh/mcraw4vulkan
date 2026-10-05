@@ -15,8 +15,8 @@ pub const BODY: &str = "Using the command line, mcraw4vulkan Pipe decodes a Moti
 pub const USEFUL_TEXT: &str = "The bytestream is formatted for rapid processing in the GPU. To correctly display the .mov file in another app, you may have to manually assign BT2020 AppleLog in that app";
 pub const NO_SELECTED_FILE_MESSAGE: &str = "Select a playlist file to generate a pipe example.";
 pub const PRORES_OUTPUT_COLOR_TEXT: &str = "The macOS VideoToolbox example converts the 12-bit producer output to p410le: 10 meaningful bits in 16-bit storage. ProRes is lossy. Apple Log input assignment remains manual; a sidecar or filename does not ensure automatic recognition.";
-pub const VULKAN_FFMPEG_8_1_NOTICE: &str =
-    "FFmpeg 8.1 or later is required for GPU encoding of ProRes files with Vulkan";
+pub const VULKAN_FFMPEG_NOTICE: &str =
+    "FFmpeg with prores_ks_vulkan is required for this Vulkan pipe example";
 pub const SIMPLE_COMMAND_PIPE: &str = "mcraw4vulkan pipe";
 pub const SIMPLE_COMMAND: &str = "mcraw4vulkan pipe FILE_NAME.mcraw > FILE_NAME.yuv444p12le";
 pub const COMPLICATED_EXAMPLE_LABEL: &str = "A complicated example:";
@@ -50,6 +50,22 @@ pub enum CommandTarget {
     Macos,
 }
 
+/// The two established ProRes recipes, independent of native shell/pipe handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProresEncoder {
+    Vulkan,
+    VideoToolbox,
+}
+
+impl ProresEncoder {
+    pub(crate) fn default_for(target: CommandTarget) -> Self {
+        match target {
+            CommandTarget::Macos => Self::VideoToolbox,
+            CommandTarget::Linux | CommandTarget::Windows => Self::Vulkan,
+        }
+    }
+}
+
 impl CommandTarget {
     pub fn terminal_label(self) -> &'static str {
         "A simple example using the terminal to create a video bytestream"
@@ -68,7 +84,7 @@ impl CommandTarget {
 
     pub fn ffmpeg_prerequisite_text(self) -> Option<&'static str> {
         match self {
-            Self::Linux | Self::Windows => Some(VULKAN_FFMPEG_8_1_NOTICE),
+            Self::Linux | Self::Windows => Some(VULKAN_FFMPEG_NOTICE),
             Self::Macos => Some(PRORES_OUTPUT_COLOR_TEXT),
         }
     }
@@ -340,11 +356,15 @@ fn macos_command(
 
 /// Literal encoder arguments shared with the protected human-facing recipe.
 pub(crate) fn encoder_args(facts: &PipeExampleFacts, target: CommandTarget) -> Vec<String> {
+    encoder_args_for(facts, ProresEncoder::default_for(target))
+}
+
+pub(crate) fn encoder_args_for(facts: &PipeExampleFacts, encoder: ProresEncoder) -> Vec<String> {
     let mut args: Vec<String> = ["-nostdin", "-hide_banner", "-y"]
         .into_iter()
         .map(str::to_owned)
         .collect();
-    if target != CommandTarget::Macos {
+    if encoder == ProresEncoder::Vulkan {
         args.extend(
             [
                 "-noauto_conversion_filters",
@@ -393,14 +413,14 @@ pub(crate) fn encoder_args(facts: &PipeExampleFacts, target: CommandTarget) -> V
         .map(str::to_owned),
     );
     let aspect = display_aspect_ratio_text(facts);
-    args.push(if target == CommandTarget::Macos {
+    args.push(if encoder == ProresEncoder::VideoToolbox {
         videotoolbox_prores_filter(&aspect)
     } else {
         vulkan_prores_filter(&aspect)
     });
     args.extend(["-an", "-c:v"].into_iter().map(str::to_owned));
     args.extend(
-        if target == CommandTarget::Macos {
+        if encoder == ProresEncoder::VideoToolbox {
             [
                 "prores_videotoolbox",
                 "-profile:v",

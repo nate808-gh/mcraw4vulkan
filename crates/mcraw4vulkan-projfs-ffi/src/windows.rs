@@ -4,6 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::iter;
 use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -14,6 +15,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use libloading::os::windows::{LOAD_LIBRARY_SEARCH_SYSTEM32, Library};
+
 use windows_sys::Win32::Foundation::{
     CloseHandle, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
     ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_SUPPORTED, S_OK,
@@ -22,10 +25,7 @@ use windows_sys::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
     PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY, PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO,
     PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION, PRJ_NOTIFICATION_PARAMETERS,
-    PRJ_PLACEHOLDER_INFO, PRJ_STARTVIRTUALIZING_OPTIONS, PrjAllocateAlignedBuffer,
-    PrjDoesNameContainWildCards, PrjFileNameCompare, PrjFileNameMatch, PrjFillDirEntryBuffer,
-    PrjFreeAlignedBuffer, PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
-    PrjWriteFileData, PrjWritePlaceholderInfo,
+    PRJ_PLACEHOLDER_INFO, PRJ_PLACEHOLDER_VERSION_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -44,6 +44,114 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 const PROCESS_EXIT_CODE_STILL_ACTIVE: u32 = 259;
 static NEXT_INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+// Only explicit projections acquire this complete table. The existing state
+// owns it until PrjStopVirtualizing has waited for callbacks to finish; callback
+// writers and aligned buffers borrow it, so native deallocation precedes unload.
+struct ProjFsApi {
+    allocate_aligned_buffer:
+        unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, usize) -> *mut c_void,
+    does_name_contain_wildcards: unsafe extern "system" fn(PCWSTR) -> bool,
+    file_name_compare: unsafe extern "system" fn(PCWSTR, PCWSTR) -> i32,
+    file_name_match: unsafe extern "system" fn(PCWSTR, PCWSTR) -> bool,
+    fill_dir_entry_buffer: unsafe extern "system" fn(
+        PCWSTR,
+        *const PRJ_FILE_BASIC_INFO,
+        PRJ_DIR_ENTRY_BUFFER_HANDLE,
+    ) -> HRESULT,
+    free_aligned_buffer: unsafe extern "system" fn(*const c_void),
+    mark_directory_as_placeholder: unsafe extern "system" fn(
+        PCWSTR,
+        PCWSTR,
+        *const PRJ_PLACEHOLDER_VERSION_INFO,
+        *const GUID,
+    ) -> HRESULT,
+    start_virtualizing: unsafe extern "system" fn(
+        PCWSTR,
+        *const PRJ_CALLBACKS,
+        *const c_void,
+        *const PRJ_STARTVIRTUALIZING_OPTIONS,
+        *mut PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    ) -> HRESULT,
+    stop_virtualizing: unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT),
+    write_file_data: unsafe extern "system" fn(
+        PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+        *const GUID,
+        *const c_void,
+        u64,
+        u32,
+    ) -> HRESULT,
+    write_placeholder_info: unsafe extern "system" fn(
+        PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+        PCWSTR,
+        *const PRJ_PLACEHOLDER_INFO,
+        u32,
+    ) -> HRESULT,
+    _library: Library,
+}
+
+impl ProjFsApi {
+    fn load() -> io::Result<Self> {
+        // SAFETY: load the OS-provided API only from the system directory (also
+        // for its dependencies). No CWD/PATH search or global search-path change.
+        // Loading/initialization happens only in an explicit mount operation.
+        let library =
+            unsafe { Library::load_with_flags("ProjectedFSLib.dll", LOAD_LIBRARY_SEARCH_SYSTEM32) }
+                .map_err(|error| {
+                    io::Error::other(format!("could not load system ProjectedFSLib.dll: {error}"))
+                })?;
+        Self::from_library(library)
+    }
+
+    fn from_library(library: Library) -> io::Result<Self> {
+        // SAFETY: these pointers use the exact windows-sys 0.61.2 signatures and
+        // system calling convention. The table owns the library for every call.
+        // Resolve the complete API before invoking anything; failed resolution
+        // drops the acquired library and never starts a partial projection.
+        unsafe {
+            Ok(Self {
+                allocate_aligned_buffer: *library.get(b"PrjAllocateAlignedBuffer\0").map_err(
+                    |error| io::Error::other(format!("PrjAllocateAlignedBuffer: {error}")),
+                )?,
+                does_name_contain_wildcards: *library
+                    .get(b"PrjDoesNameContainWildCards\0")
+                    .map_err(|error| {
+                        io::Error::other(format!("PrjDoesNameContainWildCards: {error}"))
+                    })?,
+                file_name_compare: *library
+                    .get(b"PrjFileNameCompare\0")
+                    .map_err(|error| io::Error::other(format!("PrjFileNameCompare: {error}")))?,
+                file_name_match: *library
+                    .get(b"PrjFileNameMatch\0")
+                    .map_err(|error| io::Error::other(format!("PrjFileNameMatch: {error}")))?,
+                fill_dir_entry_buffer: *library
+                    .get(b"PrjFillDirEntryBuffer\0")
+                    .map_err(|error| io::Error::other(format!("PrjFillDirEntryBuffer: {error}")))?,
+                free_aligned_buffer: *library
+                    .get(b"PrjFreeAlignedBuffer\0")
+                    .map_err(|error| io::Error::other(format!("PrjFreeAlignedBuffer: {error}")))?,
+                mark_directory_as_placeholder: *library
+                    .get(b"PrjMarkDirectoryAsPlaceholder\0")
+                    .map_err(|error| {
+                        io::Error::other(format!("PrjMarkDirectoryAsPlaceholder: {error}"))
+                    })?,
+                start_virtualizing: *library
+                    .get(b"PrjStartVirtualizing\0")
+                    .map_err(|error| io::Error::other(format!("PrjStartVirtualizing: {error}")))?,
+                stop_virtualizing: *library
+                    .get(b"PrjStopVirtualizing\0")
+                    .map_err(|error| io::Error::other(format!("PrjStopVirtualizing: {error}")))?,
+                write_file_data: *library
+                    .get(b"PrjWriteFileData\0")
+                    .map_err(|error| io::Error::other(format!("PrjWriteFileData: {error}")))?,
+                write_placeholder_info: *library.get(b"PrjWritePlaceholderInfo\0").map_err(
+                    |error| io::Error::other(format!("PrjWritePlaceholderInfo: {error}")),
+                )?,
+                _library: library,
+            })
+        }
+    }
+}
 
 pub struct Projection {
     root: PathBuf,
@@ -84,7 +192,7 @@ impl Projection {
         // call for this projection and is stopped at most once. The callback
         // table and state remain owned until native callback teardown completes.
         unsafe {
-            PrjStopVirtualizing(context);
+            (self._state.api.stop_virtualizing)(context);
         }
         debug_assert_eq!(
             self._state.in_flight_callbacks.load(AtomicOrdering::SeqCst),
@@ -106,11 +214,14 @@ struct ProjectionState {
     in_flight_callbacks: AtomicUsize,
     cancelled_commands: AtomicUsize,
     notifications: AtomicUsize,
+    // Released after stop, callback completion and the remaining state fields.
+    api: ProjFsApi,
 }
 
 impl ProjectionState {
-    fn new(provider: Box<dyn ProjectionProvider>) -> Self {
+    fn new(api: ProjFsApi, provider: Box<dyn ProjectionProvider>) -> Self {
         Self {
+            api,
             provider,
             enumerations: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
@@ -241,9 +352,14 @@ fn start_prepared_projection<P>(
 where
     P: ProjectionProvider + 'static,
 {
+    let api = ProjFsApi::load().map_err(|source| StartProjectionError::Io {
+        operation: "acquire the ProjFS API",
+        path: root.clone(),
+        source,
+    })?;
     let root_utf16 = path_to_null_terminated_utf16(&root);
     let callbacks = Box::new(callbacks());
-    let state = Box::new(ProjectionState::new(Box::new(provider)));
+    let state = Box::new(ProjectionState::new(api, Box::new(provider)));
     let state_context = state.as_ref() as *const ProjectionState as *const c_void;
     let options = PRJ_STARTVIRTUALIZING_OPTIONS {
         Flags: 0,
@@ -260,7 +376,7 @@ where
     // and intentionally null. instance_guid is unique to this virtualization
     // root so stale placeholders are not confused with a new provider.
     let mark_result = unsafe {
-        PrjMarkDirectoryAsPlaceholder(
+        (state.api.mark_directory_as_placeholder)(
             root_utf16.as_ptr(),
             ptr::null(),
             ptr::null(),
@@ -276,7 +392,7 @@ where
     // state boxes are stored in Projection and remain alive until after
     // PrjStopVirtualizing has been called.
     let start_result = unsafe {
-        PrjStartVirtualizing(
+        (state.api.start_virtualizing)(
             root_utf16.as_ptr(),
             callbacks.as_ref() as *const PRJ_CALLBACKS,
             state_context,
@@ -450,12 +566,14 @@ fn provider_error_to_hresult(error: ProviderError) -> HRESULT {
     }
 }
 
-struct AlignedBuffer {
+struct AlignedBuffer<'a> {
+    api: &'a ProjFsApi,
     buffer: *mut c_void,
 }
 
-impl AlignedBuffer {
+impl<'a> AlignedBuffer<'a> {
     fn allocate(
+        api: &'a ProjFsApi,
         namespace_context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
         size: usize,
     ) -> Result<Self, HRESULT> {
@@ -466,12 +584,12 @@ impl AlignedBuffer {
         // SAFETY: namespace_context comes from the active ProjFS callback and
         // size is the nonzero number of bytes that will be passed to
         // PrjWriteFileData for this same callback.
-        let buffer = unsafe { PrjAllocateAlignedBuffer(namespace_context, size) };
+        let buffer = unsafe { (api.allocate_aligned_buffer)(namespace_context, size) };
         if buffer.is_null() {
             return Err(E_OUTOFMEMORY);
         }
 
-        Ok(Self { buffer })
+        Ok(Self { api, buffer })
     }
 
     fn copy_from_slice(&self, bytes: &[u8]) {
@@ -487,12 +605,12 @@ impl AlignedBuffer {
     }
 }
 
-impl Drop for AlignedBuffer {
+impl Drop for AlignedBuffer<'_> {
     fn drop(&mut self) {
         // SAFETY: buffer was returned by PrjAllocateAlignedBuffer and is freed
         // exactly once by this RAII guard.
         unsafe {
-            PrjFreeAlignedBuffer(self.buffer.cast_const());
+            (self.api.free_aligned_buffer)(self.buffer.cast_const());
         }
     }
 }
@@ -579,66 +697,67 @@ enum SearchExpression {
 }
 
 impl SearchExpression {
-    fn from_raw(search_expression: Option<OsString>) -> Self {
+    fn from_raw(api: &ProjFsApi, search_expression: Option<OsString>) -> Self {
         let Some(pattern) = search_expression else {
             return Self::All;
         };
 
-        if projfs_name_contains_wildcards(pattern.as_os_str()) {
+        if projfs_name_contains_wildcards(api, pattern.as_os_str()) {
             Self::Wildcard(pattern)
         } else {
             Self::Exact(pattern)
         }
     }
 
-    fn matches(&self, name: &OsStr) -> bool {
+    fn matches(&self, api: &ProjFsApi, name: &OsStr) -> bool {
         match self {
             Self::All => true,
             Self::Exact(pattern) => {
-                compare_projfs_os_strings(name, pattern.as_os_str()) == Ordering::Equal
+                compare_projfs_os_strings(api, name, pattern.as_os_str()) == Ordering::Equal
             }
-            Self::Wildcard(pattern) => projfs_name_matches(name, pattern.as_os_str()),
+            Self::Wildcard(pattern) => projfs_name_matches(api, name, pattern.as_os_str()),
         }
     }
 }
 
-fn compare_projfs_os_strings(left: &OsStr, right: &OsStr) -> Ordering {
+fn compare_projfs_os_strings(api: &ProjFsApi, left: &OsStr, right: &OsStr) -> Ordering {
     let left = os_str_to_null_terminated_utf16(left);
     let right = os_str_to_null_terminated_utf16(right);
 
     // SAFETY: both UTF-16 buffers are null-terminated and alive for this call.
-    let result = unsafe { PrjFileNameCompare(left.as_ptr(), right.as_ptr()) };
+    let result = unsafe { (api.file_name_compare)(left.as_ptr(), right.as_ptr()) };
 
     result.cmp(&0)
 }
 
-fn projfs_name_contains_wildcards(value: &OsStr) -> bool {
+fn projfs_name_contains_wildcards(api: &ProjFsApi, value: &OsStr) -> bool {
     let value = os_str_to_null_terminated_utf16(value);
 
     // SAFETY: value is a null-terminated UTF-16 buffer alive for this call.
-    unsafe { PrjDoesNameContainWildCards(value.as_ptr()) }
+    unsafe { (api.does_name_contain_wildcards)(value.as_ptr()) }
 }
 
-fn projfs_name_matches(name: &OsStr, pattern: &OsStr) -> bool {
+fn projfs_name_matches(api: &ProjFsApi, name: &OsStr, pattern: &OsStr) -> bool {
     let name = os_str_to_null_terminated_utf16(name);
     let pattern = os_str_to_null_terminated_utf16(pattern);
 
     // SAFETY: both UTF-16 buffers are null-terminated and alive for this call.
-    unsafe { PrjFileNameMatch(name.as_ptr(), pattern.as_ptr()) }
+    unsafe { (api.file_name_match)(name.as_ptr(), pattern.as_ptr()) }
 }
 
 fn load_directory_entries(
+    api: &ProjFsApi,
     provider: &dyn ProjectionProvider,
     path: &Path,
     search_expression: Option<OsString>,
 ) -> ProviderResult<Vec<DirectoryEntry>> {
     let mut entries = provider.list_directory(path)?;
     entries.sort_by(|left, right| {
-        compare_projfs_os_strings(left.name.as_os_str(), right.name.as_os_str())
+        compare_projfs_os_strings(api, left.name.as_os_str(), right.name.as_os_str())
     });
 
-    let search_expression = SearchExpression::from_raw(search_expression);
-    entries.retain(|entry| search_expression.matches(entry.name.as_os_str()));
+    let search_expression = SearchExpression::from_raw(api, search_expression);
+    entries.retain(|entry| search_expression.matches(api, entry.name.as_os_str()));
 
     Ok(entries)
 }
@@ -670,11 +789,12 @@ trait DirectoryEntryWriter {
     fn write_directory_entry(&mut self, entry: &DirectoryEntry) -> HRESULT;
 }
 
-struct ProjFsDirectoryEntryWriter {
+struct ProjFsDirectoryEntryWriter<'a> {
+    api: &'a ProjFsApi,
     handle: PRJ_DIR_ENTRY_BUFFER_HANDLE,
 }
 
-impl DirectoryEntryWriter for ProjFsDirectoryEntryWriter {
+impl DirectoryEntryWriter for ProjFsDirectoryEntryWriter<'_> {
     fn write_directory_entry(&mut self, entry: &DirectoryEntry) -> HRESULT {
         let basic_info = placeholder_to_basic_info(entry.info);
         let name = os_string_to_null_terminated_utf16(&entry.name);
@@ -682,7 +802,7 @@ impl DirectoryEntryWriter for ProjFsDirectoryEntryWriter {
         // SAFETY: name is null-terminated and alive for the call, basic_info
         // points to a valid PRJ_FILE_BASIC_INFO, and handle was supplied by
         // ProjFS for this callback.
-        unsafe { PrjFillDirEntryBuffer(name.as_ptr(), &basic_info, self.handle) }
+        unsafe { (self.api.fill_dir_entry_buffer)(name.as_ptr(), &basic_info, self.handle) }
     }
 }
 
@@ -817,6 +937,7 @@ unsafe extern "system" fn get_directory_enumeration_callback(
 
         if let Some((path, search_expression)) = load_request {
             let entries = match load_directory_entries(
+                &state.api,
                 state.provider.as_ref(),
                 &path,
                 search_expression.clone(),
@@ -844,6 +965,7 @@ unsafe extern "system" fn get_directory_enumeration_callback(
             return S_OK;
         };
         let mut writer = ProjFsDirectoryEntryWriter {
+            api: &state.api,
             handle: dir_entry_buffer_handle,
         };
 
@@ -876,7 +998,7 @@ unsafe extern "system" fn get_placeholder_info_callback(
         // active callback. path is a null-terminated relative provider path
         // alive for the call, and placeholder_info is a valid initialized value.
         unsafe {
-            PrjWritePlaceholderInfo(
+            (state.api.write_placeholder_info)(
                 callback_data.NamespaceVirtualizationContext,
                 path.as_ptr(),
                 &placeholder_info,
@@ -941,7 +1063,7 @@ fn write_file_data_from_provider(
             return E_FAIL;
         }
 
-        let result = write_file_data_chunk(callback_data, current_offset, &bytes);
+        let result = write_file_data_chunk(&state.api, callback_data, current_offset, &bytes);
         if result < 0 {
             return result;
         }
@@ -959,6 +1081,7 @@ fn write_file_data_from_provider(
 }
 
 fn write_file_data_chunk(
+    api: &ProjFsApi,
     callback_data: &PRJ_CALLBACK_DATA,
     byte_offset: u64,
     bytes: &[u8],
@@ -967,11 +1090,14 @@ fn write_file_data_chunk(
         return E_INVALIDARG;
     }
 
-    let buffer =
-        match AlignedBuffer::allocate(callback_data.NamespaceVirtualizationContext, bytes.len()) {
-            Ok(buffer) => buffer,
-            Err(hresult) => return hresult,
-        };
+    let buffer = match AlignedBuffer::allocate(
+        api,
+        callback_data.NamespaceVirtualizationContext,
+        bytes.len(),
+    ) {
+        Ok(buffer) => buffer,
+        Err(hresult) => return hresult,
+    };
     buffer.copy_from_slice(bytes);
 
     // SAFETY: NamespaceVirtualizationContext and DataStreamId come from the
@@ -979,7 +1105,7 @@ fn write_file_data_chunk(
     // bytes.len() initialized bytes, and remains alive for the duration of the
     // call. byte_offset and length describe the requested provider range.
     unsafe {
-        PrjWriteFileData(
+        (api.write_file_data)(
             callback_data.NamespaceVirtualizationContext,
             &callback_data.DataStreamId,
             buffer.as_ptr(),

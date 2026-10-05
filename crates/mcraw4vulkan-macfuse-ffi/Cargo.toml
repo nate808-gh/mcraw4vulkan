@@ -14,5 +14,7 @@ publish = false
 unsafe_op_in_unsafe_fn = "deny"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+libloading = "=0.8.9"
 fuser = { version = "0.17", default-features = false, features = ["macos-no-mount", "macfuse-4-compat"] }
 libc = "0.2"

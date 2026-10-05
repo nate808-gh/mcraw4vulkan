@@ -26,6 +26,18 @@ pub fn send_requirement_notification(
     notifier.notify(notification)
 }
 
+pub fn mount_warning_for_report(report: &PreflightReport) -> Option<RequirementNotification> {
+    (report.platform.mount_backend_status != PreflightRequirementStatus::Available).then(|| {
+        RequirementNotification {
+            title: "DNG mounting unavailable".to_string(),
+            body: format!(
+                "DNG mounting will not function without {} installed on this workstation.",
+                report.platform.mount_backend.label()
+            ),
+        }
+    })
+}
+
 pub fn notification_for_report(report: &PreflightReport) -> Option<RequirementNotification> {
     // Notifications consume the report's blocking decisions rather than
     // repeating platform probes or independently deciding launch policy.

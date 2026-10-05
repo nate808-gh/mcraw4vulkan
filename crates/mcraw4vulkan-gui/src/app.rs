@@ -410,6 +410,7 @@ enum AppPhase {
     PreflightStarting,
     PreflightReadyVisible { transition_at: Instant },
     PreflightNotReady,
+    PreflightMountWarning,
     MainSkeleton,
 }
 
@@ -498,11 +499,17 @@ impl GuiApp {
     }
 
     fn set_preflight_result(&mut self, preflight: PreflightViewModel, now: Instant) {
+        if self.phase != AppPhase::PreflightStarting || self.quit_requested {
+            return;
+        }
         self.phase = phase_for_preflight(&preflight, now);
         self.preflight = preflight;
     }
 
     fn advance_startup_phase(&mut self, now: Instant) {
+        if self.quit_requested {
+            return;
+        }
         if let AppPhase::PreflightReadyVisible { transition_at } = self.phase {
             if now >= transition_at {
                 self.phase = AppPhase::MainSkeleton;
@@ -630,12 +637,72 @@ impl GuiApp {
                     AppPhase::MainSkeleton => self.main_gui(ui),
                     AppPhase::PreflightStarting
                     | AppPhase::PreflightReadyVisible { .. }
-                    | AppPhase::PreflightNotReady => self.preflight_splash(ui),
+                    | AppPhase::PreflightNotReady
+                    | AppPhase::PreflightMountWarning => self.preflight_splash(ui),
                 }
             });
+        self.draw_startup_mount_warning(context, now);
         self.draw_macos_mount_limit_warning(context);
         // Deliver only after this frame's Cancel/close controls have invalidated stale work.
         self.admit_movie_export_retry();
+    }
+
+    fn apply_startup_mount_warning_response(&mut self, response: Result<bool, &str>, now: Instant) {
+        if self.phase != AppPhase::PreflightMountWarning || self.quit_requested {
+            return;
+        }
+        let acknowledged = match response {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                eprintln!("Startup mount warning could not be presented: {error}");
+                true
+            }
+        };
+        if acknowledged {
+            // The current frame contains only the splash. Main controls become
+            // interactive on the next frame, after the OK release is consumed.
+            self.phase = AppPhase::PreflightReadyVisible { transition_at: now };
+        }
+    }
+
+    fn draw_startup_mount_warning(&mut self, context: &Context, now: Instant) {
+        if self.phase != AppPhase::PreflightMountWarning || self.quit_requested {
+            return;
+        }
+        let Some(warning) = self.preflight.mount_warning.as_ref() else {
+            self.apply_startup_mount_warning_response(Err("missing warning text"), now);
+            context.request_repaint();
+            return;
+        };
+        let mut open = true;
+        let response = egui::Window::new(&warning.title)
+            .id(egui::Id::new("startup-mount-warning"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(420.0)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                draw_body_line(ui, &warning.body);
+                ui.add_space(style::metrics(ui).space(8.0));
+                ui.vertical_centered(|ui| {
+                    let response = ui.button("OK");
+                    response.clicked()
+                })
+                .inner
+            });
+        let acknowledgment = if !open {
+            Ok(true)
+        } else {
+            response
+                .map(|response| response.inner.unwrap_or(false))
+                .ok_or("warning window unavailable")
+        };
+        self.apply_startup_mount_warning_response(acknowledgment, now);
+        if self.phase != AppPhase::PreflightMountWarning {
+            context.request_repaint();
+        }
     }
 
     fn main_gui(&mut self, ui: &mut egui::Ui) {
@@ -2642,7 +2709,9 @@ fn default_playlist_store() -> PlaylistStore {
 }
 
 fn phase_for_preflight(preflight: &PreflightViewModel, now: Instant) -> AppPhase {
-    if preflight.ready {
+    if preflight.ready && preflight.mount_warning.is_some() {
+        AppPhase::PreflightMountWarning
+    } else if preflight.ready {
         AppPhase::PreflightReadyVisible {
             transition_at: now + preflight_splash_min_visible(),
         }

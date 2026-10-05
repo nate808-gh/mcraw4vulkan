@@ -20,18 +20,13 @@ pub(crate) fn mount_backend_line(
         (MountBackendKind::LinuxFuse3, PreflightRequirementStatus::Available) => {
             "FUSE3: found".to_string()
         }
-        (MountBackendKind::LinuxFuse3, _) => "FUSE3 is required".to_string(),
         (MountBackendKind::MacosMacFuse, PreflightRequirementStatus::Available) => {
             "macFUSE: found".to_string()
         }
-        (MountBackendKind::MacosMacFuse, _) => "macFUSE is required".to_string(),
         (MountBackendKind::WindowsProjFs, PreflightRequirementStatus::Available) => {
             "ProjFS: enabled".to_string()
         }
-        (MountBackendKind::WindowsProjFs, _) => "ProjFS is required".to_string(),
-        (MountBackendKind::Unsupported, _) => {
-            "Mount backend not found. mcraw4vulkan requires a supported mount backend".to_string()
-        }
+        _ => format!("{}: FUSE NOT FOUND", kind.label()),
     }
 }
 

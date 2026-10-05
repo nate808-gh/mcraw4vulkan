@@ -2,7 +2,7 @@
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
-use crate::platform::{PlatformKind, absolute_path, availability_detail, platform_summary};
+use crate::platform::{PlatformKind, platform_summary};
 #[cfg(target_os = "macos")]
 use crate::{HardwareSummary, MountBackendKind, PlatformSummary};
 
@@ -16,17 +16,19 @@ pub(crate) fn collect() -> (PlatformSummary, HardwareSummary) {
             command_stdout("sysctl", &["-n", "hw.model"])
                 .and_then(|output| parse_sysctl_value(&output))
         });
-    let macfuse_root = absolute_path(&["Library", "Filesystems", "macfuse.fs"]);
-    let helper = macfuse_root.join("Contents/Resources/mount_macfuse");
-    let libfuse3 = absolute_path(&["usr", "local", "lib", "libfuse3.4.dylib"]);
-    // This checks installation artifacts rather than attempting a mount. The
-    // FUSE3 application path needs the bundle, mount helper, and ABI dylib.
-    let available = macfuse_root.exists() && helper.exists() && libfuse3.exists();
-    let (mount_backend_status, mount_backend_detail) = availability_detail(
-        available,
-        "macFUSE FUSE3 installation artifacts are present without attempting a mount",
-        "macFUSE bundle, mount helper, or libfuse3.4.dylib was not found",
-    );
+    // Share the mount-side location policy without loading the native library.
+    let (mount_backend_status, mount_backend_detail) =
+        match mcraw4vulkan_core::macfuse_location::library_from_environment() {
+            Ok(_) => (
+                crate::PreflightRequirementStatus::Available,
+                "macFUSE FUSE3 installation artifacts are present without attempting a mount"
+                    .to_string(),
+            ),
+            Err(error) => (
+                crate::PreflightRequirementStatus::Missing,
+                error.to_string(),
+            ),
+        };
 
     (
         platform_summary(

@@ -1,6 +1,6 @@
 use mcraw4vulkan_preflight::{
     PreflightCheckKind, PreflightCheckResult, PreflightReport, PreflightRequirementStatus,
-    PreflightStatus,
+    PreflightStatus, RequirementNotification, mount_warning_for_report,
 };
 
 pub const PREFLIGHT_PANEL_TITLE: &str = "Preflight System Checks";
@@ -10,6 +10,7 @@ pub struct PreflightViewModel {
     pub status_line: String,
     pub detail_line: String,
     pub ready: bool,
+    pub mount_warning: Option<RequirementNotification>,
     pub lines: Vec<PreflightLine>,
 }
 
@@ -36,6 +37,7 @@ impl PreflightViewModel {
     // its facts into presentation and may replace the displayed GPU description.
     pub fn from_report_with_gui_gpu(report: &PreflightReport, gui_gpu_model: Option<&str>) -> Self {
         let ready = report.status == PreflightStatus::ReadyToLaunch && report.ready_to_launch;
+        let mount_warning = mount_warning_for_report(report);
         let mut lines = report
             .checks
             .iter()
@@ -60,12 +62,15 @@ impl PreflightViewModel {
             } else {
                 "Not Ready".to_string()
             },
-            detail_line: if ready {
+            detail_line: if ready && mount_warning.is_some() {
+                "GUI requirements were met; DNG mounting is unavailable.".to_string()
+            } else if ready {
                 "System requirements were checked and all requirements were met.".to_string()
             } else {
                 "Resolve the listed requirements before launching the full GUI.".to_string()
             },
             ready,
+            mount_warning,
             lines,
         }
     }
@@ -75,6 +80,7 @@ impl PreflightViewModel {
             status_line: "Checking system requirements...".to_string(),
             detail_line: "Running startup preflight once on the foreground thread.".to_string(),
             ready: false,
+            mount_warning: None,
             lines: vec![PreflightLine {
                 text: "Pre-flight Checklist in progress".to_string(),
                 status: LineStatus::Informational,
