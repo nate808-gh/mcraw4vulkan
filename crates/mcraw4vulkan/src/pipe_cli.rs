@@ -169,6 +169,8 @@ struct PipeRenderedVideo {
 pub(crate) struct PipeFramePreflight {
     pub(crate) clip_info: McrawClipInfo,
     pub(crate) dimensions: FrameDimensions,
+    pub(crate) geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
+    pub(crate) analysis_decodes_here: u32,
     pub(crate) bayer: BayerPattern,
     pub(crate) runtime_source_identity: ClipSourceSha256,
     pub(crate) source_file_bytes: u64,
@@ -391,8 +393,8 @@ impl PipeStreamContextCollector {
             "source_sha256": source_sha_hex,
             "source_file_bytes": preflight.source_file_bytes,
             "frame_count": preflight.selected_frame_count,
-            "visible_width": preflight.dimensions.width,
-            "visible_height": preflight.dimensions.height,
+            "visible_width": preflight.geometry.declared.width,
+            "visible_height": preflight.geometry.declared.height,
             "cfa": bayer_pattern_label(preflight.bayer),
             "payload_layouts": self.payload_layouts.into_iter().collect::<Vec<_>>(),
             "original_dimensions": self.original_dimensions.into_iter().collect::<Vec<_>>(),
@@ -493,27 +495,64 @@ impl PipeCliRunConfig {
 /// Read only the indexed source facts needed to format a GUI Pipe Example.
 ///
 /// The display-fast container path parses frame zero plus the compact frame
-/// index/timestamps. It does not read payload bytes, hash the complete source,
-/// initialize a GPU, or run the production all-frame context preflight.
+/// index/timestamps. Geometry preparation then reads bounded type-7 headers/counts
+/// in index order. It does not expand payloads, hash the complete source, initialize
+/// a GPU, or run the production all-frame color/correction context preflight.
 pub fn pipe_example_facts_for_input(input_path: &Path) -> Result<PipeExampleFacts> {
-    let container = McrawContainer::open_for_display(input_path)
-        .with_context(|| format!("failed to inspect input {}", input_path.display()))?;
-    pipe_example_facts_from_container(&container)
+    pipe_example_facts_for_input_with_cancel(input_path, || false)
 }
 
-fn pipe_example_facts_from_container(container: &McrawContainer) -> Result<PipeExampleFacts> {
+pub fn pipe_example_facts_for_input_with_cancel(
+    input_path: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<PipeExampleFacts> {
+    let container = McrawContainer::open_for_display(input_path)
+        .with_context(|| format!("failed to inspect input {}", input_path.display()))?;
+    container.prepare_geometry_with_cancel(cancelled)?;
+    let facts = pipe_example_facts_from_container(&container)?;
+    if let Some(message) = container
+        .resolved_frame_geometry(FrameNumber(0))?
+        .recovery_message()
+    {
+        tracing::warn!("{message}");
+    }
+    Ok(facts)
+}
+
+fn validate_pipe_output_dimensions(dimensions: FrameDimensions) -> Result<()> {
+    if dimensions.width == 0
+        || dimensions.height == 0
+        || dimensions.pixel_count().is_none_or(|count| count & 1 != 0)
+    {
+        bail!(
+            "PIPE direct YUV12 requires nonzero dimensions and an even total sample count: {}x{}",
+            dimensions.width,
+            dimensions.height
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn pipe_example_facts_from_container(
+    container: &McrawContainer,
+) -> Result<PipeExampleFacts> {
     let clip = container.clip_info();
+    let dimensions = container.resolved_frame_geometry(FrameNumber(0))?.effective;
+    validate_pipe_output_dimensions(dimensions)?;
     let source_rate = clip.timing.playback_frame_rate.reduced();
     let cadence = PipeMovCadence::from_source_rate(source_rate.numerator, source_rate.denominator)
         .context("failed to derive established bounded PIPE cadence")?;
     let sample_aspect_ratio = PipeAspectRatio::square_pixels();
-    let display_aspect_ratio =
-        PipeAspectRatio::display_for_frame(clip.width, clip.height, sample_aspect_ratio)
-            .context("failed to derive PIPE display aspect ratio")?;
+    let display_aspect_ratio = PipeAspectRatio::display_for_frame(
+        dimensions.width,
+        dimensions.height,
+        sample_aspect_ratio,
+    )
+    .context("failed to derive PIPE display aspect ratio")?;
 
     Ok(PipeExampleFacts {
-        width: clip.width,
-        height: clip.height,
+        width: dimensions.width,
+        height: dimensions.height,
         cadence,
         sample_aspect_ratio,
         display_aspect_ratio,
@@ -534,6 +573,10 @@ pub(crate) fn run_pipe_cli(config: PipeCliRunConfig) -> Result<()> {
     // frame metadata on demand in stream_pipe_frames.
     let container = McrawContainer::open_for_display_with_audio(&config.input_path)
         .with_context(|| format!("failed to open input {}", config.input_path.display()))?;
+    // Package-local movie producer handoff; never a public stride override.
+    if let Ok(evidence) = std::env::var("MCRAW4VULKAN_PREPARED_GEOMETRY") {
+        container.import_prepared_geometry(&evidence)?;
+    }
     let audio_present = container.audio_info().is_some();
     prepare_output_paths(&layout, audio_present)?;
     let selected_frame_count = usize::try_from(container.clip_info().frame_count)
@@ -544,6 +587,9 @@ pub(crate) fn run_pipe_cli(config: PipeCliRunConfig) -> Result<()> {
         &container,
         selected_frame_count,
     )?;
+    if let Some(message) = preflight.geometry.recovery_message() {
+        eprintln!("{message}");
+    }
     let temps = create_temp_paths_for_layout(&layout, audio_present)?;
     let source_hash_worker = PipeSourceHashWorker::spawn(&config.input_path)?;
 
@@ -683,8 +729,15 @@ fn run_pipe_cli_inner(
         source_hash.source_sha256,
     )?;
 
-    let sidecar =
-        pipe_metadata_sidecar_json(config, preflight, &identities, layout, audio_summary, video)?;
+    let sidecar = pipe_metadata_sidecar_json(
+        config,
+        preflight,
+        &identities,
+        layout,
+        audio_summary,
+        video,
+        true,
+    )?;
     validate_pipe_sidecar_v4(&sidecar).context("generated PIPE sidecar v4 failed validation")?;
     write_metadata_sidecar_part(&temps.metadata_part_path, &sidecar)?;
 
@@ -861,7 +914,9 @@ pub(crate) fn preflight_pipe_frames(
     let first_metadata = container
         .frame_metadata(FrameNumber(0))
         .context("failed to read first frame metadata")?;
-    let dimensions = first_metadata.dimensions;
+    let geometry = container.resolved_frame_geometry(FrameNumber(0))?;
+    let dimensions = geometry.effective;
+    validate_pipe_output_dimensions(dimensions)?;
     let first_layout = first_metadata
         .payload_layout()
         .context("PIPE first-frame payload layout failed")?;
@@ -909,6 +964,8 @@ pub(crate) fn preflight_pipe_frames(
     Ok(PipeFramePreflight {
         clip_info,
         dimensions,
+        geometry,
+        analysis_decodes_here: container.geometry_analysis_decodes_here(),
         bayer,
         runtime_source_identity,
         source_file_bytes,
@@ -932,11 +989,11 @@ fn resolve_pipe_frame_context<'a>(
     correction_mode: PipeF32BayerCorrectionMode,
 ) -> Result<PipeResolvedFrameContext<'a>> {
     let index = number.0 as usize;
-    if metadata.dimensions != preflight.dimensions {
+    if metadata.dimensions != preflight.geometry.declared {
         bail!(
             "PIPE frame dimensions changed at logical frame {index}: expected {}x{}, got {}x{}",
-            preflight.dimensions.width,
-            preflight.dimensions.height,
+            preflight.geometry.declared.width,
+            preflight.geometry.declared.height,
             metadata.dimensions.width,
             metadata.dimensions.height,
         );
@@ -953,7 +1010,8 @@ fn resolve_pipe_frame_context<'a>(
         preflight.bayer,
         correction_mode,
     )
-    .with_context(|| format!("PIPE correction validation failed at logical frame {index}"))?;
+    .with_context(|| format!("PIPE correction validation failed at logical frame {index}"))?
+    .with_resolved_geometry(container.resolved_frame_geometry(number)?)?;
     let correction_fingerprint =
         PipeF32BayerCorrectionFingerprint::from_fixed_facts(&correction, correction_mode)
             .with_context(|| format!("PIPE correction identity failed at logical frame {index}"))?;
@@ -1090,6 +1148,11 @@ pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
             );
         }
         let number = payload.frame_number_core()?;
+        container
+            .validate_payload_geometry(number, payload.data.as_slice())
+            .with_context(|| {
+                format!("PIPE payload geometry/coverage validation failed at logical frame {index}")
+            })?;
         let metadata = container
             .frame_metadata(number)
             .with_context(|| format!("PIPE metadata validation failed at logical frame {index}"))?;
@@ -1111,6 +1174,7 @@ pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
                         payload_layout: context.layout,
                     },
                     dimensions: preflight.dimensions,
+                    extraction_dimensions: preflight.geometry.extraction(),
                     correction_facts: &context.correction,
                     correction_mode,
                     verified_color: &context.verified_color,
@@ -1128,18 +1192,21 @@ pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
                 let mut timings = DecodeFrameTimings::default();
                 let (decoded, _) = decoder
                     .decode_loaded_payload_to_decoded_bayer_u16_frame_with_layout(
-                        preflight.dimensions,
+                        preflight.geometry.extraction(),
                         context.layout,
                         &mut timings,
                     )
                     .with_context(|| format!("CPU decoding PIPE logical frame {index}"))?;
-                let decoded_bytes = decoded.into_owned_le_bytes();
+                let decoded_bytes = decoded
+                    .with_resolved_geometry(preflight.geometry)?
+                    .into_owned_le_bytes();
                 scheduler.submit_frame(
                     DirectYuv12FrameInput {
                         feeder: DirectYuv12FrameFeeder::CpuDecodedPackedU16 {
                             decoded_pixel_bytes_le: &decoded_bytes,
                         },
                         dimensions: preflight.dimensions,
+                        extraction_dimensions: preflight.dimensions,
                         correction_facts: &context.correction,
                         correction_mode,
                         verified_color: &context.verified_color,
@@ -1664,6 +1731,9 @@ fn pipe_metadata_json_for_config(config: &PipeCliRunConfig) -> Result<Value> {
 
     let container = McrawContainer::open_for_display_with_audio(&config.input_path)
         .with_context(|| format!("failed to open input {}", config.input_path.display()))?;
+    if let Ok(evidence) = std::env::var("MCRAW4VULKAN_PREPARED_GEOMETRY") {
+        container.import_prepared_geometry(&evidence)?;
+    }
     let selected_frame_count = usize::try_from(container.clip_info().frame_count)
         .context("PIPE frame count does not fit usize")?;
     let preflight = preflight_pipe_frames(
@@ -1672,6 +1742,9 @@ fn pipe_metadata_json_for_config(config: &PipeCliRunConfig) -> Result<Value> {
         &container,
         selected_frame_count,
     )?;
+    if let Some(message) = preflight.geometry.recovery_message() {
+        eprintln!("{message}");
+    }
     let source_hash_worker = PipeSourceHashWorker::spawn(&config.input_path)?;
     let contexts = collect_pipe_frame_contexts_without_decode(
         &container,
@@ -1707,6 +1780,7 @@ fn pipe_metadata_json_for_config(config: &PipeCliRunConfig) -> Result<Value> {
         &layout,
         audio_summary,
         video,
+        false,
     )
 }
 
@@ -1750,6 +1824,7 @@ fn pipe_metadata_sidecar_json(
     layout: &PipeOutputLayout,
     audio_summary: Option<PipeAudioSidecarSummary>,
     video: PipeVideoRunSummary,
+    pixel_decode_validated: bool,
 ) -> Result<Value> {
     if video.bytes_per_frame != preflight.bytes_per_frame
         || video.expected_total_video_bytes != preflight.expected_total_video_bytes
@@ -1788,6 +1863,30 @@ fn pipe_metadata_sidecar_json(
     let root = value
         .as_object_mut()
         .context("PIPE sidecar builder did not return an object")?;
+    root.insert(
+        "resolved_output_geometry".into(),
+        json!({
+            "declared_width": preflight.geometry.declared.width,
+            "declared_height": preflight.geometry.declared.height,
+            "encoded_geometry_scope": "first_logical_frame",
+            "encoded_width": preflight.geometry.encoded.map(|d| d.width),
+            "encoded_height": preflight.geometry.encoded.map(|d| d.height),
+            "effective_width": preflight.dimensions.width,
+            "effective_height": preflight.dimensions.height,
+            "origin": preflight.geometry.origin,
+            "reason": preflight.geometry.reason.map(|_| "IncompleteFinalFourRowGroup"),
+            "codec_extraction_width": preflight.geometry.extraction().width,
+            "codec_extraction_height": preflight.geometry.extraction().height,
+            "scene_pitch": preflight.dimensions.width,
+            "layout_guess": preflight.geometry.layout_guess,
+            "analysis_evidence_bayer_frames": u32::from(preflight.geometry.layout_guess.is_some()),
+            "analysis_provenance": if preflight.analysis_decodes_here > 0 { "this_preparation" }
+                else if preflight.geometry.layout_guess.is_some() { "validated_prepared_handoff" } else { "none" },
+            "preparation": if preflight.geometry.layout_guess.is_some() { "indexed_headers_and_one_frame_layout_analysis" }
+                else { "indexed_headers_only_no_bayer_decode" },
+            "pixel_decode_validated": pixel_decode_validated,
+        }),
+    );
     let source_file_basename = config
         .input_path
         .file_name()
@@ -1826,11 +1925,11 @@ fn pipe_metadata_sidecar_json(
     root.insert("prores_is_lossy".to_string(), json!(true));
     root.insert(
         "dng_is_camera_domain_preservation_output".to_string(),
-        json!(true),
+        json!(!preflight.geometry.layout_guess.is_some_and(|g| g.selected)),
     );
     root.insert(
         "metadata_preflight_decoded_bayer_frames".to_string(),
-        json!(0),
+        json!(preflight.analysis_decodes_here),
     );
     root.insert(
         "source_file_bytes".to_string(),
@@ -1899,13 +1998,27 @@ pub(crate) fn pipe_sidecar_paths(input: &Path, directory: &Path) -> Result<(Path
 pub(crate) fn publish_movie_no_replace(source: &Path, destination: &Path) -> Result<()> {
     publish_temp_no_replace(source, destination).map(|_| ())
 }
+pub(crate) struct PreparedPipeExportFacts {
+    pub facts: crate::PipeExampleFacts,
+    pub frames: u64,
+    pub has_audio: bool,
+    pub recovery_message: Option<String>,
+    pub geometry_handoff: Option<String>,
+}
+
 pub(crate) fn pipe_export_facts_for_input(
     input: &Path,
-) -> Result<(crate::PipeExampleFacts, u64, bool)> {
+    cancelled: impl Fn() -> bool,
+) -> Result<PreparedPipeExportFacts> {
     let container = McrawContainer::open_for_display_with_audio(input)?;
-    Ok((
-        pipe_example_facts_from_container(&container)?,
-        u64::try_from(container.frame_count())?,
-        container.audio_info().is_some(),
-    ))
+    container.prepare_geometry_with_cancel(cancelled)?;
+    Ok(PreparedPipeExportFacts {
+        facts: pipe_example_facts_from_container(&container)?,
+        frames: u64::try_from(container.frame_count())?,
+        has_audio: container.audio_info().is_some(),
+        recovery_message: container
+            .resolved_frame_geometry(FrameNumber(0))?
+            .recovery_message(),
+        geometry_handoff: container.prepared_geometry_handoff()?.map(str::to_owned),
+    })
 }

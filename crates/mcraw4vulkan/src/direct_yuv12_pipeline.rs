@@ -77,6 +77,7 @@ enum PreparedNativeWorkPlan<'a> {
 }
 
 pub struct DirectYuv12FrameInput<'a> {
+    pub extraction_dimensions: FrameDimensions,
     pub feeder: DirectYuv12FrameFeeder<'a>,
     pub dimensions: FrameDimensions,
     pub correction_facts: &'a FixedPointVignetteInputFacts<'a>,
@@ -445,7 +446,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 payload_layout: FramePayloadLayout::CompressedRawcodecType7,
             } => PreparedNativeWorkPlan::Type7(
                 decode_scratch
-                    .prepare_type7(raw_payload, frame.dimensions)
+                    .prepare_type7(raw_payload, frame.extraction_dimensions)
                     .map_err(|error| DirectYuv12PipelineError::Decode(error.to_string()))?,
             ),
             DirectYuv12FrameFeeder::NativePayload {
@@ -453,7 +454,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 payload_layout: FramePayloadLayout::BinnedRaw16Type6 { row_stride },
             } => PreparedNativeWorkPlan::Type6(
                 decode_scratch
-                    .prepare_type6(raw_payload, frame.dimensions, row_stride)
+                    .prepare_type6(raw_payload, frame.extraction_dimensions, row_stride)
                     .map_err(|error| DirectYuv12PipelineError::Decode(error.to_string()))?,
             ),
             DirectYuv12FrameFeeder::CpuDecodedPackedU16 { .. } => PreparedNativeWorkPlan::None,
@@ -467,7 +468,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 .prospective_prepared_type7_no_readback_slot_allocation(
                     SHARED_DECODER_SLOT,
                     raw_payload,
-                    frame.dimensions,
+                    frame.extraction_dimensions,
                     match prepared_work_plan {
                         PreparedNativeWorkPlan::Type7(prepared) => prepared,
                         _ => unreachable!("type-7 feeder has a prepared plan"),
@@ -481,7 +482,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 .prospective_prepared_type6_no_readback_slot_allocation(
                     SHARED_DECODER_SLOT,
                     raw_payload,
-                    frame.dimensions,
+                    frame.extraction_dimensions,
                     row_stride,
                     match prepared_work_plan {
                         PreparedNativeWorkPlan::Type6(prepared) => prepared,
@@ -619,7 +620,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 .submit_prepared_raw_payload_packed_u16_gpu_stage_no_readback_slot_with_vignette(
                     SHARED_DECODER_SLOT,
                     raw_payload,
-                    frame.dimensions,
+                    frame.extraction_dimensions,
                     match prepared_work_plan {
                         PreparedNativeWorkPlan::Type7(prepared) => prepared,
                         _ => unreachable!("type-7 feeder has a prepared plan"),
@@ -635,7 +636,7 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
                 .submit_prepared_legacy_raw16_payload_packed_u16_gpu_stage_no_readback_slot_with_vignette(
                     SHARED_DECODER_SLOT,
                     raw_payload,
-                    frame.dimensions,
+                    frame.extraction_dimensions,
                     row_stride,
                     match prepared_work_plan {
                         PreparedNativeWorkPlan::Type6(prepared) => prepared,
@@ -784,9 +785,14 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
         frame: &DirectYuv12FrameInput<'_>,
     ) -> Result<(), DirectYuv12PipelineError> {
         let color_facts = frame.verified_color.fingerprint_facts();
-        if frame.dimensions.width == 0
+        if frame.extraction_dimensions.width < frame.dimensions.width
+            || frame.extraction_dimensions.height != frame.dimensions.height
+            || frame.dimensions.width == 0
             || frame.dimensions.height == 0
-            || frame.dimensions.width & 1 != 0
+            || frame
+                .dimensions
+                .pixel_count()
+                .is_none_or(|count| count & 1 != 0)
             || frame.correction_facts.frame_dimensions != frame.dimensions
             || frame.verified_color.resolved().source_frame_index() != frame.source_frame_index
             || frame.verified_color.resolved().provenance().source_sha256()
@@ -1597,7 +1603,7 @@ impl fmt::Display for DirectYuv12PipelineError {
                 resolved_frame_index,
             } => write!(
                 formatter,
-                "direct YUV12 frame context mismatch: frame={}x{} correction={}x{} source_index={} resolved_index={} (positive even visible width required)",
+                "direct YUV12 frame context mismatch: frame={}x{} correction={}x{} source_index={} resolved_index={} (positive dimensions and even total sample count required)",
                 dimensions.width,
                 dimensions.height,
                 correction_dimensions.width,

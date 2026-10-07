@@ -25,10 +25,10 @@ struct Params {
     scale_shift: u32,
     strength_num: u32,
     strength_shift: u32,
-    _padding3: u32,
-    _padding4: u32,
-    _padding5: u32,
-    _padding6: u32,
+    normalization_width: u32,
+    normalization_height: u32,
+    origin_x: u32,
+    origin_y: u32,
     _padding7: u32,
     _padding8: u32,
     _padding9: u32,
@@ -352,8 +352,8 @@ fn compact_gain_q_for_pixel(pixel_index: u32) -> U64Parts {
 
     let x = pixel_index % params.frame_width;
     let y = pixel_index / params.frame_width;
-    let xp = fixed_axis_position(x, params.frame_width, params.source_map_width);
-    let yp = fixed_axis_position(y, params.frame_height, params.source_map_height);
+    let xp = fixed_axis_position(x + params.origin_x, params.normalization_width, params.source_map_width);
+    let yp = fixed_axis_position(y + params.origin_y, params.normalization_height, params.source_map_height);
     let plane = compact_plane_index(pixel_index);
     let plane_len = params.source_map_width * params.source_map_height;
     let plane_base = plane * plane_len;

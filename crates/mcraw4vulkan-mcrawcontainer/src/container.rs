@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mcraw4vulkan_core::frame_index::{AudioChunkEntry, FrameEntry};
@@ -25,6 +25,11 @@ pub struct McrawContainer {
     container_metadata: ContainerMetadata,
     frame_metadata: Vec<OnceLock<FrameMetadata>>,
     index: ClipIndex,
+    resolved_geometry: OnceLock<Vec<mcraw4vulkan_core::ResolvedFrameGeometry>>,
+    geometry_preparation: Mutex<()>,
+    geometry_handoff: OnceLock<String>,
+    geometry_source_stamp: OnceLock<String>,
+    geometry_analysis_performed: OnceLock<bool>,
     video_frame_rate_info: VideoFrameRateInfo,
     audio_sync_info: Option<AudioSyncInfo>,
 }
@@ -48,6 +53,304 @@ pub struct McrawContainerOpenTimings {
 }
 
 impl McrawContainer {
+    /// Freeze a single output contract in index order before a sink advertises it.
+    /// Only successful preparation is cached; cancellation can be retried.
+    pub fn prepare_geometry_with_cancel(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<&[mcraw4vulkan_core::ResolvedFrameGeometry], McrawContainerError> {
+        self.prepare_geometry_inner(cancelled, None)
+    }
+
+    /// Internal operation handoff; revalidates source, index, headers and analysis payload.
+    /// A successful import performs no pixel analysis and cannot override normal geometry.
+    pub fn import_prepared_geometry(&self, evidence: &str) -> Result<(), McrawContainerError> {
+        if evidence.len() > 8192 || self.resolved_geometry.get().is_some() {
+            return Err(McrawContainerError::InvalidMetadata(
+                "invalid or late geometry handoff".into(),
+            ));
+        }
+        self.prepare_geometry_inner(|| false, Some(evidence))
+            .map(|_| ())
+    }
+
+    pub fn prepared_geometry_handoff(&self) -> Result<Option<&str>, McrawContainerError> {
+        self.resolved_clip_geometry()?;
+        Ok(self.geometry_handoff.get().map(String::as_str))
+    }
+
+    pub fn geometry_analysis_decodes_here(&self) -> u32 {
+        u32::from(
+            self.geometry_analysis_performed
+                .get()
+                .copied()
+                .unwrap_or(false),
+        )
+    }
+
+    fn prepare_geometry_inner(
+        &self,
+        cancelled: impl Fn() -> bool,
+        incoming: Option<&str>,
+    ) -> Result<&[mcraw4vulkan_core::ResolvedFrameGeometry], McrawContainerError> {
+        if cancelled() {
+            return Err(McrawContainerError::PreparationCancelled);
+        }
+        if let Some(value) = self.resolved_geometry.get() {
+            return Ok(value);
+        }
+        let _guard = self.geometry_preparation.lock().map_err(|_| {
+            McrawContainerError::InvalidMetadata("geometry preparation lock poisoned".into())
+        })?;
+        if let Some(value) = self.resolved_geometry.get() {
+            return Ok(value);
+        }
+        let mut resolved: Vec<mcraw4vulkan_core::ResolvedFrameGeometry> =
+            Vec::with_capacity(self.frame_count());
+        for index in 0..self.frame_count() {
+            if cancelled() {
+                return Err(McrawContainerError::PreparationCancelled);
+            }
+            let projected;
+            let metadata = if let Some(cached) = self.frame_metadata[index].get() {
+                cached
+            } else {
+                let json = self.parsed_clip.read_frame_metadata_json(index)?;
+                let (mut projection, understood_origin) = FrameMetadata::parse_geometry(&json)?;
+                projection.origin_zero_mapping = understood_origin;
+                projected = projection;
+                &projected
+            };
+            let layout = metadata
+                .payload_layout()
+                .map_err(|e| McrawContainerError::UnsupportedFormat(e.to_string()))?;
+            let evidence = match layout {
+                mcraw4vulkan_core::FramePayloadLayout::CompressedRawcodecType7 => Some(
+                    self.parsed_clip
+                        .read_type7_geometry(index, metadata.dimensions)?,
+                ),
+                mcraw4vulkan_core::FramePayloadLayout::BinnedRaw16Type6 { .. } => None,
+            };
+            let geometry = metadata
+                .resolve_output_geometry(
+                    evidence,
+                    metadata.origin_zero_mapping
+                        && self
+                            .container_metadata
+                            .sensor_arrangement
+                            .bayer_pattern()
+                            .is_some(),
+                )
+                .map_err(|e| McrawContainerError::InvalidMetadata(format!("frame {index}: {e}")))?;
+            if let Some(first) = resolved.first() {
+                if first.declared != geometry.declared
+                    || first.effective != geometry.effective
+                    || first.origin != geometry.origin
+                {
+                    return Err(McrawContainerError::InvalidMetadata(format!(
+                        "frame {index} geometry differs from the fixed clip output contract"
+                    )));
+                }
+            }
+            resolved.push(geometry);
+        }
+        if cancelled() {
+            return Err(McrawContainerError::PreparationCancelled);
+        }
+        let mut handoff = None;
+        let mut source_stamp = None;
+        let mut performed = false;
+        if let Some(first) = resolved.first().copied().filter(|g| g.reason.is_some()) {
+            let mut payload = Vec::new();
+            self.read_video_payload_into(FrameNumber(0), &mut payload)?;
+            mcraw4vulkan_cpu::raw_decoder::validate_resolved_payload(&payload, first)
+                .map_err(|e| McrawContainerError::InvalidPayloadSpan(e.to_string()))?;
+            if cancelled() {
+                return Err(McrawContainerError::PreparationCancelled);
+            }
+            let stamp = self.parsed_clip.geometry_source_stamp()?;
+            let identity = mcraw4vulkan_core::geometry_evidence_identity(
+                format!(
+                    "policy1|{stamp}|{:?}|{:?}|{}|{:032x}",
+                    self.index.frames,
+                    resolved,
+                    self.parsed_clip.container_metadata_json,
+                    mcraw4vulkan_core::geometry_evidence_identity(&payload)
+                )
+                .as_bytes(),
+            );
+            let binding = format!("{identity:032x}");
+            let guess = if let Some(incoming) = incoming {
+                let value: serde_json::Value = serde_json::from_str(incoming)
+                    .map_err(|e| McrawContainerError::InvalidMetadata(e.to_string()))?;
+                if value["binding"].as_str() != Some(binding.as_str()) {
+                    return Err(McrawContainerError::InvalidMetadata(
+                        "prepared geometry source evidence changed".into(),
+                    ));
+                }
+                let seal = format!(
+                    "{:032x}",
+                    mcraw4vulkan_core::geometry_evidence_identity(
+                        format!("{binding}|{}", value["guess"]).as_bytes()
+                    )
+                );
+                if value["seal"].as_str() != Some(seal.as_str()) {
+                    return Err(McrawContainerError::InvalidMetadata(
+                        "prepared decision integrity mismatch".into(),
+                    ));
+                }
+                serde_json::from_value::<mcraw4vulkan_core::GeometryLayoutGuess>(
+                    value["guess"].clone(),
+                )
+                .map_err(|e| McrawContainerError::InvalidMetadata(e.to_string()))?
+            } else {
+                let encoded = first
+                    .encoded
+                    .expect("type-7 recovery has encoded dimensions");
+                let count = encoded
+                    .pixel_count()
+                    .filter(|count| *count <= 100_000_000)
+                    .ok_or_else(|| {
+                        McrawContainerError::InvalidPayloadSpan(
+                            "analysis raster exceeds sample limit".into(),
+                        )
+                    })?;
+                let mut pixels = vec![0u16; count];
+                mcraw4vulkan_cpu::raw_decoder::decode_raw_payload_into(
+                    &payload,
+                    encoded,
+                    &mut pixels,
+                )
+                .map_err(|e| McrawContainerError::InvalidPayloadSpan(e.to_string()))?;
+                if cancelled() {
+                    return Err(McrawContainerError::PreparationCancelled);
+                }
+                let json = self.parsed_clip.read_frame_metadata_json(0)?;
+                let (metadata, _) = FrameMetadata::parse_geometry(&json)?;
+                let black = metadata
+                    .dynamic_black_level
+                    .or(self.container_metadata.black_level.map(|b| b.values));
+                let white = metadata
+                    .dynamic_white_level
+                    .or(self.container_metadata.white_level.map(|w| w.values[0]));
+                let valid = black.zip(white).filter(|(b, w)| {
+                    w.is_finite()
+                        && *w > 0.0
+                        && *w <= 65535.0
+                        && b.iter().all(|v| v.is_finite() && *v >= 0.0 && *v < *w)
+                });
+                // Missing levels yield no informative sites and the safe baseline.
+                let (black, white) =
+                    valid.map_or(([0u16; 4], 0), |(b, w)| (b.map(|v| v as u16), w as u16));
+                let analysis = crate::frame_metadata::guess_layout(&pixels, first, black, white)?;
+                if cancelled() {
+                    return Err(McrawContainerError::PreparationCancelled);
+                }
+                debug_assert_eq!(analysis.effective.width, analysis.guess.scene_pitch);
+                performed = true;
+                analysis.guess
+            };
+            let effective = mcraw4vulkan_core::FrameDimensions {
+                width: guess.scene_pitch,
+                height: first.effective.height,
+            };
+            let check = mcraw4vulkan_core::ResolvedFrameGeometry {
+                effective,
+                layout_guess: Some(guess),
+                ..first
+            };
+            if guess.extraction != first.effective
+                || check.output_sample_count().is_none()
+                || (guess.selected
+                    && (guess.scene_pitch >= guess.extraction.width || guess.scene_pitch < 8))
+            {
+                return Err(McrawContainerError::InvalidMetadata(
+                    "invalid prepared layout mapping".into(),
+                ));
+            }
+            if self.parsed_clip.geometry_source_stamp()? != stamp {
+                return Err(McrawContainerError::InvalidMetadata(
+                    "source changed during geometry analysis".into(),
+                ));
+            }
+            for geometry in &mut resolved {
+                geometry.layout_guess = Some(guess);
+                geometry.effective = effective;
+            }
+            let value = serde_json::json!(guess);
+            let seal = format!(
+                "{:032x}",
+                mcraw4vulkan_core::geometry_evidence_identity(
+                    format!("{binding}|{value}").as_bytes()
+                )
+            );
+            handoff =
+                Some(serde_json::json!({"binding":binding,"guess":value,"seal":seal}).to_string());
+            source_stamp = Some(stamp);
+        } else if incoming.is_some() {
+            return Err(McrawContainerError::InvalidMetadata(
+                "geometry handoff for normal source".into(),
+            ));
+        }
+        if cancelled() {
+            return Err(McrawContainerError::PreparationCancelled);
+        }
+        if let Some(value) = source_stamp {
+            let _ = self.geometry_source_stamp.set(value);
+        }
+        if let Some(value) = handoff {
+            let _ = self.geometry_handoff.set(value);
+        }
+        let _ = self.geometry_analysis_performed.set(performed);
+        self.resolved_geometry.set(resolved).map_err(|_| {
+            McrawContainerError::InvalidMetadata("geometry initialized twice".into())
+        })?;
+        Ok(self
+            .resolved_geometry
+            .get()
+            .expect("geometry just initialized"))
+    }
+
+    pub fn resolved_clip_geometry(
+        &self,
+    ) -> Result<&[mcraw4vulkan_core::ResolvedFrameGeometry], McrawContainerError> {
+        self.prepare_geometry_with_cancel(|| false)
+    }
+
+    pub fn resolved_frame_geometry(
+        &self,
+        frame: FrameNumber,
+    ) -> Result<mcraw4vulkan_core::ResolvedFrameGeometry, McrawContainerError> {
+        self.resolved_clip_geometry()?
+            .get(frame.0 as usize)
+            .copied()
+            .ok_or(McrawContainerError::FrameOutOfRange(frame.0))
+    }
+
+    fn validate_source_unchanged(&self) -> Result<(), McrawContainerError> {
+        if let Some(stamp) = self.geometry_source_stamp.get() {
+            if &self.parsed_clip.geometry_source_stamp()? != stamp {
+                return Err(McrawContainerError::InvalidMetadata(
+                    "source changed after layout preparation".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_payload_geometry(
+        &self,
+        frame: FrameNumber,
+        payload: &[u8],
+    ) -> Result<(), McrawContainerError> {
+        self.validate_source_unchanged()?;
+        mcraw4vulkan_cpu::raw_decoder::validate_resolved_payload(
+            payload,
+            self.resolved_frame_geometry(frame)?,
+        )
+        .map_err(|e| McrawContainerError::InvalidPayloadSpan(format!("frame {}: {e}", frame.0)))
+    }
+
     pub fn open(path: &Path) -> Result<Self, McrawContainerError> {
         Self::open_inner(path, McrawContainerOpenMode::Full, None)
     }
@@ -234,6 +537,11 @@ impl McrawContainer {
             container_metadata,
             frame_metadata: prepared_frames.frame_metadata,
             index,
+            resolved_geometry: OnceLock::new(),
+            geometry_preparation: Mutex::new(()),
+            geometry_handoff: OnceLock::new(),
+            geometry_source_stamp: OnceLock::new(),
+            geometry_analysis_performed: OnceLock::new(),
             video_frame_rate_info,
             audio_sync_info,
         });
@@ -285,11 +593,31 @@ impl McrawContainer {
     ) -> Result<&FrameMetadata, McrawContainerError> {
         let frame_index = frame_number.0 as usize;
         self.frame_entry(frame_number)?;
-        self.frame_metadata
+        let metadata = self
+            .frame_metadata
             .get(frame_index)
             .ok_or(McrawContainerError::FrameOutOfRange(frame_number.0))?
             .get()
-            .map_or_else(|| self.parse_and_cache_frame_metadata(frame_index), Ok)
+            .map_or_else(|| self.parse_and_cache_frame_metadata(frame_index), Ok)?;
+        if let Some(geometry) = self
+            .resolved_geometry
+            .get()
+            .and_then(|g| g.get(frame_index))
+        {
+            let layout = metadata
+                .payload_layout()
+                .map_err(|e| McrawContainerError::UnsupportedFormat(e.to_string()))?;
+            if metadata.dimensions != geometry.declared
+                || layout.uses_compressed_rawcodec_work_plan() != geometry.type7.is_some()
+                || (geometry.reason.is_some()
+                    && (!metadata.origin_zero_mapping || metadata.need_remosaic != Some(false)))
+            {
+                return Err(McrawContainerError::InvalidMetadata(format!(
+                    "frame {frame_index} metadata changed after geometry preparation"
+                )));
+            }
+        }
+        Ok(metadata)
     }
 
     pub fn frame_metadata_json(
@@ -328,6 +656,7 @@ impl McrawContainer {
         frame_number: FrameNumber,
         output: &mut Vec<u8>,
     ) -> Result<(), McrawContainerError> {
+        self.validate_source_unchanged()?;
         self.frame_entry(frame_number)?;
         self.parsed_clip
             .read_frame_payload_into(frame_number.0 as usize, output)

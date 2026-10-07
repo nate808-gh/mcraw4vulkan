@@ -987,6 +987,15 @@ impl DngFrameByteCacheInner {
         let bytes: Arc<[u8]> = Arc::from(generated.bytes.into_boxed_slice());
         let byte_len = u64::try_from(bytes.len()).context("DNG byte length does not fit u64")?;
 
+        let expected_len = self
+            .byte_len_calculator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DNG byte-length calculator mutex was poisoned"))?
+            .frame_byte_len(frame_index)?;
+        anyhow::ensure!(
+            byte_len == expected_len,
+            "generated DNG length differs from published virtual length"
+        );
         let cached = Arc::new(CachedDngFrame {
             frame_index,
             bytes,
@@ -1134,7 +1143,19 @@ impl DngFrameByteCacheInner {
         let should_construct = guard.is_none();
         if should_construct {
             initialize_mount_lifetime_resource(guard, || {
-                DngFrameGenerator::open_with_config(&self.source_path, self.generation_config)
+                let calculator = self.byte_len_calculator.lock().map_err(|_| {
+                    anyhow::anyhow!("DNG byte-length calculator mutex was poisoned")
+                })?;
+                let generator = DngFrameGenerator::open_with_prepared_geometry(
+                    &self.source_path,
+                    self.generation_config,
+                    calculator.geometry_handoff()?,
+                )?;
+                anyhow::ensure!(
+                    generator.resolved_geometry()? == calculator.resolved_geometry()?,
+                    "DNG source geometry changed after virtual lengths were prepared"
+                );
+                Ok(generator)
             })?;
             self.instrumentation
                 .generator_created

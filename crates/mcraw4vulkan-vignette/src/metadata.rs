@@ -75,6 +75,9 @@ pub fn motioncam_pipe_f32_bayer_facts<'a>(
 
 #[derive(Debug, Clone, Copy)]
 pub struct VignetteCorrectionInputFacts<'a> {
+    pub normalization_dimensions: FrameDimensions,
+    pub source_origin: [u32; 2],
+    pub layout_identity: [u32; 4],
     pub mode: VignetteCorrectionMode,
     pub correction_policy: VignetteCorrectionPolicy,
     pub coordinate_mapping: VignetteCoordinateMapping,
@@ -99,6 +102,49 @@ pub struct VignetteCorrectionInputConfig<'a> {
 }
 
 impl<'a> VignetteCorrectionInputFacts<'a> {
+    pub(crate) fn validate_coordinates(&self) -> Result<(), VignetteCorrectionError> {
+        if self.source_origin != [0, 0]
+            || self.frame_dimensions.width == 0
+            || self.frame_dimensions.height == 0
+            || self.normalization_dimensions.width < self.frame_dimensions.width
+            || self.normalization_dimensions.height < self.frame_dimensions.height
+        {
+            return Err(VignetteCorrectionError::InvalidFrameDimensions {
+                dimensions: self.frame_dimensions,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn with_resolved_geometry(
+        mut self,
+        geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
+    ) -> Result<Self, VignetteCorrectionError> {
+        if self.frame_dimensions != geometry.declared
+            || geometry.origin != [0, 0]
+            || geometry.effective.width == 0
+            || geometry.effective.height == 0
+            || geometry.effective.width > geometry.declared.width
+            || geometry.effective.height > geometry.declared.height
+        {
+            return Err(VignetteCorrectionError::InvalidFrameDimensions {
+                dimensions: geometry.effective,
+            });
+        }
+        self.normalization_dimensions = geometry.declared;
+        self.frame_dimensions = geometry.effective;
+        self.source_origin = geometry.origin;
+        self.layout_identity = geometry.layout_guess.map_or([0; 4], |g| {
+            [
+                g.policy_version,
+                g.extraction.width,
+                g.extraction.height,
+                g.scene_pitch,
+            ]
+        });
+        Ok(self)
+    }
+
     pub fn new(
         mode: VignetteCorrectionMode,
         coordinate_mapping: VignetteCoordinateMapping,
@@ -140,6 +186,9 @@ impl<'a> VignetteCorrectionInputFacts<'a> {
             VignettePixelDomainFacts::from_source_levels(input_black_level, output_white_level);
 
         Ok(Self {
+            normalization_dimensions: frame_dimensions,
+            source_origin: [0, 0],
+            layout_identity: [0; 4],
             mode,
             correction_policy,
             coordinate_mapping,
@@ -181,6 +230,9 @@ impl<'a> VignetteCorrectionInputFacts<'a> {
 // rounding inputs for CPU and GPU correction.
 #[derive(Debug, Clone)]
 pub struct FixedPointVignetteInputFacts<'a> {
+    pub normalization_dimensions: FrameDimensions,
+    pub source_origin: [u32; 2],
+    pub layout_identity: [u32; 4],
     pub mode: VignetteCorrectionMode,
     pub correction_policy: VignetteCorrectionPolicy,
     pub coordinate_mapping: VignetteCoordinateMapping,
@@ -194,6 +246,49 @@ pub struct FixedPointVignetteInputFacts<'a> {
 }
 
 impl<'a> FixedPointVignetteInputFacts<'a> {
+    pub(crate) fn validate_coordinates(&self) -> Result<(), VignetteCorrectionError> {
+        if self.source_origin != [0, 0]
+            || self.frame_dimensions.width == 0
+            || self.frame_dimensions.height == 0
+            || self.normalization_dimensions.width < self.frame_dimensions.width
+            || self.normalization_dimensions.height < self.frame_dimensions.height
+        {
+            return Err(VignetteCorrectionError::InvalidFrameDimensions {
+                dimensions: self.frame_dimensions,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn with_resolved_geometry(
+        mut self,
+        geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
+    ) -> Result<Self, VignetteCorrectionError> {
+        if self.frame_dimensions != geometry.declared
+            || geometry.origin != [0, 0]
+            || geometry.effective.width == 0
+            || geometry.effective.height == 0
+            || geometry.effective.width > geometry.declared.width
+            || geometry.effective.height > geometry.declared.height
+        {
+            return Err(VignetteCorrectionError::InvalidFrameDimensions {
+                dimensions: geometry.effective,
+            });
+        }
+        self.normalization_dimensions = geometry.declared;
+        self.frame_dimensions = geometry.effective;
+        self.source_origin = geometry.origin;
+        self.layout_identity = geometry.layout_guess.map_or([0; 4], |g| {
+            [
+                g.policy_version,
+                g.extraction.width,
+                g.extraction.height,
+                g.scene_pitch,
+            ]
+        });
+        Ok(self)
+    }
+
     pub fn from_input_facts(
         facts: &VignetteCorrectionInputFacts<'a>,
     ) -> Result<Self, VignetteCorrectionError> {
@@ -221,6 +316,9 @@ impl<'a> FixedPointVignetteInputFacts<'a> {
         }
 
         Ok(Self {
+            normalization_dimensions: facts.normalization_dimensions,
+            source_origin: facts.source_origin,
+            layout_identity: facts.layout_identity,
             mode: facts.mode,
             correction_policy: facts.correction_policy,
             coordinate_mapping: facts.coordinate_mapping,

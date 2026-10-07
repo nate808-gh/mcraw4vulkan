@@ -180,6 +180,8 @@ pub struct GpuVignetteGainMapUploadTimings {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuVignetteCorrectionParams {
+    pub normalization_dimensions: FrameDimensions,
+    pub source_origin: [u32; 2],
     pub mode: VignetteCorrectionMode,
     pub frame_dimensions: FrameDimensions,
     pub bayer_pattern_tag: u32,
@@ -500,6 +502,7 @@ impl GpuVignetteCorrector {
             uploaded: GpuUploadedFullResolutionGainMap {
                 buffer: spatial.buffer.clone(),
                 frame_dimensions: facts.frame_dimensions,
+
                 pixel_count,
                 memory_bytes: spatial.memory_bytes,
                 fractional_bits: crate::VIGNETTE_GAIN_FRACTIONAL_BITS,
@@ -979,6 +982,7 @@ impl GpuVignetteCorrectionParams {
     pub fn from_fixed_facts(
         facts: &FixedPointVignetteInputFacts<'_>,
     ) -> Result<Self, VignetteCorrectionError> {
+        facts.validate_coordinates()?;
         let prepared_map = facts
             .lens_shading_map
             .as_ref()
@@ -1056,6 +1060,8 @@ impl GpuVignetteCorrectionParams {
         Ok(Self {
             mode: facts.mode,
             frame_dimensions: facts.frame_dimensions,
+            normalization_dimensions: facts.normalization_dimensions,
+            source_origin: facts.source_origin,
             bayer_pattern_tag: bayer_pattern_tag(facts.bayer_pattern),
             source_map_width,
             source_map_height,
@@ -1161,10 +1167,10 @@ impl GpuVignetteCorrectionParams {
             self.scale_shift,
             self.strength_num,
             self.strength_shift,
-            0,
-            0,
-            0,
-            0,
+            self.normalization_dimensions.width,
+            self.normalization_dimensions.height,
+            self.source_origin[0],
+            self.source_origin[1],
             0,
             0,
             0,

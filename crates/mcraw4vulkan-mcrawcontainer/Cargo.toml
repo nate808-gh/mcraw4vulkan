@@ -17,3 +17,4 @@ workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 mcraw4vulkan-core = { path = "../mcraw4vulkan-core" }
+mcraw4vulkan-cpu = { path = "../mcraw4vulkan-cpu" }

@@ -222,6 +222,12 @@ impl ExportResult {
         self.snapshot.rows[row].reason = reason;
     }
     fn record_result(&mut self, row: usize, outcome: Outcome, reason: String) -> String {
+        let prior = &self.snapshot.rows[row];
+        let reason = if prior.outcome.is_none() && !prior.reason.is_empty() {
+            format!("{}\n{reason}", prior.reason)
+        } else {
+            reason
+        };
         match outcome {
             Outcome::Succeeded => self.snapshot.succeeded += 1,
             Outcome::Failed => self.snapshot.failed += 1,
@@ -345,6 +351,7 @@ fn discover(inputs: ExportInputs, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
 
 #[derive(Debug)]
 struct Job {
+    geometry_handoff: Option<String>,
     row: usize,
     source: PathBuf,
     facts: PipeExampleFacts,
@@ -408,9 +415,21 @@ fn plan(
             );
             let movie = dest.join(format!("{stem}{PIPE_PRORES_FILE_SUFFIX}"));
             let json = dest.join(format!("{stem}{PIPE_PRORES_SIDECAR_SUFFIX}"));
-            let (facts, frames, has_audio) = crate::pipe_cli::pipe_export_facts_for_input(&source)?;
+            let crate::pipe_cli::PreparedPipeExportFacts {
+                facts,
+                frames,
+                has_audio,
+                recovery_message,
+                geometry_handoff,
+            } = crate::pipe_cli::pipe_export_facts_for_input(&source, || {
+                cancel.load(Ordering::Relaxed)
+            })?;
+            // Retain this one preparation warning in the existing job status/report.
+            // Producer stderr remains owned by its normal drain; no second GUI alert.
+            result.snapshot.rows[row].reason = recovery_message.unwrap_or_default();
             *names.entry(stem.to_uppercase()).or_default() += 1;
             Ok(Some(Job {
+                geometry_handoff,
                 row,
                 source: source.clone(),
                 facts,
@@ -1160,6 +1179,10 @@ impl VideoSlot {
             let (reader, writer) = std::io::pipe().context("could not create video pipe")?;
             let mut command = Command::new(&config.producer);
             configure_process(&mut command);
+            command.env_remove("MCRAW4VULKAN_PREPARED_GEOMETRY");
+            if let Some(evidence) = &slot.files.job.geometry_handoff {
+                command.env("MCRAW4VULKAN_PREPARED_GEOMETRY", evidence);
+            }
             command
                 .args(producer_args(&slot.files.job.source, config.options))
                 .current_dir(&slot.files.directory)

@@ -185,6 +185,10 @@ impl UploadedGainMapCache {
 }
 
 impl DngFrameGenerator {
+    pub(crate) fn resolved_geometry(&self) -> Result<&[mcraw4vulkan_core::ResolvedFrameGeometry]> {
+        Ok(self.container.resolved_clip_geometry()?)
+    }
+
     // Open one clip and create a DNG generator using the requested backend.
     pub fn open(path: &Path, backend: DngGenerationBackend) -> Result<Self> {
         Self::open_with_config(
@@ -198,10 +202,21 @@ impl DngFrameGenerator {
     }
 
     pub fn open_with_config(path: &Path, config: DngGenerationConfig) -> Result<Self> {
+        Self::open_with_prepared_geometry(path, config, None)
+    }
+
+    pub(crate) fn open_with_prepared_geometry(
+        path: &Path,
+        config: DngGenerationConfig,
+        handoff: Option<&str>,
+    ) -> Result<Self> {
         let container = McrawContainer::open(path).with_context(|| {
             format!("failed to open clip for DNG generation: {}", path.display())
         })?;
 
+        if let Some(evidence) = handoff {
+            container.import_prepared_geometry(evidence)?;
+        }
         validate_first_raw_payload(&container)
             .context("failed to validate first raw payload for DNG generation")?;
 
@@ -393,6 +408,14 @@ impl DngFrameGenerator {
 }
 
 impl DngFrameByteLenCalculator {
+    pub(crate) fn geometry_handoff(&self) -> Result<Option<&str>> {
+        Ok(self.container.prepared_geometry_handoff()?)
+    }
+
+    pub(crate) fn resolved_geometry(&self) -> Result<&[mcraw4vulkan_core::ResolvedFrameGeometry]> {
+        Ok(self.container.resolved_clip_geometry()?)
+    }
+
     pub fn open_with_config(path: &Path, config: DngGenerationConfig) -> Result<Self> {
         let container = McrawContainer::open(path).with_context(|| {
             format!(
@@ -404,6 +427,12 @@ impl DngFrameByteLenCalculator {
         validate_first_raw_payload(&container)
             .context("failed to validate first raw payload for DNG metadata sizing")?;
 
+        if let Some(message) = container
+            .resolved_frame_geometry(FrameNumber(0))?
+            .recovery_message()
+        {
+            tracing::warn!("{message}");
+        }
         let frame_rate = source_video_frame_rate(&container);
 
         Ok(Self {
@@ -520,7 +549,7 @@ fn generate_frames_gpu_canonical_dng_in_flight(
                     let frame_index = frame_indices[input_index];
                     let (prepared_frame, raw_payload) =
                         prepare_gpu_canonical_dng_frame(container, frame_index, vignette_mode)?;
-                    let dimensions = prepared_frame.dng_description.dimensions;
+                    let dimensions = prepared_frame.dng_description.extraction_dimensions();
                     prepared
                         .borrow_mut()
                         .insert(prepared_frame.frame_index, prepared_frame);
@@ -557,7 +586,7 @@ fn generate_frames_gpu_canonical_dng_in_flight(
                         container.container_metadata(),
                         frame_metadata,
                         VignetteCorrectionMode::Enabled,
-                    )
+                    )?.with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)
                     .with_context(|| {
                         format!(
                             "failed to build in-flight LumaPlane0 vignette facts for frame {frame_index}"
@@ -577,7 +606,7 @@ fn generate_frames_gpu_canonical_dng_in_flight(
                     .clone();
                     let params = GpuVignetteCorrectionParams::from_fixed_facts(&facts)
                         .context("failed to build in-flight GPU LumaPlane0 parameters")?;
-                    let dimensions = prepared_frame.dng_description.dimensions;
+                    let dimensions = prepared_frame.dng_description.extraction_dimensions();
                     prepared
                         .borrow_mut()
                         .insert(prepared_frame.frame_index, prepared_frame);
@@ -771,7 +800,12 @@ fn generate_frame_cpu(
     let frame_number = frame_number_from_index(frame_index)?;
     let (entry_byte_len, entry_dimensions) = {
         let entry = container.frame_entry(frame_number)?;
-        (entry.byte_len, entry.dimensions)
+        (
+            entry.byte_len,
+            container
+                .resolved_frame_geometry(frame_number)?
+                .extraction(),
+        )
     };
 
     let description_start = Instant::now();
@@ -785,6 +819,10 @@ fn generate_frame_cpu(
     container
         .read_video_payload_into(frame_number, cpu_frame_decoder.compressed_mut())
         .with_context(|| format!("failed to read raw payload for frame {frame_index}"))?;
+    mcraw4vulkan_cpu::raw_decoder::validate_resolved_payload(
+        cpu_frame_decoder.compressed_mut(),
+        container.resolved_frame_geometry(frame_number)?,
+    )?;
     let payload_read_time = payload_start.elapsed();
 
     let decode_start = Instant::now();
@@ -798,6 +836,8 @@ fn generate_frame_cpu(
             &mut decode_timings,
         )
         .with_context(|| format!("failed to CPU-decode frame {frame_index}"))?;
+    let decoded_bayer_frame = decoded_bayer_frame
+        .with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)?;
 
     let (sink_frame, gpu_timings) = match vignette_mode {
         DngSinkVignetteMode::None => {
@@ -825,7 +865,8 @@ fn generate_frame_cpu(
                 container.container_metadata(),
                 frame_metadata,
                 VignetteCorrectionMode::Enabled,
-            )
+            )?
+            .with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)
             .with_context(|| {
                 format!("failed to build LumaPlane0 vignette facts for frame {frame_index}")
             })?;
@@ -959,7 +1000,7 @@ fn generate_frame_gpu_canonical_dng(
                     .backend
                     .decode_raw_payload_to_canonical_bayer_u16_mapped(
                         raw_payload_scratch,
-                        dng_description.dimensions,
+                        dng_description.extraction_dimensions(),
                         |mapped_pixel_bytes| {
                             let frame = mapped_prefix_to_owned_frame(
                                 mapped_pixel_bytes,
@@ -985,7 +1026,7 @@ fn generate_frame_gpu_canonical_dng(
                     .backend
                     .decode_legacy_raw16_payload_to_canonical_bayer_u16_mapped(
                         raw_payload_scratch,
-                        dng_description.dimensions,
+                        dng_description.extraction_dimensions(),
                         row_stride,
                         |mapped_pixel_bytes| {
                             let frame = mapped_prefix_to_owned_frame(
@@ -1019,7 +1060,8 @@ fn generate_frame_gpu_canonical_dng(
                 container.container_metadata(),
                 frame_metadata,
                 VignetteCorrectionMode::Enabled,
-            )
+            )?
+            .with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)
             .with_context(|| {
                 format!("failed to build LumaPlane0 vignette facts for frame {frame_index}")
             })?;
@@ -1041,7 +1083,7 @@ fn generate_frame_gpu_canonical_dng(
                         .backend
                         .decode_raw_payload_to_canonical_bayer_u16_mapped_with_vignette(
                             raw_payload_scratch,
-                            dng_description.dimensions,
+                            dng_description.extraction_dimensions(),
                             Some(OptionalGpuVignetteCorrection {
                                 corrector: &mut vignette.corrector,
                                 uploaded_gain_map,
@@ -1076,7 +1118,7 @@ fn generate_frame_gpu_canonical_dng(
                         .backend
                         .decode_legacy_raw16_payload_to_canonical_bayer_u16_mapped_with_vignette(
                             raw_payload_scratch,
-                            dng_description.dimensions,
+                            dng_description.extraction_dimensions(),
                             row_stride,
                             Some(OptionalGpuVignetteCorrection {
                                 corrector: &mut vignette.corrector,
@@ -1327,11 +1369,8 @@ fn bayer_pattern_from_sensor_arrangement(
 }
 
 fn validate_first_raw_payload(container: &McrawContainer) -> Result<()> {
-    let clip_info = container.clip_info();
-    let clip_dimensions = FrameDimensions {
-        width: clip_info.width,
-        height: clip_info.height,
-    };
+    let geometry = container.resolved_frame_geometry(FrameNumber(0))?;
+    let clip_dimensions = geometry.extraction();
     let first_metadata = container
         .frame_metadata(FrameNumber(0))
         .context("failed to read first frame metadata")?;
@@ -1341,6 +1380,7 @@ fn validate_first_raw_payload(container: &McrawContainer) -> Result<()> {
     container
         .read_video_payload_into(FrameNumber(0), &mut first_payload)
         .context("failed to read first raw payload")?;
+    mcraw4vulkan_cpu::raw_decoder::validate_resolved_payload(&first_payload, geometry)?;
     validate_frame_payload(&first_payload, clip_dimensions, payload_layout)
         .context("first raw payload validation failed")?;
 
@@ -1357,6 +1397,10 @@ fn raw_payload_vec_for_frame(
     let mut raw_payload = Vec::with_capacity(capacity);
 
     container.read_video_payload_into(frame_number, &mut raw_payload)?;
+    mcraw4vulkan_cpu::raw_decoder::validate_resolved_payload(
+        &raw_payload,
+        container.resolved_frame_geometry(frame_number)?,
+    )?;
 
     Ok(raw_payload)
 }
@@ -1375,7 +1419,8 @@ fn dng_description_for_container_frame(
         entry.frame_number,
         entry.timestamp_us,
         correction,
-    )?)
+    )?
+    .with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)?)
 }
 
 fn source_video_frame_rate(container: &McrawContainer) -> Option<FrameRate> {

@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-audio"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "mcraw4vulkan-mcrawcontainer",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-audiowriter"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "thiserror 2.0.20",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-core"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "camino",
  "serde",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-cpu"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "mcraw4vulkan-rawcodec",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-display"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "thiserror 2.0.20",
  "wgpu",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-display-sound"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-audio",
  "mcraw4vulkan-core",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-dngwriter"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "mcraw4vulkan-core",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-fuse"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "fuser",
@@ -1203,7 +1203,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-gui"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "egui",
  "egui-wgpu",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-macfuse-ffi"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "fuser",
  "libc",
@@ -1230,16 +1230,17 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-mcrawcontainer"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
+ "mcraw4vulkan-cpu",
  "serde_json",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mcraw4vulkan-optimizer"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-mcrawcontainer",
  "serde_json",
@@ -1247,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-preflight"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "notify-rust",
@@ -1256,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-projfs-ffi"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "libloading",
  "windows-sys",
@@ -1264,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-rawcodec"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "thiserror 2.0.20",
@@ -1272,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-render"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "mcraw4vulkan-vignette",
@@ -1282,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-sdl2-wgpu-surface"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "pollster",
  "sdl2",
@@ -1291,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "mcraw4vulkan-vignette"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "mcraw4vulkan-core",
  "mcraw4vulkan-mcrawcontainer",

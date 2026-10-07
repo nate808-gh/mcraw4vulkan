@@ -55,9 +55,18 @@ impl VignetteGainMapFingerprint {
             .ok_or(VignetteCorrectionError::MissingLensShadingMap)?;
         let mut hash = StableVignetteHash::new();
 
-        hash.write_bytes(b"mcraw4vulkan:vignette-full-res-gain:v1");
+        hash.write_bytes(b"mcraw4vulkan:vignette-full-res-gain:v2");
         hash.write_u32(facts.frame_dimensions.width);
         hash.write_u32(facts.frame_dimensions.height);
+        hash.write_u32(facts.normalization_dimensions.width);
+        hash.write_u32(facts.normalization_dimensions.height);
+        hash.write_u32(facts.source_origin[0]);
+        hash.write_u32(facts.source_origin[1]);
+        if facts.layout_identity != [0; 4] {
+            for word in facts.layout_identity {
+                hash.write_u32(word);
+            }
+        }
         hash.write_u8(vignette_mode_tag(facts.mode));
         hash.write_u8(vignette_policy_tag(facts.correction_policy));
         hash.write_u8(coordinate_mapping_tag(facts.coordinate_mapping));
@@ -254,6 +263,7 @@ impl PreparedFullResolutionFixedGainMap {
         prepared_map: &PreparedFixedLensShadingMap<'_>,
         facts: &FixedPointVignetteInputFacts<'_>,
     ) -> Result<Self, VignetteCorrectionError> {
+        facts.validate_coordinates()?;
         validate_frame_dimensions(facts.frame_dimensions)?;
 
         let pixel_count = facts.frame_dimensions.pixel_count().ok_or(
@@ -280,9 +290,9 @@ impl PreparedFullResolutionFixedGainMap {
                     interpolated_fixed_gain(
                         prepared_map,
                         plane_index,
-                        x,
-                        y,
-                        facts.frame_dimensions,
+                        x + facts.source_origin[0] as usize,
+                        y + facts.source_origin[1] as usize,
+                        facts.normalization_dimensions,
                         facts.coordinate_mapping,
                     )?
                 }
@@ -392,9 +402,9 @@ fn motioncam_compatible_pixel_domain_gain_q16(
     let gain_q = interpolated_fixed_gain(
         prepared_map,
         plane_index,
-        x,
-        y,
-        facts.frame_dimensions,
+        x + facts.source_origin[0] as usize,
+        y + facts.source_origin[1] as usize,
+        facts.normalization_dimensions,
         facts.coordinate_mapping,
     )?;
 

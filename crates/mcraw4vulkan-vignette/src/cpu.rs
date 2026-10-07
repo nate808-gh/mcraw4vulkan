@@ -265,6 +265,7 @@ pub fn apply_cpu_vignette_correction_with_facts<'a>(
     facts: &VignetteCorrectionInputFacts<'_>,
 ) -> Result<CpuVignetteCorrectionResult<'a>, VignetteCorrectionError> {
     let dimensions = frame.dimensions();
+    facts.validate_coordinates()?;
     if dimensions != facts.frame_dimensions {
         return Err(VignetteCorrectionError::FrameDimensionsMismatch {
             frame_dimensions: dimensions,
@@ -305,9 +306,9 @@ pub fn apply_cpu_vignette_correction_with_facts<'a>(
         let gain = interpolated_prepared_gain(
             lens_shading_map,
             gain_plane_index,
-            x,
-            y,
-            dimensions,
+            x + facts.source_origin[0] as usize,
+            y + facts.source_origin[1] as usize,
+            facts.normalization_dimensions,
             facts.coordinate_mapping,
         )?;
         let (black, gain, output_white_level) = if facts.correction_policy
@@ -383,9 +384,9 @@ fn correct_fixed_into_le_bytes(
             let raw_gain_q = interpolated_fixed_gain(
                 lens_shading_map,
                 gain_plane_index,
-                x,
-                y,
-                dimensions,
+                x + facts.source_origin[0] as usize,
+                y + facts.source_origin[1] as usize,
+                facts.normalization_dimensions,
                 facts.coordinate_mapping,
             )?;
             let gain = raw_gain_q as f64 / VIGNETTE_GAIN_SCALE as f64;
@@ -403,9 +404,9 @@ fn correct_fixed_into_le_bytes(
             let gain_q = interpolated_fixed_gain(
                 lens_shading_map,
                 plane_index,
-                x,
-                y,
-                dimensions,
+                x + facts.source_origin[0] as usize,
+                y + facts.source_origin[1] as usize,
+                facts.normalization_dimensions,
                 facts.coordinate_mapping,
             )?;
             (
@@ -426,6 +427,7 @@ fn validate_fixed_frame_dimensions(
     dimensions: mcraw4vulkan_core::FrameDimensions,
     facts: &FixedPointVignetteInputFacts<'_>,
 ) -> Result<(), VignetteCorrectionError> {
+    facts.validate_coordinates()?;
     if dimensions != facts.frame_dimensions {
         return Err(VignetteCorrectionError::FrameDimensionsMismatch {
             frame_dimensions: dimensions,

@@ -2,6 +2,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum McrawContainerError {
+    #[error("geometry preparation cancelled")]
+    PreparationCancelled,
+
     #[error("I/O error: {0}")]
     Io(String),
 

@@ -248,7 +248,16 @@ struct PreviewStartupWorkerMessage {
 
 type PreviewStartupResult = PreviewStartupWorkerMessage;
 
+// Own cancellation with the existing startup state, including selection changes.
+struct PreviewPreparationCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for PreviewPreparationCancel {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct PreviewStartup {
+    _preparation_cancel: PreviewPreparationCancel,
     spec: PreviewStartSpec,
     request_id: u64,
     receiver: Receiver<PreviewStartupResult>,
@@ -377,7 +386,9 @@ impl Default for GuiPreview {
 }
 
 #[rustfmt::skip]
-fn spawn_preview_startup_worker(spec: &PreviewStartSpec) -> Receiver<PreviewStartupResult> {
+fn spawn_preview_startup_worker(spec: &PreviewStartSpec) -> (Receiver<PreviewStartupResult>, PreviewPreparationCancel) {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let token = std::sync::Arc::clone(&cancel);
     let config = spec
         .settings
         .display_config_with_sound(spec.source_path.clone(), spec.sound_enabled);
@@ -385,7 +396,7 @@ fn spawn_preview_startup_worker(spec: &PreviewStartSpec) -> Receiver<PreviewStar
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let result = if sound_enabled {
-            EmbeddedDisplayPreviewPrepared::prepare_with_sound_plan(config)
+            EmbeddedDisplayPreviewPrepared::prepare_with_sound_plan_cancellable(config, || token.load(std::sync::atomic::Ordering::Relaxed))
                 .map(|(prepared, sound_plan)| match sound_plan {
                     Ok(sound_plan) => PreviewPreparedBundle {
                         prepared,
@@ -400,7 +411,7 @@ fn spawn_preview_startup_worker(spec: &PreviewStartSpec) -> Receiver<PreviewStar
                 })
                 .map_err(|error| error.to_string())
         } else {
-            EmbeddedDisplayPreviewPrepared::prepare(config)
+            EmbeddedDisplayPreviewPrepared::prepare_cancellable(config, || token.load(std::sync::atomic::Ordering::Relaxed))
                 .map(|prepared| PreviewPreparedBundle {
                     prepared,
                     sound_plan: None,
@@ -412,7 +423,7 @@ fn spawn_preview_startup_worker(spec: &PreviewStartSpec) -> Receiver<PreviewStar
             result,
         });
     });
-    receiver
+    (receiver, PreviewPreparationCancel(cancel))
 }
 
 fn preview_audio_unavailable_message(error: &impl std::fmt::Display) -> String {
@@ -653,8 +664,9 @@ impl GuiPreview {
         self.next_request_id = self.next_request_id.saturating_add(1);
         self.preview_start_surface_refresh =
             PreviewStartSurfaceRefresh::AwaitingFirstSubmit { request_id };
-        let receiver = spawn_preview_startup_worker(&spec);
+        let (receiver, preparation_cancel) = spawn_preview_startup_worker(&spec);
         self.state = PreviewState::Starting(PreviewStartup {
+            _preparation_cancel: preparation_cancel,
             spec,
             request_id,
             receiver,

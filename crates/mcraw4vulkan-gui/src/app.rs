@@ -265,6 +265,7 @@ struct GuiApp {
     control_heights: Option<((style::Density, f32, f32, f32), main_view::ControlHeights)>,
     more_options_visible: bool,
     pipe_example: Option<PipeExamplePanel>,
+    pending_pipe_example: Option<pipe_example::PendingPipeExample>,
     pipe_body: PipeBody,
     pipe_vignette: bool,
     right_pane_owner: RightPaneOwner,
@@ -485,6 +486,7 @@ impl GuiApp {
             control_heights: None,
             more_options_visible: false,
             pipe_example: None,
+            pending_pipe_example: None,
             pipe_body: PipeBody::About,
             pipe_vignette: true,
             right_pane_owner: RightPaneOwner::Idle,
@@ -594,7 +596,7 @@ impl GuiApp {
 
     fn ui(&mut self, context: &Context, now: Instant) {
         style::select_density(context);
-        if self.movie_export.needs_poll() {
+        if self.movie_export.needs_poll() || self.pending_pipe_example.is_some() {
             context.request_repaint_after(FILE_CHOOSER_POLL_INTERVAL);
         }
         self.movie_export.recovery_dialog(context);
@@ -1259,16 +1261,13 @@ impl GuiApp {
             self.set_status(pipe_example::NO_SELECTED_FILE_MESSAGE);
             return None;
         };
-        let panel = pipe_example::example_for_selected_file(
-            Some(entry.source_path.as_path()),
+        self.pending_pipe_example = Some(pipe_example::PendingPipeExample::start(
+            entry.source_path.clone(),
             self.settings.decode_mode(),
             self.settings.optimizer_profile,
             self.pipe_vignette,
-        );
-        if let PipeExamplePanel::Error(message) = &panel {
-            self.set_status(message.clone());
-            return None;
-        }
+        ));
+        let panel = PipeExamplePanel::Message("Preparing PIPE example…".into());
         Some(PreparedPipeRequest { panel })
     }
 
@@ -1499,6 +1498,40 @@ impl GuiApp {
         false
     }
 
+    fn poll_pipe_example(&mut self) -> bool {
+        let Some(pending) = self.pending_pipe_example.as_ref() else {
+            return false;
+        };
+        if self.quit_requested
+            || self
+                .playlist
+                .selected_entry()
+                .is_none_or(|entry| entry.source_path != pending.source)
+        {
+            self.pending_pipe_example = None;
+            return true;
+        }
+        let Some(panel) = pending.poll() else {
+            return false;
+        };
+        self.pending_pipe_example = None;
+        if let Some(RightPaneRequest::ShowPipeExample(request)) =
+            self.pending_right_pane_request.as_mut()
+        {
+            request.panel = panel;
+        } else if self.right_pane_owner == RightPaneOwner::PipeExample
+            && self.pipe_body == PipeBody::Example
+        {
+            if let PipeExamplePanel::Error(message) = &panel {
+                self.set_status(message.clone());
+            } else {
+                self.set_status("Pipe Example ready.");
+            }
+            self.pipe_example = Some(panel);
+        }
+        true
+    }
+
     fn close_pipe_example(&mut self) {
         if self.movie_export.is_running() {
             self.set_status("Cancel or finish movie export before closing this pane.");
@@ -1510,6 +1543,7 @@ impl GuiApp {
     }
 
     fn clear_pipe_example(&mut self) {
+        self.pending_pipe_example = None;
         self.pipe_example = None;
         if self.right_pane_owner == RightPaneOwner::PipeExample {
             self.right_pane_owner = RightPaneOwner::Idle;
@@ -5029,6 +5063,7 @@ fn render_splash_frame(
         }
         scheduler.mark_dirty();
     }
+    if app.poll_pipe_example() { scheduler.mark_dirty(); }
     if app.poll_dng_processes() {
         scheduler.mark_dirty();
     }
@@ -5043,7 +5078,7 @@ fn render_splash_frame(
     if input.minimized || normalized_client_rect(snapshot, pixels_per_point(snapshot) * context.zoom_factor()).is_none() {
         // No invalid density/input snapshot or render; owned completions still poll.
         if app.poll_file_chooser() { scheduler.mark_dirty(); }
-        let retry = if app.quit_requested || app.movie_export.needs_poll() || app.pending_file_chooser.is_some() {
+        let retry = if app.quit_requested || app.movie_export.needs_poll() || app.pending_file_chooser.is_some() || app.pending_pipe_example.is_some() {
             FILE_CHOOSER_POLL_INTERVAL
         } else if app.dng_processes.has_active_work() { DNG_PROCESS_POLL_INTERVAL }
         else if app.optimizer.is_running() { OPTIMIZER_REPAINT_INTERVAL }
@@ -5217,7 +5252,11 @@ fn render_splash_frame(
 }
 
 fn deferred_surface_poll_delay(app: &GuiApp) -> Duration {
-    if app.quit_requested || app.movie_export.needs_poll() || app.pending_file_chooser.is_some() {
+    if app.quit_requested
+        || app.movie_export.needs_poll()
+        || app.pending_file_chooser.is_some()
+        || app.pending_pipe_example.is_some()
+    {
         FILE_CHOOSER_POLL_INTERVAL
     } else if app.dng_processes.has_active_work() {
         DNG_PROCESS_POLL_INTERVAL

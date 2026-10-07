@@ -157,6 +157,71 @@ pub struct ParsedClip {
 }
 
 impl ParsedClip {
+    pub(crate) fn geometry_source_stamp(&self) -> Result<String, DecodeError> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|e| DecodeError::Io(e.to_string()))?;
+        if metadata.len() != self.file_len {
+            return Err(DecodeError::InvalidPayloadSpan(
+                "source size changed during preparation".into(),
+            ));
+        }
+        Ok(format!(
+            "{}:{:?}",
+            metadata.len(),
+            metadata
+                .modified()
+                .map_err(|e| DecodeError::Io(e.to_string()))?
+        ))
+    }
+
+    /// Fixed header and, only for a mismatch, two bounded count words. No expansion.
+    pub(crate) fn read_type7_geometry(
+        &self,
+        index: usize,
+        declared: mcraw4vulkan_core::FrameDimensions,
+    ) -> Result<mcraw4vulkan_core::Type7GeometryEvidence, DecodeError> {
+        let frame = self.frame_at_index(index)?;
+        let read = |relative: u32, length: u32| -> Result<u64, DecodeError> {
+            if relative
+                .checked_add(length)
+                .is_none_or(|end| end > frame.payload_len)
+            {
+                return Err(DecodeError::InvalidPayloadSpan(
+                    "type-7 header/count outside payload".into(),
+                ));
+            }
+            frame
+                .payload_offset
+                .checked_add(u64::from(relative))
+                .ok_or_else(|| DecodeError::InvalidPayloadSpan("type-7 offset overflow".into()))
+        };
+        let bytes = read_array_at::<16>(&self.file, read(0, 16)?)?;
+        let header = mcraw4vulkan_core::read_metadata_header(&bytes)
+            .ok_or_else(|| DecodeError::InvalidMetadata("missing type-7 header".into()))?;
+        let counts =
+            if declared.width > header.encoded_width || declared.height > header.encoded_height {
+                Some([
+                    u32::from_le_bytes(read_array_at::<4>(
+                        &self.file,
+                        read(header.bits_offset, 4)?,
+                    )?),
+                    u32::from_le_bytes(read_array_at::<4>(
+                        &self.file,
+                        read(header.refs_offset, 4)?,
+                    )?),
+                ])
+            } else {
+                None
+            };
+        Ok(mcraw4vulkan_core::Type7GeometryEvidence {
+            header,
+            payload_len: frame.payload_len,
+            counts,
+        })
+    }
+
     pub fn file_len(&self) -> u64 {
         self.file_len
     }

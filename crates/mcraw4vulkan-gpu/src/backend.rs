@@ -3916,6 +3916,7 @@ where
         timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
     }
 
+    let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
     let copy_to_readback_encode_elapsed;
@@ -3940,12 +3941,17 @@ where
             timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
         }
         let copy_to_readback_encode_start = Instant::now();
+        readback_byte_len = dispatch.stats.output_buffer_bytes;
+        anyhow::ensure!(
+            readback_byte_len <= output_byte_len,
+            "corrected output exceeds decode allocation"
+        );
         encoder.copy_buffer_to_buffer(
             dispatch.output.buffer(),
             0,
             readback_buffer,
             0,
-            output_byte_len,
+            readback_byte_len,
         );
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
@@ -3968,7 +3974,7 @@ where
     let command_finish_submit_start = Instant::now();
     let submission_index = queue.submit(Some(encoder.finish()));
     let command_finish_submit_elapsed = command_finish_submit_start.elapsed();
-    let readback_slice = readback_buffer.slice(0..output_byte_len);
+    let readback_slice = readback_buffer.slice(0..readback_byte_len);
 
     let encode_submit_elapsed = encode_submit_start.elapsed();
 
@@ -4235,6 +4241,7 @@ where
         timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
     }
 
+    let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
     let copy_to_readback_encode_elapsed;
@@ -4259,12 +4266,17 @@ where
             timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
         }
         let copy_to_readback_encode_start = Instant::now();
+        readback_byte_len = dispatch.stats.output_buffer_bytes;
+        anyhow::ensure!(
+            readback_byte_len <= output_byte_len,
+            "corrected output exceeds decode allocation"
+        );
         encoder.copy_buffer_to_buffer(
             dispatch.output.buffer(),
             0,
             readback_buffer,
             0,
-            output_byte_len,
+            readback_byte_len,
         );
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
@@ -4287,7 +4299,7 @@ where
     let command_finish_submit_start = Instant::now();
     let submission_index = queue.submit(Some(encoder.finish()));
     let command_finish_submit_elapsed = command_finish_submit_start.elapsed();
-    let readback_slice = readback_buffer.slice(0..output_byte_len);
+    let readback_slice = readback_buffer.slice(0..readback_byte_len);
     let encode_submit_elapsed = encode_submit_start.elapsed();
 
     let wait_map_start = Instant::now();
@@ -4581,9 +4593,9 @@ where
             &mut encoder,
             GpuDecodedPackedU16BufferView {
                 buffer: dispatch.output.buffer(),
-                byte_len: decode_output_byte_len,
-                dimensions: visible_dimensions,
-                pixel_count,
+                byte_len: dispatch.stats.output_buffer_bytes,
+                dimensions: correction.params.frame_dimensions,
+                pixel_count: correction.params.pixel_count()?,
             },
         )?
     } else {
@@ -5012,9 +5024,9 @@ where
             &mut encoder,
             GpuDecodedPackedU16BufferView {
                 buffer: dispatch.output.buffer(),
-                byte_len: decode_output_byte_len,
-                dimensions: visible_dimensions,
-                pixel_count,
+                byte_len: dispatch.stats.output_buffer_bytes,
+                dimensions: correction.params.frame_dimensions,
+                pixel_count: correction.params.pixel_count()?,
             },
         )?
     } else {
@@ -5312,9 +5324,9 @@ where
             &mut encoder,
             GpuDecodedPackedU16BufferView {
                 buffer: dispatch.output.buffer(),
-                byte_len: decode_output_byte_len,
-                dimensions: visible_dimensions,
-                pixel_count,
+                byte_len: dispatch.stats.output_buffer_bytes,
+                dimensions: correction.params.frame_dimensions,
+                pixel_count: correction.params.pixel_count()?,
             },
         )?
     } else {
@@ -5649,6 +5661,7 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
     }
 
+    let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
     let copy_to_readback_encode_elapsed;
@@ -5685,12 +5698,17 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         }
 
         let copy_to_readback_encode_start = Instant::now();
+        readback_byte_len = dispatch.stats.output_buffer_bytes;
+        anyhow::ensure!(
+            readback_byte_len <= output_byte_len,
+            "corrected output exceeds decode allocation"
+        );
         encoder.copy_buffer_to_buffer(
             dispatch.output.buffer(),
             0,
             readback_buffer,
             0,
-            output_byte_len,
+            readback_byte_len,
         );
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
@@ -5720,7 +5738,7 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         slot_index,
         input_index,
         frame_index,
-        output_byte_len,
+        output_byte_len: readback_byte_len,
         submission_index,
         work_plan_elapsed,
         work_plan_stats,

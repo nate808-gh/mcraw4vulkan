@@ -43,6 +43,33 @@ impl<'a> DecodedBayerU16Frame<'a> {
         })
     }
 
+    pub fn with_resolved_geometry(
+        mut self,
+        geometry: crate::ResolvedFrameGeometry,
+    ) -> Result<Self, DecodedBayerU16FrameValidationError> {
+        let dimensions = geometry.effective;
+        let required = expected_pixel_byte_len(dimensions)?;
+        if self.dimensions != geometry.extraction()
+            || required > self.pixel_bytes_le.len()
+            || geometry.output_sample_count().is_none()
+        {
+            return Err(DecodedBayerU16FrameValidationError::ByteLengthMismatch {
+                dimensions,
+                expected_len: required,
+                actual_len: self.pixel_bytes_le.len(),
+            });
+        }
+        self.pixel_bytes_le = match self.pixel_bytes_le {
+            Cow::Owned(mut bytes) => {
+                bytes.truncate(required);
+                Cow::Owned(bytes)
+            }
+            Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..required]),
+        };
+        self.dimensions = dimensions;
+        Ok(self)
+    }
+
     pub fn dimensions(&self) -> FrameDimensions {
         self.dimensions
     }

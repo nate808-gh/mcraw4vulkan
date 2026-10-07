@@ -58,6 +58,8 @@ pub enum PipeF32BayerNumericDomain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipeF32BayerCorrectionFingerprint {
+    pub geometry: [u32; 6],
+    pub layout_identity: [u32; 4],
     pub spatial: Option<CompactSpatialMapFingerprint>,
     pub conversion: GainConversionFingerprint,
     pub black_q: [u32; 4],
@@ -71,10 +73,10 @@ impl PipeF32BayerCorrectionFingerprint {
     /// The record is deliberately owned by the typed fingerprint so public
     /// orchestration and private diagnostics cannot drift into different
     /// serializations of the same correction facts.
-    pub fn record_bytes(self) -> [u8; 88] {
-        const PREFIX: &[u8; 36] = b"PipeF32BayerCorrectionFingerprintV1\0";
+    pub fn record_bytes(self) -> Vec<u8> {
+        const PREFIX: &[u8; 36] = b"PipeF32BayerCorrectionFingerprintV2\0";
 
-        let mut record = [0_u8; 88];
+        let mut record = vec![0_u8; 112];
         record[..PREFIX.len()].copy_from_slice(PREFIX);
         record[36] = match self.mode {
             PipeF32BayerCorrectionMode::IdentitySpatialGain => 0,
@@ -100,7 +102,16 @@ impl PipeF32BayerCorrectionFingerprint {
             let start = 70 + index * size_of::<u32>();
             record[start..start + size_of::<u32>()].copy_from_slice(&black.to_le_bytes());
         }
-        record[86..].copy_from_slice(&self.corrected_white.to_le_bytes());
+        record[86..88].copy_from_slice(&self.corrected_white.to_le_bytes());
+        for (index, word) in self.geometry.into_iter().enumerate() {
+            record[88 + index * 4..92 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        if self.layout_identity != [0; 4] {
+            record.extend_from_slice(b"LayoutGuessV1\0");
+            for word in self.layout_identity {
+                record.extend_from_slice(&word.to_le_bytes());
+            }
+        }
         record
     }
 
@@ -136,6 +147,15 @@ impl PipeF32BayerCorrectionFingerprint {
             PipeF32BayerCorrectionMode::IdentitySpatialGain => None,
         };
         Ok(Self {
+            layout_identity: facts.layout_identity,
+            geometry: [
+                facts.frame_dimensions.width,
+                facts.frame_dimensions.height,
+                facts.normalization_dimensions.width,
+                facts.normalization_dimensions.height,
+                facts.source_origin[0],
+                facts.source_origin[1],
+            ],
             spatial,
             conversion: GainConversionFingerprint::from_fixed_facts(facts)?,
             black_q: quantized_motioncam_black(facts)?,
@@ -631,7 +651,7 @@ impl PipeF32DispatchContract {
             });
         }
 
-        validate_fixed_axis_domain(dimensions, facts, mode)?;
+        validate_fixed_axis_domain(facts.normalization_dimensions, facts, mode)?;
         let black_q = quantized_motioncam_black(facts)?;
         let (scale_num, scale_shift) = f32_power2_rational(
             facts.pixel_domain.source_to_corrected_scale,
@@ -771,6 +791,9 @@ impl PipeF32DispatchContract {
         words[20] = scale_shift;
         words[21] = strength_num;
         words[22] = strength_shift;
+        words[23] = facts.normalization_dimensions.width;
+        words[24] = facts.normalization_dimensions.height;
+        words[25..27].copy_from_slice(&facts.source_origin);
 
         Ok(Self {
             pixel_count,
@@ -790,6 +813,7 @@ impl PipeF32DispatchContract {
 fn validate_correction_facts(
     facts: &FixedPointVignetteInputFacts<'_>,
 ) -> Result<(), PipeF32BayerError> {
+    facts.validate_coordinates()?;
     if facts.correction_policy != VignetteCorrectionPolicy::MotionCamCompatiblePixelDomainV1 {
         return Err(PipeF32BayerError::UnsupportedCorrectionPolicy {
             policy: facts.correction_policy,

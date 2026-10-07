@@ -30,7 +30,7 @@ pub struct McrawClipInfo {
     pub container_flavor: ContainerFlavor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrameDimensions {
     pub width: u32,
     pub height: u32,
@@ -336,4 +336,146 @@ fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
     }
 
     left
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataHeader {
+    pub encoded_width: u32,
+    pub encoded_height: u32,
+    pub bits_offset: u32,
+    pub refs_offset: u32,
+}
+
+// Parse the fixed raw payload metadata header at the start of one compressed raw
+// video frame payload.
+pub fn read_metadata_header(input: &[u8]) -> Option<MetadataHeader> {
+    if input.len() < 16 {
+        return None;
+    }
+
+    Some(MetadataHeader {
+        encoded_width: u32::from_le_bytes([input[0], input[1], input[2], input[3]]),
+        encoded_height: u32::from_le_bytes([input[4], input[5], input[6], input[7]]),
+        bits_offset: u32::from_le_bytes([input[8], input[9], input[10], input[11]]),
+        refs_offset: u32::from_le_bytes([input[12], input[13], input[14], input[15]]),
+    })
+}
+
+/// Source and output coordinates are distinct: reconciliation never rewrites JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedFrameGeometry {
+    pub declared: FrameDimensions,
+    pub encoded: Option<FrameDimensions>,
+    pub effective: FrameDimensions,
+    pub origin: [u32; 2],
+    pub reason: Option<GeometryRecoveryReason>,
+    pub type7: Option<Type7GeometryEvidence>,
+    pub layout_guess: Option<GeometryLayoutGuess>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryRecoveryReason {
+    IncompleteFinalFourRowGroup,
+}
+
+/// Compact evidence retained before an output contract is published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Type7GeometryEvidence {
+    pub header: MetadataHeader,
+    pub payload_len: u32,
+    pub counts: Option<[u32; 2]>,
+}
+
+/// One bounded analysis decision, shared by every sink. Scores are not probabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GeometryLayoutGuess {
+    pub policy_version: u32,
+    pub extraction: FrameDimensions,
+    pub scene_pitch: u32,
+    pub selected: bool,
+    pub analysis_frame: u32,
+    pub informative_sites: u32,
+    pub baseline_score: u32,
+    pub selected_score: u32,
+    pub margin_basis_points: u32,
+}
+
+impl ResolvedFrameGeometry {
+    pub fn extraction(self) -> FrameDimensions {
+        self.layout_guess
+            .map_or(self.effective, |guess| guess.extraction)
+    }
+
+    /// Reframes expose a checked contiguous prefix of the codec extraction.
+    /// Never pass the effective width as the codec width for this mapping.
+    pub fn output_sample_count(self) -> Option<usize> {
+        let extraction = self.extraction();
+        if self.origin != [0, 0]
+            || self.effective.width == 0
+            || self.effective.height == 0
+            || self.effective.height != extraction.height
+            || self.effective.width > extraction.width
+            || self.layout_guess.is_some_and(|g| {
+                g.policy_version != 1
+                    || g.analysis_frame != 0
+                    || g.scene_pitch != self.effective.width
+                    || g.extraction.width != self.declared.width
+                    || (!g.selected && self.effective != extraction)
+            })
+        {
+            return None;
+        }
+        let count = self.effective.pixel_count()?;
+        (count <= self.extraction().pixel_count()?).then_some(count)
+    }
+
+    pub fn recovery_message(self) -> Option<String> {
+        if let Some(guess) = self.layout_guess {
+            return Some(if guess.selected {
+                format!(
+                    "Metadata/payload geometry mismatch: using a best-guess {}x{} layout. Original samples may be missing or repeated.",
+                    self.effective.width, self.effective.height
+                )
+            } else {
+                format!(
+                    "Metadata/payload geometry mismatch: retained the safe {}x{} metadata-based layout; alignment may remain imperfect.",
+                    self.effective.width, self.effective.height
+                )
+            });
+        }
+        self.reason.map(|_| format!(
+            "Metadata declares {}x{}; using the represented {}x{} image. The payload does not represent the final {} declared rows under this layout.",
+            self.declared.width, self.declared.height, self.effective.width,
+            self.effective.height, self.declared.height - self.effective.height))
+    }
+
+    /// Compare against the evidence frozen before publication; never resolve again.
+    pub fn matches_payload(self, payload: &[u8]) -> bool {
+        let Some(evidence) = self.type7 else {
+            return true;
+        };
+        if payload.len() != evidence.payload_len as usize
+            || read_metadata_header(payload) != Some(evidence.header)
+        {
+            return false;
+        }
+        evidence.counts.is_none_or(|counts| {
+            [evidence.header.bits_offset, evidence.header.refs_offset]
+                .into_iter()
+                .zip(counts)
+                .all(|(offset, count)| {
+                    usize::try_from(offset)
+                        .ok()
+                        .and_then(|start| {
+                            start.checked_add(4).and_then(|end| payload.get(start..end))
+                        })
+                        .is_some_and(|bytes| bytes == count.to_le_bytes())
+                })
+        })
+    }
+}
+
+/// Bounded preparation evidence identity; final source publication retains its SHA-256 check.
+pub fn geometry_evidence_identity(bytes: &[u8]) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(bytes)
 }

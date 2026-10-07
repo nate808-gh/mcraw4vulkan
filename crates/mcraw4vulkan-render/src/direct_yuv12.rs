@@ -469,10 +469,8 @@ impl DirectYuv12Geometry {
         if dimensions.width == 0 || dimensions.height == 0 {
             return Err(DirectYuv12Error::InvalidDimensions { dimensions });
         }
-        if dimensions.width & 1 != 0 {
-            return Err(DirectYuv12Error::OddVisibleWidth {
-                width: dimensions.width,
-            });
+        if dimensions.width & 1 != 0 && dimensions.height & 1 != 0 {
+            return Err(DirectYuv12Error::OddSampleCount { dimensions });
         }
         let pixel_count = dimensions
             .pixel_count()
@@ -509,9 +507,13 @@ impl DirectYuv12Geometry {
                 max_buffer_bytes: limits.max_buffer_size,
             });
         }
-        let pair_width = dimensions.width / 2;
+        let (pair_width, pair_rows) = if dimensions.width & 1 == 0 {
+            (dimensions.width / 2, dimensions.height)
+        } else {
+            (dimensions.width, dimensions.height / 2)
+        };
         let dispatch_workgroups_x = pair_width.div_ceil(DIRECT_YUV12_WORKGROUP_X);
-        let dispatch_workgroups_y = dimensions.height.div_ceil(DIRECT_YUV12_WORKGROUP_Y);
+        let dispatch_workgroups_y = pair_rows.div_ceil(DIRECT_YUV12_WORKGROUP_Y);
         for (axis, required_workgroups) in
             [("x", dispatch_workgroups_x), ("y", dispatch_workgroups_y)]
         {
@@ -730,8 +732,8 @@ fn u32_words_to_le_bytes(values: &[u32]) -> Vec<u8> {
 pub enum DirectYuv12Error {
     #[error("direct YUV12 dimensions {dimensions:?} must be positive")]
     InvalidDimensions { dimensions: FrameDimensions },
-    #[error("direct YUV12 requires an even visible width, got {width}")]
-    OddVisibleWidth { width: u32 },
+    #[error("direct YUV12 requires an even total sample count, got {dimensions:?}")]
+    OddSampleCount { dimensions: FrameDimensions },
     #[error("direct YUV12 dimensions {dimensions:?} overflow checked buffer/index arithmetic")]
     DimensionOverflow { dimensions: FrameDimensions },
     #[error("direct YUV12 requires RelativeLinearCorrectedCodeV1, got {domain:?}")]

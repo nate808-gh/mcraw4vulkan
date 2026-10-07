@@ -29,5 +29,8 @@ pub use mount_naming::{
 pub use types::{
     AudioSampleRange, AudioTrackInfo, BayerPattern, BlockEncoding, ClipId, ClipTimingInfo,
     ContainerFlavor, DecodeBackend, FrameDimensions, FrameNumber, FramePayloadLayout, FrameRate,
-    McrawClipInfo, TimelineFrameRateSource,
+    GeometryLayoutGuess, GeometryRecoveryReason, McrawClipInfo, MetadataHeader,
+    ResolvedFrameGeometry, TimelineFrameRateSource, Type7GeometryEvidence, read_metadata_header,
 };
+
+pub use types::geometry_evidence_identity;

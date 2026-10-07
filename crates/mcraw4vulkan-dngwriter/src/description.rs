@@ -30,6 +30,7 @@ pub struct DngFrameDescription {
     pub frame_number: FrameNumber,
     pub timestamp_us: u64,
     pub dimensions: FrameDimensions,
+    pub resolved_geometry: Option<mcraw4vulkan_core::ResolvedFrameGeometry>,
     pub default_crop_origin: [u32; 2],
     pub default_crop_size: [u32; 2],
     pub bits_per_sample: u16,
@@ -109,6 +110,33 @@ pub struct CfaPattern {
 }
 
 impl DngFrameDescription {
+    pub fn extraction_dimensions(&self) -> FrameDimensions {
+        self.resolved_geometry
+            .map_or(self.dimensions, |g| g.extraction())
+    }
+
+    pub fn with_resolved_geometry(
+        mut self,
+        geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
+    ) -> Result<Self, DngDescriptionError> {
+        if self.dimensions != geometry.declared
+            || geometry.origin != [0, 0]
+            || geometry.effective.width == 0
+            || geometry.effective.height == 0
+            || geometry.effective.width > geometry.declared.width
+            || geometry.effective.height > geometry.declared.height
+        {
+            return Err(DngDescriptionError::UnsupportedMetadata(
+                "invalid resolved DNG geometry".into(),
+            ));
+        }
+        self.resolved_geometry = Some(geometry);
+        self.dimensions = geometry.effective;
+        self.default_crop_origin = [0, 0];
+        self.default_crop_size = [geometry.effective.width, geometry.effective.height];
+        Ok(self)
+    }
+
     // Build a DNG-ready description from typed .mcraw metadata.
     //
     // Missing values that are required for a usable Bayer DNG fail here instead
@@ -177,6 +205,7 @@ impl DngFrameDescription {
             CfaPattern::from_sensor_arrangement(&container_metadata.sensor_arrangement)?;
 
         Ok(Self {
+            resolved_geometry: None,
             frame_number,
             timestamp_us,
             dimensions: frame_metadata.dimensions,

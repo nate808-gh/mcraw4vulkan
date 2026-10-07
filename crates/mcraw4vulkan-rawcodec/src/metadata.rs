@@ -7,36 +7,15 @@
 use mcraw4vulkan_core::BlockEncoding;
 
 use crate::block::decode_block;
-use crate::constants::{ENCODING_BLOCK, HEADER_LENGTH, METADATA_OFFSET};
+use crate::constants::{ENCODING_BLOCK, HEADER_LENGTH};
 use crate::error::RawCodecError;
 
-#[derive(Debug, Clone, Copy)]
-pub struct MetadataHeader {
-    pub encoded_width: u32,
-    pub encoded_height: u32,
-    pub bits_offset: u32,
-    pub refs_offset: u32,
-}
+pub use mcraw4vulkan_core::{MetadataHeader, read_metadata_header};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockHeader {
     pub encoding: BlockEncoding,
     pub reference: u16,
-}
-
-// Parse the fixed raw payload metadata header at the start of one compressed raw
-// video frame payload.
-pub fn read_metadata_header(input: &[u8]) -> Option<MetadataHeader> {
-    if input.len() < METADATA_OFFSET {
-        return None;
-    }
-
-    Some(MetadataHeader {
-        encoded_width: u32::from_le_bytes([input[0], input[1], input[2], input[3]]),
-        encoded_height: u32::from_le_bytes([input[4], input[5], input[6], input[7]]),
-        bits_offset: u32::from_le_bytes([input[8], input[9], input[10], input[11]]),
-        refs_offset: u32::from_le_bytes([input[12], input[13], input[14], input[15]]),
-    })
 }
 
 // Convert raw metadata stream values into the shared BlockEncoding contract.
@@ -118,4 +97,69 @@ pub fn decode_metadata(input: &[u8], offset: usize) -> Result<Vec<u16>, RawCodec
     }
 
     Ok(out)
+}
+
+/// Validate the bounded streams and residual walk for a frozen recovered frame.
+/// No Bayer samples are decoded and no image-sized coverage map is allocated.
+pub fn validate_resolved_payload(
+    input: &[u8],
+    geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
+) -> Result<(), RawCodecError> {
+    let invalid = || RawCodecError::InvalidResolvedGeometry;
+    if geometry.output_sample_count().is_none() || !geometry.matches_payload(input) {
+        return Err(invalid());
+    }
+    if geometry.reason.is_none() {
+        return Ok(());
+    }
+    let evidence = geometry.type7.ok_or_else(invalid)?;
+    let h = evidence.header;
+    let lanes = (h.encoded_width / 64)
+        .checked_mul(h.encoded_height)
+        .ok_or_else(invalid)?;
+    let maximum = lanes
+        .checked_add(63)
+        .map(|n| n / 64 * 64)
+        .ok_or_else(invalid)?;
+    if h.encoded_width == 0
+        || h.encoded_height == 0
+        || h.encoded_width > 16_384
+        || h.encoded_height > 16_384
+        || geometry.effective.width == 0
+        || geometry.effective.height == 0
+        || geometry.effective.width > h.encoded_width
+        || geometry.effective.height > h.encoded_height
+        || u64::from(geometry.effective.width) * u64::from(geometry.effective.height) > 100_000_000
+        || h.encoded_width & 63 != 0
+        || h.encoded_height & 3 != 0
+        || h.bits_offset < 16
+        || h.bits_offset
+            .checked_add(4)
+            .is_none_or(|n| n > h.refs_offset)
+        || h.refs_offset
+            .checked_add(4)
+            .is_none_or(|n| n > evidence.payload_len)
+        || evidence
+            .counts
+            .is_none_or(|counts| counts.into_iter().any(|n| n < lanes || n > maximum))
+    {
+        return Err(invalid());
+    }
+    let bits_start = usize::try_from(h.bits_offset).map_err(|_| invalid())?;
+    let refs_start = usize::try_from(h.refs_offset).map_err(|_| invalid())?;
+    let bits = decode_metadata(input.get(bits_start..refs_start).ok_or_else(invalid)?, 0)?;
+    let refs = decode_metadata(input.get(refs_start..).ok_or_else(invalid)?, 0)?;
+    if bits.len() < lanes as usize || refs.len() < lanes as usize {
+        return Err(invalid());
+    }
+    let mut cursor = 16usize;
+    for &encoding in &bits[..lanes as usize] {
+        cursor = cursor
+            .checked_add(crate::block_len(block_encoding_from_raw(encoding)?))
+            .ok_or_else(invalid)?;
+        if cursor > bits_start {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }

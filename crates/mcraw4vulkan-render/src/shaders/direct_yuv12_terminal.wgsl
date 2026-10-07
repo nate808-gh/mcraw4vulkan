@@ -242,18 +242,26 @@ fn direct_yuv12_pack_pair(low: u32, high: u32) -> u32 {
 fn direct_yuv12_main(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
-    let pair_width = pipe_f32_bayer_width() / 2u;
-    let lane_has_pair = gid.x < pair_width && gid.y < pipe_f32_bayer_height();
+    let width = pipe_f32_bayer_width();
+    let even_width = (width & 1u) == 0u;
+    let pair_width = select(width, width / 2u, even_width);
+    let pair_rows = select(pipe_f32_bayer_height() / 2u, pipe_f32_bayer_height(), even_width);
+    // Guard both axes before flattening: padded invocations cannot alias the next row.
+    let lane_has_pair = gid.x < pair_width && gid.y < pair_rows;
     if (lane_has_pair) {
-        let x0 = gid.x * 2u;
-        let x1 = x0 + 1u;
-        let pixel0 = direct_yuv12_pixel(x0, gid.y);
-        let pixel1 = direct_yuv12_pixel(x1, gid.y);
-        let linear0 = gid.y * pipe_f32_bayer_width() + x0;
+        let word = gid.y * pair_width + gid.x;
+        let linear0 = 2u * word;
+        var p0 = vec2<u32>(gid.x * 2u, gid.y);
+        var p1 = vec2<u32>(p0.x + 1u, gid.y);
+        if (!even_width) {
+            p0 = vec2<u32>(linear0 % width, linear0 / width);
+            p1 = vec2<u32>((linear0 + 1u) % width, (linear0 + 1u) / width);
+        }
+        let pixel0 = direct_yuv12_pixel(p0.x, p0.y);
+        let pixel1 = direct_yuv12_pixel(p1.x, p1.y);
         direct_yuv12_record_failure(linear0, pixel0.failure_bits);
         direct_yuv12_record_failure(linear0 + 1u, pixel1.failure_bits);
 
-        let word = gid.y * pair_width + gid.x;
         let plane_words = direct_yuv12_plane_words();
         direct_yuv12_words[word] = direct_yuv12_pack_pair(pixel0.codes.x, pixel1.codes.x);
         direct_yuv12_words[plane_words + word] =

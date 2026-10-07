@@ -9,6 +9,9 @@ use mcraw4vulkan_rawcodec::{
 
 use crate::error::CpuDecodeError;
 
+// Shared codec validation, also used before GPU dispatch by output owners.
+pub use mcraw4vulkan_rawcodec::validate_resolved_payload;
+
 const MCRAW_DECODED_BLOCK_SAMPLES: usize = 64;
 const BYTES_PER_BAYER_U16_SAMPLE: usize = 2;
 const LEGACY_RAW16_BLOCK_SAMPLES: usize = 16;

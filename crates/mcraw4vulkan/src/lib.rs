@@ -25,7 +25,7 @@ pub use dng_mount::{
     DngMountRunConfig, DngUnmountRequest, DngUnmountSummary, default_mountpoint_for_source,
     dng_virtual_names_for_stem,
 };
-pub use pipe_cli::pipe_example_facts_for_input;
+pub use pipe_cli::{pipe_example_facts_for_input, pipe_example_facts_for_input_with_cancel};
 pub use pipe_contract::{
     PIPE_AUDIO_FILE_SUFFIX, PIPE_METADATA_FILE_SUFFIX, PIPE_OUTPUT_STEM_SUFFIX,
     PIPE_PRORES_FILE_SUFFIX, PIPE_PRORES_SIDECAR_SUFFIX, PipeAspectRatio, PipeAudioContractV4,

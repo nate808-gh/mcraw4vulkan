@@ -557,23 +557,37 @@ pub struct EmbeddedDisplayPreviewPrepared {
 
 impl EmbeddedDisplayPreviewPrepared {
     pub fn prepare(config: DisplayCliRunConfig) -> Result<Self> {
+        Self::prepare_cancellable(config, || false)
+    }
+
+    pub fn prepare_cancellable(
+        config: DisplayCliRunConfig,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self> {
         config.validate_before_open()?;
         if config.sound.enabled() {
             bail!("display sound is only supported by standalone CLI display");
         }
         Ok(Self {
-            prepared: DisplayWindowPreparedState::prepare(config, None)?,
+            prepared: DisplayWindowPreparedState::prepare_with_cancel(config, None, cancelled)?,
         })
     }
 
     pub fn prepare_with_sound_plan(
         config: DisplayCliRunConfig,
     ) -> Result<(Self, Result<DisplaySoundPlan, DisplaySoundError>)> {
+        Self::prepare_with_sound_plan_cancellable(config, || false)
+    }
+
+    pub fn prepare_with_sound_plan_cancellable(
+        config: DisplayCliRunConfig,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(Self, Result<DisplaySoundPlan, DisplaySoundError>)> {
         config.validate_before_open()?;
         if !config.sound.enabled() {
             bail!("embedded display sound preparation requires sound-enabled config");
         }
-        let prepared = DisplayWindowPreparedState::prepare(config, None)?;
+        let prepared = DisplayWindowPreparedState::prepare_with_cancel(config, None, cancelled)?;
         let sound_plan = DisplaySoundPlan::from_container(&prepared.source.container);
         Ok((Self { prepared }, sound_plan))
     }
@@ -1016,7 +1030,15 @@ fn display_fps_overlay_for_present(
 impl DisplayWindowPreparedState {
     fn prepare(
         config: DisplayCliRunConfig,
+        startup_timing: Option<DisplayStartupTimings>,
+    ) -> Result<Self> {
+        Self::prepare_with_cancel(config, startup_timing, || false)
+    }
+
+    fn prepare_with_cancel(
+        config: DisplayCliRunConfig,
         mut startup_timing: Option<DisplayStartupTimings>,
+        cancelled: impl Fn() -> bool,
     ) -> Result<Self> {
         let container_start = Instant::now();
         let mut container_timings = McrawContainerOpenTimings::default();
@@ -1033,6 +1055,7 @@ impl DisplayWindowPreparedState {
             (false, false) => McrawContainer::open_for_display(&config.input_path),
         }
         .with_context(|| format!("opening {}", config.input_path.display()))?;
+        container.prepare_geometry_with_cancel(cancelled)?;
         if let Some(timing) = startup_timing.as_mut() {
             timing.record_phase("mcraw_container.open.total", container_start);
             timing.record_nested_phase(
@@ -1517,7 +1540,7 @@ impl DisplayWindowState {
             FramePayloadLayout::CompressedRawcodecType7 => backend
                 .decode_raw_payload_packed_u16_gpu_stage_no_readback_with_vignette(
                     frame.data.as_slice(),
-                    facts.dimensions,
+                    facts.geometry.extraction(),
                     None,
                     |device, queue, encoder, decoded| {
                         encode_preview_stage(
@@ -1534,7 +1557,7 @@ impl DisplayWindowState {
             FramePayloadLayout::BinnedRaw16Type6 { row_stride } => backend
                 .decode_legacy_raw16_payload_packed_u16_gpu_stage_no_readback_with_vignette(
                     frame.data.as_slice(),
-                    facts.dimensions,
+                    facts.geometry.extraction(),
                     row_stride,
                     None,
                     |device, queue, encoder, decoded| {
@@ -1574,7 +1597,7 @@ impl DisplayWindowState {
                 .backend
                 .decode_raw_payload_packed_u16_gpu_stage_no_readback_with_vignette(
                     frame.data.as_slice(),
-                    facts.dimensions,
+                    facts.geometry.extraction(),
                     correction,
                     |_device, _queue, _encoder, decoded| {
                         Ok(DecodedDisplayStage {
@@ -1587,7 +1610,7 @@ impl DisplayWindowState {
                 .backend
                 .decode_legacy_raw16_payload_packed_u16_gpu_stage_no_readback_with_vignette(
                     frame.data.as_slice(),
-                    facts.dimensions,
+                    facts.geometry.extraction(),
                     row_stride,
                     correction,
                     |_device, _queue, _encoder, decoded| {
@@ -1709,12 +1732,14 @@ impl DisplayWindowState {
             .source
             .cpu_decoder
             .decode_loaded_payload_to_decoded_bayer_u16_frame_with_layout(
-                facts.dimensions,
+                facts.geometry.extraction(),
                 facts.payload_layout,
                 &mut timings,
             )
             .context("CPU decoding display frame")?;
-        let bytes = decoded.into_owned_le_bytes();
+        let bytes = decoded
+            .with_resolved_geometry(facts.geometry)?
+            .into_owned_le_bytes();
 
         let byte_len =
             u64::try_from(bytes.len()).context("CPU preview byte length overflows u64")?;
@@ -1900,6 +1925,10 @@ impl DisplayWindowPreparedSource {
         startup_timing: Option<&mut DisplayStartupTimings>,
     ) -> Result<Self> {
         let source_create_start = startup_timing.as_ref().map(|_| Instant::now());
+        let geometry = container.resolved_frame_geometry(FrameNumber(0))?;
+        if let Some(message) = geometry.recovery_message() {
+            tracing::warn!("{message}");
+        }
         let frame_count = container.frame_count();
         if frame_count == 0 {
             bail!("{} contains no frames", input_path.display());
@@ -2004,10 +2033,14 @@ impl DisplayWindowSource {
     }
 
     fn source_size(&self) -> DisplaySize {
-        let clip_info = self.container.clip_info();
+        let dimensions = self
+            .container
+            .resolved_frame_geometry(FrameNumber(0))
+            .expect("prepared display geometry")
+            .effective;
         DisplaySize {
-            width: clip_info.width,
-            height: clip_info.height,
+            width: dimensions.width,
+            height: dimensions.height,
         }
     }
 
@@ -2030,6 +2063,8 @@ impl DisplayWindowSource {
                 expected
             );
         }
+        self.container
+            .validate_payload_geometry(expected, payload.data.as_slice())?;
         Ok(Some(payload))
     }
 
@@ -2061,6 +2096,8 @@ impl DisplayWindowSource {
                 expected
             );
         }
+        self.container
+            .validate_payload_geometry(expected, payload.data.as_slice())?;
         Ok(DisplayPayloadFramePoll::Ready(payload))
     }
 
@@ -2174,7 +2211,8 @@ impl DisplayWindowSource {
             .frame_metadata(frame_number)
             .with_context(|| format!("reading metadata for frame {:?}", frame_number))?;
         let container_metadata = self.container.container_metadata();
-        let dimensions = frame_metadata.dimensions;
+        let geometry = self.container.resolved_frame_geometry(frame_number)?;
+        let dimensions = geometry.effective;
         let bayer_pattern = bayer_pattern_from_sensor(&container_metadata.sensor_arrangement)
             .context("unsupported Bayer arrangement for display")?;
         let black_level =
@@ -2219,6 +2257,7 @@ impl DisplayWindowSource {
         };
         let payload_layout = frame_metadata.payload_layout()?;
         Ok(DisplayFrameFacts {
+            geometry,
             dimensions,
             payload_layout,
             bayer_pattern,
@@ -2234,6 +2273,7 @@ impl DisplayWindowSource {
 }
 
 struct DisplayFrameFacts {
+    geometry: mcraw4vulkan_core::ResolvedFrameGeometry,
     dimensions: FrameDimensions,
     payload_layout: FramePayloadLayout,
     bayer_pattern: BayerPattern,
@@ -2256,12 +2296,13 @@ impl DisplayFrameFacts {
         let input_facts = VignetteCorrectionInputFacts::new(
             VignetteCorrectionMode::Enabled,
             VignetteCoordinateMapping::VisibleFrame,
-            self.dimensions,
+            self.geometry.declared,
             self.bayer_pattern,
             None,
             self.black_level,
             self.white_level as u16,
-        )?;
+        )?
+        .with_resolved_geometry(self.geometry)?;
         FixedPointVignetteInputFacts::from_input_facts_with_fixed_map(&input_facts, Some(fixed_map))
             .context("failed to build fixed-point vignette input facts")
     }

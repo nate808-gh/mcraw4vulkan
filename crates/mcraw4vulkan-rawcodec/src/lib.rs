@@ -14,5 +14,5 @@ pub use constants::{ENCODING_BLOCK, ENCODING_BLOCK_LENGTH, HEADER_LENGTH, METADA
 pub use error::RawCodecError;
 pub use metadata::{
     BlockHeader, MetadataHeader, block_encoding_from_raw, decode_header, decode_metadata,
-    read_metadata_header,
+    read_metadata_header, validate_resolved_payload,
 };
