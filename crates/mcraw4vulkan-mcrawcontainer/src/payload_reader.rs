@@ -492,18 +492,6 @@ pub struct PayloadFeederOptions {
     pub chunk_options: PayloadChunkOptions,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PayloadFeederSpawnPhaseTiming {
-    pub start_offset: Duration,
-    pub duration: Duration,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PayloadFeederSpawnTimings {
-    pub total: Duration,
-    pub chunk_plan_from_plan: Option<PayloadFeederSpawnPhaseTiming>,
-}
-
 impl PayloadFeederOptions {
     pub const fn production_default() -> Self {
         Self {
@@ -1056,31 +1044,12 @@ pub enum PayloadFeederPoll {
 }
 
 impl PayloadFeeder {
+    #[rustfmt::skip]
     pub fn spawn(
         path: impl AsRef<Path>,
         plan: PayloadReadPlan,
         options: PayloadFeederOptions,
     ) -> Result<Self, PayloadFeederError> {
-        Self::spawn_inner(path, plan, options, None)
-    }
-
-    pub fn spawn_with_timing(
-        path: impl AsRef<Path>,
-        plan: PayloadReadPlan,
-        options: PayloadFeederOptions,
-        timings: &mut PayloadFeederSpawnTimings,
-    ) -> Result<Self, PayloadFeederError> {
-        *timings = PayloadFeederSpawnTimings::default();
-        Self::spawn_inner(path, plan, options, Some(timings))
-    }
-
-    fn spawn_inner(
-        path: impl AsRef<Path>,
-        plan: PayloadReadPlan,
-        options: PayloadFeederOptions,
-        mut timings: Option<&mut PayloadFeederSpawnTimings>,
-    ) -> Result<Self, PayloadFeederError> {
-        let total_start = timings.as_ref().map(|_| Instant::now());
         if options.prefetch_depth == 0 {
             return Err(PayloadFeederError::InvalidPlan(
                 "payload prefetch depth must be at least 1".into(),
@@ -1108,27 +1077,14 @@ impl PayloadFeeder {
         }
 
         let path = path.as_ref().to_path_buf();
-        let result = match options.mode {
+        match options.mode {
             PayloadReadMode::Current => Self::new_current(path, plan, options),
             PayloadReadMode::OffsetPrefetch => Self::spawn_offset(path, plan, options, None, false),
             PayloadReadMode::ChunkedOffsetPrefetch => {
-                let chunk_plan_start = total_start.map(|_| Instant::now());
                 let chunk_plan = PayloadChunkPlan::from_plan(&plan, options.chunk_options)?;
-                if let (Some(total_start), Some(chunk_plan_start), Some(timings)) =
-                    (total_start, chunk_plan_start, timings.as_deref_mut())
-                {
-                    timings.chunk_plan_from_plan = Some(PayloadFeederSpawnPhaseTiming {
-                        start_offset: chunk_plan_start.duration_since(total_start),
-                        duration: chunk_plan_start.elapsed(),
-                    });
-                }
                 Self::spawn_offset(path, plan, options, Some(chunk_plan), true)
             }
-        };
-        if let (Some(total_start), Some(timings)) = (total_start, timings) {
-            timings.total = total_start.elapsed();
         }
-        result
     }
 
     pub fn next_frame(&mut self) -> Result<Option<PayloadFrame>, PayloadFeederError> {

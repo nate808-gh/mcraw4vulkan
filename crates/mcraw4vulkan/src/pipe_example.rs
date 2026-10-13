@@ -8,6 +8,8 @@ use crate::{
     pipe_example_facts_for_input,
 };
 
+use crate::movie_export::ExportOutputKind;
+
 use crate::cli::{ComputeBackendChoice as DecodeMode, SettingsSourceChoice as OptimizerProfile};
 
 pub const HEADER: &str = "mcraw4vulkan Pipe";
@@ -356,10 +358,18 @@ fn macos_command(
 
 /// Literal encoder arguments shared with the protected human-facing recipe.
 pub(crate) fn encoder_args(facts: &PipeExampleFacts, target: CommandTarget) -> Vec<String> {
-    encoder_args_for(facts, ProresEncoder::default_for(target))
+    encoder_args_for(
+        facts,
+        ProresEncoder::default_for(target),
+        ExportOutputKind::ProRes4444,
+    )
 }
 
-pub(crate) fn encoder_args_for(facts: &PipeExampleFacts, encoder: ProresEncoder) -> Vec<String> {
+pub(crate) fn encoder_args_for(
+    facts: &PipeExampleFacts,
+    encoder: ProresEncoder,
+    output_kind: ExportOutputKind,
+) -> Vec<String> {
     let mut args: Vec<String> = ["-nostdin", "-hide_banner", "-y"]
         .into_iter()
         .map(str::to_owned)
@@ -414,22 +424,30 @@ pub(crate) fn encoder_args_for(facts: &PipeExampleFacts, encoder: ProresEncoder)
     );
     let aspect = display_aspect_ratio_text(facts);
     args.push(if encoder == ProresEncoder::VideoToolbox {
-        videotoolbox_prores_filter(&aspect)
+        videotoolbox_prores_filter(&aspect, output_kind)
     } else {
-        vulkan_prores_filter(&aspect)
+        vulkan_prores_filter(&aspect, output_kind)
     });
+    let proxy = output_kind == ExportOutputKind::ProResProxy;
+    let profile = if proxy { "0" } else { "4" };
     args.extend(["-an", "-c:v"].into_iter().map(str::to_owned));
     args.extend(
         if encoder == ProresEncoder::VideoToolbox {
             [
                 "prores_videotoolbox",
                 "-profile:v",
-                "4",
+                profile,
                 "-pix_fmt",
-                "p410le",
+                if proxy { "p210le" } else { "p410le" },
             ]
         } else {
-            ["prores_ks_vulkan", "-profile:v", "4", "-alpha_bits", "0"]
+            [
+                "prores_ks_vulkan",
+                "-profile:v",
+                profile,
+                "-alpha_bits",
+                "0",
+            ]
         }
         .into_iter()
         .map(str::to_owned),
@@ -510,15 +528,40 @@ fn render_remux_tail(facts: &PipeExampleFacts) -> String {
         .join(" ")
 }
 
-fn vulkan_prores_filter(aspect: &str) -> String {
+// Explicit same-size conversion is required with Vulkan's noauto_conversion_filters.
+// Pin matrix and range on both sides; this only subsamples/reduces precision.
+const PROXY_CONVERSION: &str =
+    "scale=w=iw:h=ih:in_color_matrix=bt2020:out_color_matrix=bt2020:in_range=tv:out_range=tv,";
+
+fn vulkan_prores_filter(aspect: &str, output_kind: ExportOutputKind) -> String {
+    let conversion = if output_kind == ExportOutputKind::ProResProxy {
+        "yuv422p10le"
+    } else {
+        "yuv444p12le"
+    };
+    let scale = if output_kind == ExportOutputKind::ProResProxy {
+        PROXY_CONVERSION
+    } else {
+        ""
+    };
     format!(
-        "setsar=1,setdar={aspect},setparams=range=tv:color_primaries=bt2020:color_trc=2:colorspace=bt2020nc,format=yuv444p12le,hwupload"
+        "setsar=1,setdar={aspect},setparams=range=tv:color_primaries=bt2020:color_trc=2:colorspace=bt2020nc,{scale}format={conversion},hwupload"
     )
 }
 
-fn videotoolbox_prores_filter(aspect: &str) -> String {
+fn videotoolbox_prores_filter(aspect: &str, output_kind: ExportOutputKind) -> String {
+    let conversion = if output_kind == ExportOutputKind::ProResProxy {
+        "p210le"
+    } else {
+        "p410le"
+    };
+    let scale = if output_kind == ExportOutputKind::ProResProxy {
+        PROXY_CONVERSION
+    } else {
+        ""
+    };
     format!(
-        "setsar=1,setdar={aspect},setparams=range=tv:color_primaries=bt2020:color_trc=2:colorspace=bt2020nc,format=p410le"
+        "setsar=1,setdar={aspect},setparams=range=tv:color_primaries=bt2020:color_trc=2:colorspace=bt2020nc,{scale}format={conversion}"
     )
 }
 

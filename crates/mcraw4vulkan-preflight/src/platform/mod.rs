@@ -2,7 +2,7 @@
 use std::env;
 #[cfg(any(target_os = "linux", test))]
 use std::path::Path;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 use std::path::PathBuf;
 
 use crate::{HardwareSummary, MountBackendKind, PlatformSummary, PreflightRequirementStatus};
@@ -48,7 +48,7 @@ pub(crate) fn path_value() -> Option<String> {
     env::var_os("PATH").map(|value| value.to_string_lossy().into_owned())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn absolute_path(parts: &[&str]) -> PathBuf {
     let mut path = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
     for part in parts {
@@ -74,6 +74,7 @@ pub(crate) fn find_executable_in_path_list(
         .find(|candidate| is_executable_file(candidate))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn availability_detail(
     available: bool,
     available_detail: &str,

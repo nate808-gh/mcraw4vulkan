@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::virtual_fs::{VirtualFileSystemConfig, VirtualFileSystemStatsSnapshot};
+use crate::virtual_fs::VirtualFileSystemConfig;
 
 const LINUX_FUSE3_NOTES: &[&str] = &[
     "Linux FUSE3/fuser adapter is implemented for Linux builds.",
@@ -11,18 +11,13 @@ const LINUX_FUSE3_NOTES: &[&str] = &[
 ];
 
 const MACOS_MACFUSE_NOTES: &[&str] = &[
-    "macFUSE adapter is implemented for macOS builds.",
+    "macOS FUSE3 callbacks use macFUSE FSKit with real per-clip home-directory mounts.",
     "Shared virtual filesystem state remains the source of truth for mounted DNG and sidecar bytes.",
 ];
 
 const WINDOWS_PROJFS_NOTES: &[&str] = &[
     "Windows ProjFS adapter is implemented for Windows builds.",
     "Shared virtual filesystem state remains the source of truth; materialized placeholders must not own DNG bytes.",
-];
-
-const WINDOWS_PROJFS_PLACEHOLDER_NOTES: &[&str] = &[
-    "ProjFS adapter is a placeholder until native virtualization is implemented.",
-    "VirtualFileSystem remains the source of truth; materialized placeholders must not own DNG bytes.",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +39,7 @@ impl PlatformMountKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::LinuxFuse3 => "Linux FUSE3",
-            Self::MacosMacFuse => "macOS macFUSE",
+            Self::MacosMacFuse => "macOS FUSE3",
             Self::WindowsProjFs => "Windows ProjFS",
         }
     }
@@ -119,23 +114,6 @@ impl PlatformMountCapabilities {
             virtual_file_source_of_truth: true,
             supports_virtual_read_ranges: true,
             notes: MACOS_MACFUSE_NOTES,
-        }
-    }
-
-    pub fn windows_projfs_placeholder() -> Self {
-        Self {
-            kind: PlatformMountKind::WindowsProjFs,
-            supports_live_mount: false,
-            supports_request_unmount: false,
-            supports_wait_until_unmounted: false,
-            requires_empty_mount_root: false,
-            requires_writable_mount_root: true,
-            requires_native_driver: true,
-            may_materialize_placeholders: true,
-            may_need_mount_root_cleanup: true,
-            virtual_file_source_of_truth: true,
-            supports_virtual_read_ranges: true,
-            notes: WINDOWS_PROJFS_PLACEHOLDER_NOTES,
         }
     }
 
@@ -299,6 +277,5 @@ pub trait PlatformMountHandle {
     where
         Self: Sized;
     fn status(&self) -> PlatformMountStatus;
-    fn stats_snapshot(&self) -> Result<Option<VirtualFileSystemStatsSnapshot>>;
     fn capabilities(&self) -> PlatformMountCapabilities;
 }

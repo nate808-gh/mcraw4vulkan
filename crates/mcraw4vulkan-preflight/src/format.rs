@@ -21,7 +21,7 @@ pub(crate) fn mount_backend_line(
             "FUSE3: found".to_string()
         }
         (MountBackendKind::MacosMacFuse, PreflightRequirementStatus::Available) => {
-            "macFUSE: found".to_string()
+            "DNG mounting: provider found".to_string()
         }
         (MountBackendKind::WindowsProjFs, PreflightRequirementStatus::Available) => {
             "ProjFS: enabled".to_string()

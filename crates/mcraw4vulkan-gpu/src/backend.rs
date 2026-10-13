@@ -39,14 +39,12 @@ pub enum GpuBackendPreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuDecodeConfig {
     pub backend_preference: GpuBackendPreference,
-    pub enable_gpu_timestamps: bool,
 }
 
 impl Default for GpuDecodeConfig {
     fn default() -> Self {
         Self {
             backend_preference: GpuBackendPreference::Auto,
-            enable_gpu_timestamps: false,
         }
     }
 }
@@ -107,7 +105,6 @@ impl GpuDecodeRequiredLimits {
 pub struct GpuDecodeBackend {
     adapter_info: wgpu::AdapterInfo,
     limits: wgpu::Limits,
-    timestamp_support: GpuTimestampSupport,
     // GPU child resources precede queue/device because Rust drops fields in
     // declaration order. Buffers and pipelines therefore release before their
     // device when the backend is torn down.
@@ -130,8 +127,6 @@ pub struct GpuNoReadbackSlotAllocation {
     pub packed_output_bytes: u64,
     pub params_bytes: u64,
     pub retained_readback_bytes: u64,
-    pub retained_mappable_output_bytes: u64,
-    pub timestamp_buffer_bytes: u64,
     pub host_raw_upload_scratch_capacity: u64,
     pub host_work_item_scratch_capacity: u64,
 }
@@ -142,8 +137,6 @@ impl GpuNoReadbackSlotAllocation {
             .checked_add(self.work_item_bytes)
             .and_then(|value| value.checked_add(self.params_bytes))
             .and_then(|value| value.checked_add(self.retained_readback_bytes))
-            .and_then(|value| value.checked_add(self.retained_mappable_output_bytes))
-            .and_then(|value| value.checked_add(self.timestamp_buffer_bytes))
             .context("decoder extra GPU allocation byte count overflow")
     }
 
@@ -267,46 +260,6 @@ pub struct GpuSubmittedNoReadbackGpuStageOutput<S> {
     pub expected_invocations: usize,
     pub timings: GpuDecodeTimings,
     pub vignette_stats: Option<GpuVignetteCorrectionStats>,
-    pub gpu_timestamps: GpuSubmittedTimestampProfile,
-}
-
-// Lightweight descriptor for timestamp data resolved as part of a submitted
-// no-readback GPU-stage frame. The query resources themselves remain owned by
-// the backend slot so callers can retire frames without taking GPU resources out
-// of the backend.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GpuSubmittedTimestampProfile {
-    pub support: GpuTimestampSupport,
-    pub output_clear_stage: bool,
-    pub vignette_stage: bool,
-    pub preview_render_stage: bool,
-}
-
-impl GpuSubmittedTimestampProfile {
-    fn unavailable(support: GpuTimestampSupport) -> Self {
-        Self {
-            support,
-            output_clear_stage: false,
-            vignette_stage: false,
-            preview_render_stage: false,
-        }
-    }
-
-    fn from_stage_mask(support: GpuTimestampSupport, stages: GpuTimestampStageMask) -> Self {
-        Self {
-            support,
-            output_clear_stage: stages.output_clear,
-            vignette_stage: stages.vignette,
-            preview_render_stage: true,
-        }
-    }
-
-    fn stage_mask(self) -> GpuTimestampStageMask {
-        GpuTimestampStageMask {
-            output_clear: self.output_clear_stage,
-            vignette: self.vignette_stage,
-        }
-    }
 }
 
 // Input for an in-flight mapped packed-u16 batch decode.
@@ -531,7 +484,6 @@ pub struct GpuDecodeTimings {
     pub readback_convert: Duration,
     pub dispatch_readback: Duration,
     pub total: Duration,
-    pub gpu_timestamps: GpuTimestampProfile,
 }
 
 impl GpuDecodeTimings {
@@ -566,7 +518,6 @@ impl GpuDecodeTimings {
             readback_convert: dispatch.readback_convert,
             dispatch_readback: dispatch.total,
             total,
-            gpu_timestamps: dispatch.gpu_timestamps,
         }
     }
 
@@ -646,67 +597,6 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-// Adapter/device timestamp-query capability for the reusable decode backend.
-//
-// Timestamp profiling is opt-in. When requested but unsupported, the backend is
-// still created without timestamp features and decode output behavior is
-// unchanged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GpuTimestampSupport {
-    pub requested: bool,
-    pub supported: bool,
-    pub enabled: bool,
-    pub period_ps: u64,
-}
-
-impl GpuTimestampSupport {
-    pub fn period_ns(self) -> Option<f64> {
-        (self.period_ps != 0).then(|| self.period_ps as f64 / 1_000.0)
-    }
-}
-
-// GPU-side timestamp-query profile for one packed-u16 decode submission.
-//
-// These durations are derived from GPU timestamp query deltas. They are separate
-// from CPU-side encode/submit/map timings and are only populated when timestamp
-// profiling was requested, supported, and enabled for the device.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GpuTimestampProfile {
-    pub requested: bool,
-    pub supported: bool,
-    pub enabled: bool,
-    pub period_ps: u64,
-    pub samples_valid: bool,
-    pub output_clear: Option<Duration>,
-    pub decode_dispatch: Option<Duration>,
-    pub vignette_dispatch: Option<Duration>,
-    pub copy_to_readback: Option<Duration>,
-    pub total_command: Option<Duration>,
-    pub query_resolve_readback: Duration,
-}
-
-impl GpuTimestampProfile {
-    fn unavailable(support: GpuTimestampSupport) -> Self {
-        Self {
-            requested: support.requested,
-            supported: support.supported,
-            enabled: support.enabled,
-            period_ps: support.period_ps,
-            samples_valid: false,
-            output_clear: None,
-            decode_dispatch: None,
-            vignette_dispatch: None,
-            copy_to_readback: None,
-            total_command: None,
-            query_resolve_readback: Duration::ZERO,
-        }
-    }
-
-    pub fn period_ns(self) -> Option<f64> {
-        (self.period_ps != 0).then(|| self.period_ps as f64 / 1_000.0)
-    }
-}
-
 // Reusable GPU buffers owned by one GpuDecodeBackend.
 //
 // These buffers grow when needed and are then reused across later frames. This is
@@ -721,7 +611,6 @@ struct ReusableGpuBuffers {
     params: Option<SizedGpuBuffer>,
     bind_group: Option<wgpu::BindGroup>,
     vignette_corrector: Option<GpuVignetteCorrector>,
-    timestamp_recorder: Option<GpuTimestampRecorder>,
 
     // CPU-side upload staging reused across frames.
     //
@@ -743,20 +632,12 @@ struct SizedGpuBuffer {
 
 impl ReusableGpuBuffers {
     fn allocation_snapshot(&self) -> GpuNoReadbackSlotAllocation {
-        #[allow(unused_variables)]
-        let retained_mappable_output_bytes = 0;
         GpuNoReadbackSlotAllocation {
             raw_payload_bytes: self.raw_payload.as_ref().map_or(0, |buffer| buffer.size),
             work_item_bytes: self.work_items.as_ref().map_or(0, |buffer| buffer.size),
             packed_output_bytes: self.output.as_ref().map_or(0, |buffer| buffer.size),
             params_bytes: self.params.as_ref().map_or(0, |buffer| buffer.size),
             retained_readback_bytes: self.readback.as_ref().map_or(0, |buffer| buffer.size),
-            retained_mappable_output_bytes,
-            timestamp_buffer_bytes: if self.timestamp_recorder.is_some() {
-                GPU_TIMESTAMP_READBACK_BYTES.saturating_mul(2)
-            } else {
-                0
-            },
             host_raw_upload_scratch_capacity: u64::try_from(
                 self.raw_payload_upload_scratch.capacity(),
             )
@@ -962,7 +843,6 @@ struct GpuDispatchTimings {
     mapped_consumer: Duration,
     readback_convert: Duration,
     total: Duration,
-    gpu_timestamps: GpuTimestampProfile,
 }
 
 // Result from one GPU dispatch/readback operation that lets the caller consume
@@ -997,251 +877,8 @@ struct PendingNoReadbackGpuStageDispatchWithVignetteResult<S> {
     stage: S,
     submission_index: wgpu::SubmissionIndex,
     dispatch_start: Instant,
-    gpu_timestamps: GpuSubmittedTimestampProfile,
     timings: GpuDispatchTimings,
     vignette_stats: Option<GpuVignetteCorrectionStats>,
-}
-
-const GPU_TIMESTAMP_QUERY_COUNT: u32 = 10;
-const GPU_TIMESTAMP_QUERY_COUNT_USIZE: usize = GPU_TIMESTAMP_QUERY_COUNT as usize;
-const GPU_TIMESTAMP_READBACK_BYTES: u64 =
-    GPU_TIMESTAMP_QUERY_COUNT as u64 * wgpu::QUERY_SIZE as u64;
-
-#[derive(Clone, Copy)]
-#[repr(u32)]
-enum GpuTimestampQuery {
-    TotalStart = 0,
-    OutputClearStart = 1,
-    OutputClearEnd = 2,
-    DecodeDispatchStart = 3,
-    DecodeDispatchEnd = 4,
-    VignetteDispatchStart = 5,
-    VignetteDispatchEnd = 6,
-    CopyToReadbackStart = 7,
-    CopyToReadbackEnd = 8,
-    TotalEnd = 9,
-}
-
-#[derive(Clone, Copy)]
-struct GpuTimestampStageMask {
-    output_clear: bool,
-    vignette: bool,
-}
-
-struct GpuTimestampRecorder {
-    query_set: wgpu::QuerySet,
-    resolve_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
-    support: GpuTimestampSupport,
-}
-
-impl GpuTimestampRecorder {
-    fn new(
-        device: &wgpu::Device,
-        support: GpuTimestampSupport,
-        label: &'static str,
-    ) -> Option<Self> {
-        if !support.enabled {
-            return None;
-        }
-
-        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some(label),
-            ty: wgpu::QueryType::Timestamp,
-            count: GPU_TIMESTAMP_QUERY_COUNT,
-        });
-        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MCRAW GPU timestamp resolve buffer"),
-            size: GPU_TIMESTAMP_READBACK_BYTES,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MCRAW GPU timestamp readback buffer"),
-            size: GPU_TIMESTAMP_READBACK_BYTES,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        Some(Self {
-            query_set,
-            resolve_buffer,
-            readback_buffer,
-            support,
-        })
-    }
-
-    fn write(&self, encoder: &mut wgpu::CommandEncoder, query: GpuTimestampQuery) {
-        encoder.write_timestamp(&self.query_set, query as u32);
-    }
-
-    fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        encoder.resolve_query_set(
-            &self.query_set,
-            0..GPU_TIMESTAMP_QUERY_COUNT,
-            &self.resolve_buffer,
-            0,
-        );
-        encoder.copy_buffer_to_buffer(
-            &self.resolve_buffer,
-            0,
-            &self.readback_buffer,
-            0,
-            GPU_TIMESTAMP_READBACK_BYTES,
-        );
-    }
-
-    fn read_profile(
-        &self,
-        device: &wgpu::Device,
-        submission_index: wgpu::SubmissionIndex,
-        stages: GpuTimestampStageMask,
-    ) -> Result<GpuTimestampProfile> {
-        let query_readback_start = Instant::now();
-        let timestamp_slice = self.readback_buffer.slice(0..GPU_TIMESTAMP_READBACK_BYTES);
-
-        let (sender, receiver) = mpsc::channel();
-        timestamp_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-
-        device.poll(wgpu::Maintain::wait_for(submission_index.clone()));
-
-        let map_result = receiver
-            .recv_timeout(Duration::from_secs(30))
-            .context("timed out waiting for MCRAW GPU timestamp mapping callback")?;
-
-        map_result.map_err(|error| anyhow!("failed to map MCRAW timestamp buffer: {error:?}"))?;
-
-        let mut samples = [0u64; GPU_TIMESTAMP_QUERY_COUNT_USIZE];
-        {
-            let mapped = timestamp_slice.get_mapped_range();
-            if mapped.len() != GPU_TIMESTAMP_READBACK_BYTES as usize {
-                anyhow::bail!(
-                    "GPU timestamp readback byte length mismatch: expected={} actual={}",
-                    GPU_TIMESTAMP_READBACK_BYTES,
-                    mapped.len()
-                );
-            }
-            for (index, chunk) in mapped.chunks_exact(8).enumerate() {
-                samples[index] = u64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ]);
-            }
-        }
-
-        self.readback_buffer.unmap();
-
-        let mut profile = gpu_timestamp_profile_from_samples(self.support, &samples, stages);
-        profile.query_resolve_readback = query_readback_start.elapsed();
-        Ok(profile)
-    }
-}
-
-fn ensure_timestamp_recorder<'a>(
-    device: &wgpu::Device,
-    recorder: &'a mut Option<GpuTimestampRecorder>,
-    support: GpuTimestampSupport,
-    label: &'static str,
-) -> Option<&'a GpuTimestampRecorder> {
-    if !support.enabled {
-        return None;
-    }
-    if recorder.is_none() {
-        *recorder = GpuTimestampRecorder::new(device, support, label);
-    }
-    recorder.as_ref()
-}
-
-fn read_submitted_timestamp_profile(
-    device: &wgpu::Device,
-    recorder: Option<&GpuTimestampRecorder>,
-    submission_index: wgpu::SubmissionIndex,
-    submitted: GpuSubmittedTimestampProfile,
-) -> Result<GpuTimestampProfile> {
-    if !submitted.support.enabled {
-        return Ok(GpuTimestampProfile::unavailable(submitted.support));
-    }
-    let recorder = recorder.context("GPU timestamp recorder was not allocated for submission")?;
-    recorder.read_profile(device, submission_index, submitted.stage_mask())
-}
-
-fn gpu_timestamp_required_features() -> wgpu::Features {
-    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-}
-
-fn timestamp_period_ps(period_ns: f32) -> u64 {
-    (f64::from(period_ns) * 1_000.0).round() as u64
-}
-
-fn gpu_timestamp_profile_from_samples(
-    support: GpuTimestampSupport,
-    samples: &[u64; GPU_TIMESTAMP_QUERY_COUNT_USIZE],
-    stages: GpuTimestampStageMask,
-) -> GpuTimestampProfile {
-    let total_command = timestamp_delta_duration(
-        samples[GpuTimestampQuery::TotalStart as usize],
-        samples[GpuTimestampQuery::TotalEnd as usize],
-        support.period_ps,
-    );
-    let output_clear = stages.output_clear.then(|| {
-        timestamp_delta_duration(
-            samples[GpuTimestampQuery::OutputClearStart as usize],
-            samples[GpuTimestampQuery::OutputClearEnd as usize],
-            support.period_ps,
-        )
-    });
-    let decode_dispatch = timestamp_delta_duration(
-        samples[GpuTimestampQuery::DecodeDispatchStart as usize],
-        samples[GpuTimestampQuery::DecodeDispatchEnd as usize],
-        support.period_ps,
-    );
-    let vignette_dispatch = stages.vignette.then(|| {
-        timestamp_delta_duration(
-            samples[GpuTimestampQuery::VignetteDispatchStart as usize],
-            samples[GpuTimestampQuery::VignetteDispatchEnd as usize],
-            support.period_ps,
-        )
-    });
-    let copy_to_readback = timestamp_delta_duration(
-        samples[GpuTimestampQuery::CopyToReadbackStart as usize],
-        samples[GpuTimestampQuery::CopyToReadbackEnd as usize],
-        support.period_ps,
-    );
-
-    let output_clear = output_clear.flatten();
-    let vignette_dispatch = vignette_dispatch.flatten();
-    let samples_valid = total_command.is_some()
-        && decode_dispatch.is_some()
-        && copy_to_readback.is_some()
-        && (!stages.output_clear || output_clear.is_some())
-        && (!stages.vignette || vignette_dispatch.is_some());
-
-    GpuTimestampProfile {
-        requested: support.requested,
-        supported: support.supported,
-        enabled: support.enabled,
-        period_ps: support.period_ps,
-        samples_valid,
-        output_clear,
-        decode_dispatch,
-        vignette_dispatch,
-        copy_to_readback,
-        total_command,
-        query_resolve_readback: Duration::ZERO,
-    }
-}
-
-fn timestamp_delta_duration(start: u64, end: u64, period_ps: u64) -> Option<Duration> {
-    if period_ps == 0 || end < start {
-        return None;
-    }
-
-    let delta_ticks = u128::from(end - start);
-    let total_ps = delta_ticks.checked_mul(u128::from(period_ps))?;
-    let nanos = (total_ps + 500) / 1_000;
-    let nanos = u64::try_from(nanos).ok()?;
-    Some(Duration::from_nanos(nanos))
 }
 
 // GPU output layout selected by a decode path.
@@ -1423,14 +1060,7 @@ impl GpuDecodeBackend {
         let adapter_info = selected.info;
         let adapter_limits = selected.adapter.limits();
         let requested_limits = requested_device_limits(&adapter_limits, required_limits.as_ref())?;
-        let adapter_features = selected.adapter.features();
-        let timestamp_features = gpu_timestamp_required_features();
-        let timestamp_supported = adapter_features.contains(timestamp_features);
-        let timestamp_enabled = config.enable_gpu_timestamps && timestamp_supported;
-        let mut required_features = wgpu::Features::empty();
-        if timestamp_enabled {
-            required_features |= timestamp_features;
-        }
+        let required_features = wgpu::Features::empty();
         let (device, queue) = selected
             .adapter
             .request_device(
@@ -1444,16 +1074,6 @@ impl GpuDecodeBackend {
             )
             .await
             .context("failed to create wgpu device and queue")?;
-        let timestamp_support = GpuTimestampSupport {
-            requested: config.enable_gpu_timestamps,
-            supported: timestamp_supported,
-            enabled: timestamp_enabled,
-            period_ps: if timestamp_enabled {
-                timestamp_period_ps(queue.get_timestamp_period())
-            } else {
-                0
-            },
-        };
         let decode_bind_group_layout = create_decode_bind_group_layout(&device);
         let packed_u16_pipeline = create_decode_pipeline(
             &device,
@@ -1475,7 +1095,6 @@ impl GpuDecodeBackend {
         Ok(Self {
             adapter_info,
             limits,
-            timestamp_support,
             buffers: ReusableGpuBuffers::default(),
             pipeline_slots: Vec::new(),
             packed_u16_pipeline,
@@ -1498,25 +1117,9 @@ impl GpuDecodeBackend {
 
     pub fn from_wgpu_device(
         adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
         device: wgpu::Device,
         queue: wgpu::Queue,
-        config: GpuDecodeConfig,
     ) -> Result<Self> {
-        let timestamp_features = gpu_timestamp_required_features();
-        let timestamp_supported = adapter_features.contains(timestamp_features);
-        let timestamp_enabled = config.enable_gpu_timestamps && timestamp_supported;
-        if config.enable_gpu_timestamps && !timestamp_supported {
-            anyhow::bail!(
-                "GPU timestamps requested but adapter does not support timestamp query features"
-            );
-        }
-        if timestamp_enabled && !device.features().contains(timestamp_features) {
-            anyhow::bail!(
-                "GPU timestamps requested but device was not created with timestamp query features"
-            );
-        }
-
         let decode_bind_group_layout = create_decode_bind_group_layout(&device);
         let packed_u16_pipeline = create_decode_pipeline(
             &device,
@@ -1534,20 +1137,9 @@ impl GpuDecodeBackend {
         );
 
         let limits = device.limits();
-        let timestamp_support = GpuTimestampSupport {
-            requested: config.enable_gpu_timestamps,
-            supported: timestamp_supported,
-            enabled: timestamp_enabled,
-            period_ps: if timestamp_enabled {
-                timestamp_period_ps(queue.get_timestamp_period())
-            } else {
-                0
-            },
-        };
         Ok(Self {
             adapter_info,
             limits,
-            timestamp_support,
             buffers: ReusableGpuBuffers::default(),
             pipeline_slots: Vec::new(),
             packed_u16_pipeline,
@@ -1739,10 +1331,6 @@ impl GpuDecodeBackend {
         ))
     }
 
-    pub fn gpu_timestamp_support(&self) -> GpuTimestampSupport {
-        self.timestamp_support
-    }
-
     // Create an isolated vignette GPU corrector on this backend's device.
     //
     // The corrector is owned by the caller so it can be reused across frames
@@ -1816,7 +1404,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             pixel_count,
@@ -1877,7 +1464,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             pixel_count,
@@ -1971,7 +1557,6 @@ impl GpuDecodeBackend {
             &self.queue,
             &self.legacy_raw16_packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             work_plan.chunk_count,
@@ -2214,7 +1799,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             pixel_count,
@@ -2287,7 +1871,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             work_plan.blocks,
             pixel_count,
@@ -2356,7 +1939,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             pixel_count,
@@ -2424,7 +2006,6 @@ impl GpuDecodeBackend {
             &self.queue,
             &self.legacy_raw16_packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             work_plan.chunk_count,
@@ -2465,7 +2046,7 @@ impl GpuDecodeBackend {
     ///
     /// This is the nonblocking counterpart of
     /// [`Self::decode_legacy_raw16_payload_packed_u16_gpu_stage_no_readback_with_vignette`].
-    /// With timestamps disabled, the same slot may be reused immediately after
+    /// The same slot may be reused immediately after
     /// submit only when every later command is submitted to this same ordered
     /// queue and the consumer has copied its result into independently retained
     /// storage. Otherwise the selected slot must not be reused until
@@ -2554,7 +2135,6 @@ impl GpuDecodeBackend {
             &self.queue,
             &self.legacy_raw16_packed_u16_pipeline,
             slot_buffers,
-            self.timestamp_support,
             raw_payload,
             prepared.blocks,
             prepared.chunk_count,
@@ -2590,7 +2170,6 @@ impl GpuDecodeBackend {
                 gpu_total_without_wait,
             ),
             vignette_stats: dispatch_result.vignette_stats,
-            gpu_timestamps: dispatch_result.gpu_timestamps,
         })
     }
 
@@ -2889,7 +2468,6 @@ impl GpuDecodeBackend {
             expected_invocations: 0,
             timings,
             vignette_stats,
-            gpu_timestamps: GpuSubmittedTimestampProfile::unavailable(self.timestamp_support),
         })
     }
 
@@ -2929,7 +2507,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             &mut self.buffers,
-            self.timestamp_support,
             raw_payload,
             work_plan.blocks,
             pixel_count,
@@ -2996,7 +2573,7 @@ impl GpuDecodeBackend {
 
     /// Submit one type-7 frame into a reusable backend slot.
     ///
-    /// With timestamps disabled, the same slot may be reused immediately after
+    /// The same slot may be reused immediately after
     /// submit only when every later command is submitted to this same ordered
     /// queue and the consumer has copied its result into independently retained
     /// storage. Otherwise the selected slot must not be reused until
@@ -3040,7 +2617,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             slot_buffers,
-            self.timestamp_support,
             raw_payload,
             &work_plan.blocks,
             pixel_count,
@@ -3072,7 +2648,6 @@ impl GpuDecodeBackend {
                 gpu_total_without_wait,
             ),
             vignette_stats: dispatch_result.vignette_stats,
-            gpu_timestamps: dispatch_result.gpu_timestamps,
         })
     }
 
@@ -3120,7 +2695,6 @@ impl GpuDecodeBackend {
             &self.queue,
             packed_u16_pipeline,
             slot_buffers,
-            self.timestamp_support,
             raw_payload,
             prepared.work_plan.blocks,
             pixel_count,
@@ -3154,25 +2728,7 @@ impl GpuDecodeBackend {
                 gpu_total_without_wait,
             ),
             vignette_stats: dispatch_result.vignette_stats,
-            gpu_timestamps: dispatch_result.gpu_timestamps,
         })
-    }
-
-    pub fn read_submitted_no_readback_slot_timestamps<S>(
-        &self,
-        slot_index: usize,
-        submitted: &GpuSubmittedNoReadbackGpuStageOutput<S>,
-    ) -> Result<GpuTimestampProfile> {
-        let slot_buffers = self
-            .pipeline_slots
-            .get(slot_index)
-            .context("GPU no-readback timestamp slot was not allocated")?;
-        read_submitted_timestamp_profile(
-            &self.device,
-            slot_buffers.timestamp_recorder.as_ref(),
-            submitted.submission_index.clone(),
-            submitted.gpu_timestamps,
-        )
     }
 
     // Streaming ring over the normal mapped packed-u16 readback
@@ -3313,7 +2869,6 @@ impl GpuDecodeBackend {
                 &self.queue,
                 packed_u16_pipeline,
                 &mut self.pipeline_slots[slot_index],
-                self.timestamp_support,
                 slot_index,
                 input_index,
                 frame.frame_index,
@@ -3431,7 +2986,6 @@ impl GpuDecodeBackend {
                 &self.queue,
                 packed_u16_pipeline,
                 &mut self.pipeline_slots[slot_index],
-                self.timestamp_support,
                 slot_index,
                 input_index,
                 input.frame_index,
@@ -3621,7 +3175,6 @@ fn run_mcraw_gpu_dispatch_packed_u16_mapped<T, F>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -3639,7 +3192,6 @@ where
         queue,
         pipeline,
         buffers,
-        timestamp_support,
         raw_payload,
         work_items,
         pixel_count,
@@ -3657,7 +3209,6 @@ fn run_mcraw_gpu_dispatch_packed_u16_mapped_with_vignette<T, F>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -3676,7 +3227,6 @@ where
         queue,
         pipeline,
         buffers,
-        timestamp_support,
         raw_payload,
         work_items,
         pixel_count,
@@ -3695,7 +3245,6 @@ fn run_mcraw_gpu_dispatch_mapped<T, F>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -3713,7 +3262,6 @@ where
         queue,
         pipeline,
         buffers,
-        timestamp_support,
         raw_payload,
         work_items,
         pixel_count,
@@ -3737,7 +3285,6 @@ fn run_mcraw_gpu_dispatch_mapped_with_vignette<T, F>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -3872,18 +3419,7 @@ where
         label: Some("MCRAW GPU decode command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder =
-        GpuTimestampRecorder::new(device, timestamp_support, "MCRAW GPU decode timestamps");
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     // The shader assembles each packed word with atomicOr, which cannot clear
     // bits retained by a reused output buffer. Zero it before every dispatch.
@@ -3892,11 +3428,6 @@ where
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(output_byte_len));
         output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -3910,11 +3441,6 @@ where
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
@@ -3935,11 +3461,6 @@ where
             })
             .context("failed to dispatch GPU vignette correction")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         let copy_to_readback_encode_start = Instant::now();
         readback_byte_len = dispatch.stats.output_buffer_bytes;
         anyhow::ensure!(
@@ -3956,19 +3477,9 @@ where
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
     } else {
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         let copy_to_readback_encode_start = Instant::now();
         encoder.copy_buffer_to_buffer(output_buffer, 0, readback_buffer, 0, output_byte_len);
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
     }
 
     let command_finish_submit_start = Instant::now();
@@ -4012,11 +3523,6 @@ where
     readback_buffer.unmap();
 
     let value = consume_result?;
-    let gpu_timestamps = if let Some(timestamps) = timestamp_recorder {
-        timestamps.read_profile(device, submission_index, timestamp_stages)?
-    } else {
-        GpuTimestampProfile::unavailable(timestamp_support)
-    };
 
     Ok(GpuMappedDispatchWithVignetteResult {
         value,
@@ -4054,7 +3560,6 @@ where
             mapped_consumer: mapped_consumer_elapsed,
             readback_convert: Duration::ZERO,
             total: dispatch_readback_elapsed,
-            gpu_timestamps,
         },
         vignette_stats,
     })
@@ -4066,7 +3571,6 @@ fn run_legacy_raw16_gpu_dispatch_mapped_with_vignette<T, F>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     chunk_count: usize,
@@ -4196,32 +3700,13 @@ where
         label: Some("MCRAW legacy raw16 GPU decode command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder = GpuTimestampRecorder::new(
-        device,
-        timestamp_support,
-        "MCRAW legacy raw16 GPU decode timestamps",
-    );
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     let mut output_clear_encode_elapsed = Duration::ZERO;
     if output_clear_enabled {
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(output_byte_len));
         output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -4235,11 +3720,6 @@ where
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
@@ -4260,11 +3740,6 @@ where
             })
             .context("failed to dispatch GPU vignette correction for legacy raw16")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         let copy_to_readback_encode_start = Instant::now();
         readback_byte_len = dispatch.stats.output_buffer_bytes;
         anyhow::ensure!(
@@ -4281,19 +3756,9 @@ where
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
     } else {
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         let copy_to_readback_encode_start = Instant::now();
         encoder.copy_buffer_to_buffer(output_buffer, 0, readback_buffer, 0, output_byte_len);
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
     }
 
     let command_finish_submit_start = Instant::now();
@@ -4327,11 +3792,6 @@ where
     readback_buffer.unmap();
 
     let value = consume_result?;
-    let gpu_timestamps = if let Some(timestamps) = timestamp_recorder {
-        timestamps.read_profile(device, submission_index, timestamp_stages)?
-    } else {
-        GpuTimestampProfile::unavailable(timestamp_support)
-    };
 
     Ok(GpuMappedDispatchWithVignetteResult {
         value,
@@ -4369,7 +3829,6 @@ where
             mapped_consumer: mapped_consumer_elapsed,
             readback_convert: Duration::ZERO,
             total: dispatch_readback_elapsed,
-            gpu_timestamps,
         },
         vignette_stats,
     })
@@ -4381,7 +3840,6 @@ fn run_mcraw_gpu_dispatch_packed_u16_mapped_with_gpu_stage<T, S, E, C>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -4519,32 +3977,13 @@ where
         label: Some("MCRAW GPU decode/stage command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder = GpuTimestampRecorder::new(
-        device,
-        timestamp_support,
-        "MCRAW GPU decode/stage timestamps",
-    );
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     let mut decode_output_clear_encode_elapsed = Duration::ZERO;
     if output_clear_enabled {
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(decode_output_byte_len));
         decode_output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -4558,11 +3997,6 @@ where
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
@@ -4581,11 +4015,6 @@ where
             })
             .context("failed to dispatch GPU vignette correction before downstream GPU stage")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         vignette_stats = Some(dispatch.stats);
         encode_gpu_stage(
             device,
@@ -4599,10 +4028,6 @@ where
             },
         )?
     } else {
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         encode_gpu_stage(
             device,
             queue,
@@ -4615,12 +4040,6 @@ where
             },
         )?
     };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
-    }
 
     let command_finish_submit_start = Instant::now();
     let submission_index = queue.submit(Some(encoder.finish()));
@@ -4670,11 +4089,6 @@ where
     stage_readback.buffer.unmap();
 
     let value = consume_result?;
-    let gpu_timestamps = if let Some(timestamps) = timestamp_recorder {
-        timestamps.read_profile(device, submission_index, timestamp_stages)?
-    } else {
-        GpuTimestampProfile::unavailable(timestamp_support)
-    };
 
     Ok(GpuMappedGpuStageDispatchWithVignetteResult {
         value,
@@ -4713,19 +4127,18 @@ where
             mapped_consumer: mapped_consumer_elapsed,
             readback_convert: Duration::ZERO,
             total: dispatch_readback_elapsed,
-            gpu_timestamps,
         },
         vignette_stats,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
 fn run_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage<S, E>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -4750,7 +4163,6 @@ where
         queue,
         pipeline,
         buffers,
-        timestamp_support,
         raw_payload,
         work_items,
         pixel_count,
@@ -4762,16 +4174,19 @@ where
         visible_dimensions,
         encode_gpu_stage,
     )?;
-    wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage(device, buffers, pending)
+    wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage(
+        device,
+        pending,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
 fn run_legacy_raw16_gpu_dispatch_no_readback_with_gpu_stage<S, E>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     chunk_count: usize,
@@ -4797,7 +4212,6 @@ where
         queue,
         pipeline,
         buffers,
-        timestamp_support,
         raw_payload,
         work_items,
         chunk_count,
@@ -4810,7 +4224,10 @@ where
         visible_dimensions,
         encode_gpu_stage,
     )?;
-    wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage(device, buffers, pending)
+    wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage(
+        device,
+        pending,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4819,7 +4236,6 @@ fn submit_legacy_raw16_gpu_dispatch_no_readback_with_gpu_stage<S, E>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     chunk_count: usize,
@@ -4949,33 +4365,13 @@ where
         label: Some("MCRAW legacy raw16 GPU decode/no-readback-stage command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder = ensure_timestamp_recorder(
-        device,
-        &mut buffers.timestamp_recorder,
-        timestamp_support,
-        "MCRAW legacy raw16 no-readback decode timestamps",
-    );
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     let mut decode_output_clear_encode_elapsed = Duration::ZERO;
     if output_clear_enabled {
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(decode_output_byte_len));
         decode_output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -4989,11 +4385,6 @@ where
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
@@ -5012,11 +4403,6 @@ where
             })
             .context("failed to dispatch GPU vignette correction before legacy raw16 GPU stage")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         vignette_stats = Some(dispatch.stats);
         encode_gpu_stage(
             device,
@@ -5030,10 +4416,6 @@ where
             },
         )?
     } else {
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         encode_gpu_stage(
             device,
             queue,
@@ -5047,26 +4429,16 @@ where
         )?
     };
 
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
-    }
-
     let command_finish_submit_start = Instant::now();
     let submission_index = queue.submit(Some(encoder.finish()));
     let command_finish_submit_elapsed = command_finish_submit_start.elapsed();
     let encode_submit_elapsed = encode_submit_start.elapsed();
     let dispatch_submit_elapsed = total_start.elapsed();
-    let submitted_timestamps = timestamp_recorder
-        .map(|_| GpuSubmittedTimestampProfile::from_stage_mask(timestamp_support, timestamp_stages))
-        .unwrap_or_else(|| GpuSubmittedTimestampProfile::unavailable(timestamp_support));
 
     Ok(PendingNoReadbackGpuStageDispatchWithVignetteResult {
         stage,
         submission_index,
         dispatch_start: total_start,
-        gpu_timestamps: submitted_timestamps,
         timings: GpuDispatchTimings {
             raw_payload_bytes: raw_payload_byte_len,
             work_item_count: work_items.len() as u64,
@@ -5101,7 +4473,6 @@ where
             mapped_consumer: Duration::ZERO,
             readback_convert: Duration::ZERO,
             total: dispatch_submit_elapsed,
-            gpu_timestamps: GpuTimestampProfile::unavailable(timestamp_support),
         },
         vignette_stats,
     })
@@ -5113,7 +4484,6 @@ fn submit_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage<S, E>(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     raw_payload: &[u8],
     work_items: &[McrawVulkanBlockWorkItem],
     pixel_count: usize,
@@ -5249,33 +4619,13 @@ where
         label: Some("MCRAW GPU decode/no-readback-stage command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder = ensure_timestamp_recorder(
-        device,
-        &mut buffers.timestamp_recorder,
-        timestamp_support,
-        "MCRAW GPU decode/no-readback-stage timestamps",
-    );
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     let mut decode_output_clear_encode_elapsed = Duration::ZERO;
     if output_clear_enabled {
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(decode_output_byte_len));
         decode_output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -5289,11 +4639,6 @@ where
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut vignette_stats = None;
     let mut vignette_encode_elapsed = Duration::ZERO;
@@ -5312,11 +4657,6 @@ where
             })
             .context("failed to dispatch GPU vignette correction before no-readback GPU stage")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-        if let Some(timestamps) = timestamp_recorder {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         vignette_stats = Some(dispatch.stats);
         encode_gpu_stage(
             device,
@@ -5330,10 +4670,6 @@ where
             },
         )?
     } else {
-        if let Some(timestamps) = timestamp_recorder {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
         encode_gpu_stage(
             device,
             queue,
@@ -5347,27 +4683,17 @@ where
         )?
     };
 
-    if let Some(timestamps) = timestamp_recorder {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
-    }
-
     let command_finish_submit_start = Instant::now();
     let submission_index = queue.submit(Some(encoder.finish()));
     let command_finish_submit_elapsed = command_finish_submit_start.elapsed();
     let encode_submit_elapsed = encode_submit_start.elapsed();
 
     let dispatch_submit_elapsed = total_start.elapsed();
-    let submitted_timestamps = timestamp_recorder
-        .map(|_| GpuSubmittedTimestampProfile::from_stage_mask(timestamp_support, timestamp_stages))
-        .unwrap_or_else(|| GpuSubmittedTimestampProfile::unavailable(timestamp_support));
 
     Ok(PendingNoReadbackGpuStageDispatchWithVignetteResult {
         stage,
         submission_index,
         dispatch_start: total_start,
-        gpu_timestamps: submitted_timestamps,
         timings: GpuDispatchTimings {
             raw_payload_bytes: raw_payload_byte_len,
             work_item_count: work_items.len() as u64,
@@ -5402,7 +4728,6 @@ where
             mapped_consumer: Duration::ZERO,
             readback_convert: Duration::ZERO,
             total: dispatch_submit_elapsed,
-            gpu_timestamps: GpuTimestampProfile::unavailable(timestamp_support),
         },
         vignette_stats,
     })
@@ -5410,7 +4735,6 @@ where
 
 fn wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage<S>(
     device: &wgpu::Device,
-    buffers: &ReusableGpuBuffers,
     pending: PendingNoReadbackGpuStageDispatchWithVignetteResult<S>,
 ) -> Result<GpuNoReadbackGpuStageDispatchWithVignetteResult<S>> {
     let wait_start = Instant::now();
@@ -5418,16 +4742,9 @@ fn wait_mcraw_gpu_dispatch_packed_u16_no_readback_with_gpu_stage<S>(
     let wait_elapsed = wait_start.elapsed();
 
     let dispatch_elapsed = pending.dispatch_start.elapsed();
-    let gpu_timestamps = read_submitted_timestamp_profile(
-        device,
-        buffers.timestamp_recorder.as_ref(),
-        pending.submission_index,
-        pending.gpu_timestamps,
-    )?;
     let mut timings = pending.timings;
     timings.wait_map = wait_elapsed;
     timings.total = dispatch_elapsed;
-    timings.gpu_timestamps = gpu_timestamps;
 
     Ok(GpuNoReadbackGpuStageDispatchWithVignetteResult {
         stage: pending.stage,
@@ -5455,9 +4772,6 @@ struct PendingMappedDispatch {
     expected_invocations: usize,
     dispatch_timings: GpuDispatchTimings,
     dispatch_start: Instant,
-    timestamp_support: GpuTimestampSupport,
-    timestamp_recorder: Option<GpuTimestampRecorder>,
-    timestamp_stages: GpuTimestampStageMask,
     vignette_stats: Option<GpuVignetteCorrectionStats>,
 }
 
@@ -5475,7 +4789,6 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
     buffers: &mut ReusableGpuBuffers,
-    timestamp_support: GpuTimestampSupport,
     slot_index: usize,
     input_index: usize,
     frame_index: usize,
@@ -5614,21 +4927,7 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         label: Some("MCRAW in-flight GPU decode command encoder"),
     });
     let command_encoder_create_elapsed = command_encoder_create_start.elapsed();
-    let timestamp_recorder = GpuTimestampRecorder::new(
-        device,
-        timestamp_support,
-        "MCRAW in-flight GPU decode timestamps",
-    );
     let output_clear_enabled = output_layout.output_clear_enabled();
-    let mut timestamp_stages = GpuTimestampStageMask {
-        output_clear: output_clear_enabled,
-        vignette: false,
-    };
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalStart);
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearStart);
-    }
 
     // Ring slots retain their output allocation between owners, so clear it
     // before atomic packed writes can inherit bits from the previous owner.
@@ -5637,11 +4936,6 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         let output_clear_encode_start = Instant::now();
         encoder.clear_buffer(output_buffer, 0, Some(output_byte_len));
         output_clear_encode_elapsed = output_clear_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::OutputClearEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchStart);
     }
 
     let decode_pass_encode_start = Instant::now();
@@ -5655,11 +4949,6 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         compute_pass.dispatch_workgroups(dispatch_width, dispatch_height, 1);
     }
     let decode_pass_encode_elapsed = decode_pass_encode_start.elapsed();
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::DecodeDispatchEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchStart);
-    }
 
     let mut readback_byte_len = output_byte_len;
     let mut vignette_stats = None;
@@ -5690,12 +4979,6 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
             })
             .context("failed to dispatch ring-mapped GPU vignette correction")?;
         vignette_encode_elapsed = vignette_encode_start.elapsed();
-        timestamp_stages.vignette = dispatch.stats.dispatch_submitted;
-
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
 
         let copy_to_readback_encode_start = Instant::now();
         readback_byte_len = dispatch.stats.output_buffer_bytes;
@@ -5713,20 +4996,9 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
         vignette_stats = Some(dispatch.stats);
     } else {
-        if let Some(timestamps) = timestamp_recorder.as_ref() {
-            timestamps.write(&mut encoder, GpuTimestampQuery::VignetteDispatchEnd);
-            timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackStart);
-        }
-
         let copy_to_readback_encode_start = Instant::now();
         encoder.copy_buffer_to_buffer(output_buffer, 0, readback_buffer, 0, output_byte_len);
         copy_to_readback_encode_elapsed = copy_to_readback_encode_start.elapsed();
-    }
-
-    if let Some(timestamps) = timestamp_recorder.as_ref() {
-        timestamps.write(&mut encoder, GpuTimestampQuery::CopyToReadbackEnd);
-        timestamps.write(&mut encoder, GpuTimestampQuery::TotalEnd);
-        timestamps.resolve(&mut encoder);
     }
 
     let command_finish_submit_start = Instant::now();
@@ -5780,12 +5052,8 @@ fn submit_mcraw_gpu_dispatch_mapped_in_flight(
             mapped_consumer: Duration::ZERO,
             readback_convert: Duration::ZERO,
             total: Duration::ZERO,
-            gpu_timestamps: GpuTimestampProfile::unavailable(timestamp_support),
         },
         dispatch_start,
-        timestamp_support,
-        timestamp_recorder,
-        timestamp_stages,
         vignette_stats,
     })
 }
@@ -5840,11 +5108,6 @@ where
     readback_buffer.unmap();
 
     let value = consume_result?;
-    let gpu_timestamps = if let Some(timestamps) = pending.timestamp_recorder {
-        timestamps.read_profile(device, pending.submission_index, pending.timestamp_stages)?
-    } else {
-        GpuTimestampProfile::unavailable(pending.timestamp_support)
-    };
     let gpu_total_without_consumer = pending
         .work_plan_elapsed
         .saturating_add(dispatch_readback_elapsed);
@@ -5852,7 +5115,6 @@ where
     dispatch_timings.wait_map = wait_map_elapsed;
     dispatch_timings.mapped_consumer = mapped_consumer_elapsed;
     dispatch_timings.total = dispatch_readback_elapsed;
-    dispatch_timings.gpu_timestamps = gpu_timestamps;
 
     Ok((
         GpuMappedPackedU16Output {

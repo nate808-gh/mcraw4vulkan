@@ -28,9 +28,6 @@ pub use backend::GpuNoReadbackSlotAllocation;
 pub use backend::GpuPreparedType6WorkPlan;
 pub use backend::GpuPreparedType7WorkPlan;
 pub use backend::GpuSubmittedNoReadbackGpuStageOutput;
-pub use backend::GpuSubmittedTimestampProfile;
-pub use backend::GpuTimestampProfile;
-pub use backend::GpuTimestampSupport;
 pub use backend::OptionalGpuVignetteCorrection;
 pub use shader::{
     MCRAW_DECODE_BLOCKS_PACKED_U16_WGSL, MCRAW_DECODE_LEGACY_RAW16_PACKED_U16_WGSL,

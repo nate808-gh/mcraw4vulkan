@@ -12,7 +12,6 @@ use crate::virtual_fs::CachedDngFrame;
 use crate::virtual_fs::DEFAULT_DNG_HOT_FRAME_CAPACITY;
 use crate::virtual_fs::DEFAULT_DNG_HOT_PREFETCH_TARGET;
 use crate::virtual_fs::DngFrameByteCache;
-use crate::virtual_fs::DngFrameCacheStats;
 use crate::virtual_fs::DngGenerationBackend;
 use crate::virtual_fs::DngGenerationConfig;
 use crate::virtual_fs::DngGenerationExecutionPolicy;
@@ -24,8 +23,6 @@ use crate::virtual_fs::VirtualFileKind;
 use crate::virtual_fs::VirtualFileMetadata;
 use crate::virtual_fs::VirtualMetadataProvider;
 use crate::virtual_fs::VirtualNode;
-use crate::virtual_fs::VirtualRuntimeStats;
-use crate::virtual_fs::VirtualRuntimeStatsSnapshot;
 use crate::virtual_timestamp::virtual_timestamp_for_input_path;
 
 pub const DEFAULT_DNG_CACHE_FRAME_CAPACITY: usize = DEFAULT_DNG_HOT_FRAME_CAPACITY;
@@ -40,15 +37,13 @@ pub const LOWEST_MEMORY_PREFETCH_FORWARD_FRAMES: usize = 4;
 // Platform-neutral virtual filesystem facade.
 //
 // This is the shared callback-shaped layer used by platform mount adapters. It
-// owns virtual metadata, DNG byte cache access, runtime stats, and prefetch
+// owns virtual metadata, DNG byte cache access, and prefetch
 // triggering. OS-specific layers should remain thin translation layers around
 // these methods.
 pub struct VirtualFileSystem {
     provider: VirtualMetadataProvider,
     cache: Arc<DngFrameByteCache>,
-    runtime_stats: Arc<VirtualRuntimeStats>,
     open_dng_handles: Mutex<OpenDngHandleTable>,
-    prefetch_forward_frames: usize,
 }
 
 // Platform-neutral read result for virtual file data.
@@ -119,35 +114,6 @@ impl OpenDngHandleTable {
                     .flatten()
             })
     }
-
-    fn stats(&self) -> VirtualDngHandleStats {
-        let mut unique_frames = Vec::new();
-        let mut unique_pinned_bytes = 0_u64;
-
-        for handle in self.handles.values() {
-            let Some(pinned) = handle.pinned.as_ref() else {
-                continue;
-            };
-            if unique_frames.contains(&handle.frame_index) {
-                continue;
-            }
-            unique_frames.push(handle.frame_index);
-            unique_pinned_bytes = unique_pinned_bytes.saturating_add(pinned.byte_len);
-        }
-
-        VirtualDngHandleStats {
-            active_handles: self.handles.len(),
-            unique_pinned_frames: unique_frames.len(),
-            unique_pinned_bytes,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct VirtualDngHandleStats {
-    pub active_handles: usize,
-    pub unique_pinned_frames: usize,
-    pub unique_pinned_bytes: u64,
 }
 
 // Configuration for the platform-neutral virtual filesystem facade.
@@ -203,7 +169,6 @@ impl VirtualFileSystem {
     // - bounded DNG byte cache
     // - stable lazy BW64 WAV range source from raw decoded MCRAW audio
     // - virtual metadata provider with capture-time or fallback timestamp
-    // - runtime instrumentation counters for filesystem adapter analysis
     // - best-effort directional prefetch after sequential logical demand
     pub fn open_clip(path: &Path, config: VirtualFileSystemConfig) -> Result<Self> {
         let container = McrawContainer::open(path).with_context(|| {
@@ -247,9 +212,7 @@ impl VirtualFileSystem {
         Ok(Self {
             provider,
             cache,
-            runtime_stats: Arc::new(VirtualRuntimeStats::new()),
             open_dng_handles: Mutex::new(OpenDngHandleTable::default()),
-            prefetch_forward_frames: config.prefetch_forward_frames,
         })
     }
 
@@ -259,97 +222,6 @@ impl VirtualFileSystem {
 
     pub fn inode_map(&self) -> &InodeMap {
         self.provider.inode_map()
-    }
-
-    pub fn cache_stats(&self) -> Result<DngFrameCacheStats> {
-        self.cache.stats()
-    }
-
-    pub fn stats_snapshot(&self) -> Result<VirtualFileSystemStatsSnapshot> {
-        Ok(VirtualFileSystemStatsSnapshot {
-            runtime: self.runtime_stats.snapshot(),
-            cache: self.cache.stats()?,
-            dng_handles: self.dng_handle_stats(),
-        })
-    }
-
-    pub fn stats_summary_line(&self) -> Result<String> {
-        let snapshot = self.stats_snapshot()?;
-        let read = snapshot.runtime.read;
-        let cache = snapshot.cache;
-
-        Ok(format!(
-            "reads={} served_mib={:.1} avg_req_kib={} min_req={} max_req={} offset0={} empty_reads={} lookup={} getattr={} readdir={} cache_hits={} cache_wait_hits={} cache_misses={} generated={} evicted={} cached_frames={} cached_mib={:.1} max_frames={} max_cached_mib={:.1} cold_frames={} hot={} hot_direction={:?} hot_prefetch={} hot_history={} hot_grace_ms={} epoch={} active_demands={} active_prefetches={} active_handles={} pinned_frames={} pinned_mib={:.1} avg_gen_ms={:.2} avg_desc_ms={:.2} avg_payload_ms={:.2} avg_decode_ms={:.2} avg_dng_ms={:.2} avg_insert_ms={:.2} avg_gpu_work_plan_ms={:.2} avg_gpu_cpu_prepare_ms={:.2} avg_gpu_upload_ms={:.2} avg_gpu_submit_ms={:.2} avg_gpu_wait_map_ms={:.2} avg_gpu_readback_convert_ms={:.2} avg_gpu_dispatch_readback_ms={:.2} avg_raw_mib={:.1} avg_decoded_mib={:.1} avg_final_dng_mib={:.1} last_frame={:?} configured_prefetch={} prefetch_req={} prefetch_queued={} prefetch_full={} prefetch_skip_cached={} prefetch_busy={} prefetch_gen={} prefetch_stale={} prefetch_err={} hot_promotions={} hot_demotions={} generator_created={} generator_dropped={}",
-            read.read_count,
-            read.read_bytes_total as f64 / 1024.0 / 1024.0,
-            read.average_requested_size() / 1024,
-            read.read_size_min,
-            read.read_size_max,
-            read.read_offset_zero_count,
-            read.read_empty_count,
-            snapshot.runtime.lookup_count,
-            snapshot.runtime.getattr_count,
-            snapshot.runtime.readdir_count,
-            cache.cache_hits,
-            cache.cache_hits_after_wait,
-            cache.cache_misses,
-            cache.frames_generated,
-            cache.frames_evicted,
-            cache.cached_frames,
-            cache.total_cached_bytes as f64 / 1024.0 / 1024.0,
-            cache.max_frames,
-            cache.max_cached_bytes as f64 / 1024.0 / 1024.0,
-            cache.cold_frame_capacity,
-            cache.is_hot,
-            cache.hot_direction,
-            cache.hot_prefetch_target,
-            cache.hot_history_capacity,
-            cache.hot_grace_ms,
-            cache.generation_epoch,
-            cache.active_demands,
-            cache.active_prefetches,
-            snapshot.dng_handles.active_handles,
-            snapshot.dng_handles.unique_pinned_frames,
-            snapshot.dng_handles.unique_pinned_bytes as f64 / 1024.0 / 1024.0,
-            cache.average_generation_time_ms(),
-            cache.average_description_time_ms(),
-            cache.average_payload_read_time_ms(),
-            cache.average_decode_time_ms(),
-            cache.average_dng_build_time_ms(),
-            cache.average_cache_insert_time_ms(),
-            cache.average_gpu_work_plan_time_ms(),
-            cache.average_gpu_cpu_prepare_time_ms(),
-            cache.average_gpu_upload_time_ms(),
-            cache.average_gpu_encode_submit_time_ms(),
-            cache.average_gpu_wait_map_time_ms(),
-            cache.average_gpu_readback_convert_time_ms(),
-            cache.average_gpu_dispatch_readback_time_ms(),
-            cache.average_raw_payload_mib(),
-            cache.average_decoded_pixels_mib(),
-            cache.average_final_dng_mib(),
-            cache.last_generated_frame,
-            self.prefetch_forward_frames,
-            cache.prefetch_requested,
-            cache.prefetch_queued,
-            cache.prefetch_queue_full,
-            cache.prefetch_skipped_cached,
-            cache.prefetch_generator_busy,
-            cache.prefetch_generated,
-            cache.prefetch_stale,
-            cache.prefetch_errors,
-            cache.hot_promotions,
-            cache.hot_demotions,
-            cache.generator_created,
-            cache.generator_dropped,
-        ))
-    }
-
-    pub fn record_open(&self) {
-        self.runtime_stats.record_open();
-    }
-
-    pub fn record_opendir(&self) {
-        self.runtime_stats.record_opendir();
     }
 
     pub fn open_file_handle(&self, inode: u64, handle_id: u64) -> Result<()> {
@@ -373,13 +245,6 @@ impl VirtualFileSystem {
             .lock()
             .ok()
             .and_then(|mut handles| handles.handles.remove(&handle_id));
-    }
-
-    pub fn dng_handle_stats(&self) -> VirtualDngHandleStats {
-        self.open_dng_handles
-            .lock()
-            .map(|handles| handles.stats())
-            .unwrap_or_default()
     }
 
     fn dng_frame_bytes_for_read(
@@ -470,13 +335,11 @@ impl VirtualFileSystem {
     // behavior. The root contains one clip directory; the clip directory contains
     // the DNG sequence and BW64 WAV file.
     pub fn lookup(&self, parent_inode: u64, name: &OsStr) -> Result<Option<VirtualFileMetadata>> {
-        self.runtime_stats.record_lookup();
         self.provider.metadata_for_child_name(parent_inode, name)
     }
 
     // Platform adapter getattr callback shape.
     pub fn getattr(&self, inode: u64) -> Result<Option<VirtualFileMetadata>> {
-        self.runtime_stats.record_getattr();
         self.provider.metadata_for_inode(inode)
     }
 
@@ -490,8 +353,6 @@ impl VirtualFileSystem {
     // Non-directory inodes return Ok(None). The platform callback translates
     // that into the appropriate filesystem error.
     pub fn readdir(&self, inode: u64) -> Result<Option<Vec<VirtualDirEntry>>> {
-        self.runtime_stats.record_readdir();
-
         let Some(metadata) = self.provider.metadata_for_inode(inode)? else {
             return Ok(None);
         };
@@ -543,8 +404,6 @@ impl VirtualFileSystem {
                 .read_range(inode, offset, size)?
                 .context("audio inode did not return read bytes")?;
             let returned_len = bytes.len();
-            self.runtime_stats
-                .record_read_result(offset, size, returned_len);
 
             return Ok(Some(VirtualReadData {
                 bytes: Arc::from(bytes.into_boxed_slice()),
@@ -554,13 +413,11 @@ impl VirtualFileSystem {
         }
 
         let Some(node) = self.provider.inode_map().node_for_inode(inode) else {
-            self.runtime_stats.record_read_none();
             return Ok(None);
         };
 
         let file_bytes = match node {
             VirtualNode::Root | VirtualNode::ClipDirectory => {
-                self.runtime_stats.record_read_none();
                 return Ok(None);
             }
             VirtualNode::AudioWav => unreachable!("audio reads are handled above"),
@@ -580,25 +437,12 @@ impl VirtualFileSystem {
             (start, end)
         };
 
-        let returned_len = end.saturating_sub(start);
-
-        self.runtime_stats
-            .record_read_result(offset, size, returned_len);
-
         Ok(Some(VirtualReadData {
             bytes: file_bytes,
             start,
             end,
         }))
     }
-}
-
-// Snapshot combining virtual filesystem operation counters and DNG cache counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VirtualFileSystemStatsSnapshot {
-    pub runtime: VirtualRuntimeStatsSnapshot,
-    pub cache: DngFrameCacheStats,
-    pub dng_handles: VirtualDngHandleStats,
 }
 
 // Return the input filename stem, used as the virtual directory, DNG frame, and

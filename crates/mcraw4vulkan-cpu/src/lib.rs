@@ -15,4 +15,4 @@ pub mod raw_decoder;
 pub mod scratch;
 
 pub use error::CpuDecodeError;
-pub use frame_decoder::{CpuFrameDecoder, DecodeFrameTimings, DecodedFrameInfo, DecodedFrameRef};
+pub use frame_decoder::CpuFrameDecoder;

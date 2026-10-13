@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mcraw4vulkan_core::{BayerPattern, FrameDimensions, FrameNumber, FramePayloadLayout};
-use mcraw4vulkan_cpu::{CpuFrameDecoder, DecodeFrameTimings};
+use mcraw4vulkan_cpu::CpuFrameDecoder;
 use mcraw4vulkan_gpu::{
     GpuDecodeBackend, GpuDecodeConfig, GpuDecodeScratch, OptionalGpuVignetteCorrection,
 };
@@ -56,7 +56,6 @@ impl DisplayMeasurementRunner {
         let mut cpu_decoder = CpuFrameDecoder::new();
         let mut backend = GpuDecodeBackend::new_blocking(GpuDecodeConfig {
             backend_preference: request.gpu.backend_preference,
-            enable_gpu_timestamps: false,
         })?;
         let mut preview = GpuPreviewTextureRenderer::new(backend.device())?;
         let mut uploader = CpuPreviewUploadBuffer::default();
@@ -115,7 +114,6 @@ impl DisplayMeasurementRunner {
             display_payload_feeder_for_frames(&container, &request, &request.run.selected_frames)?;
         let mut backend = GpuDecodeBackend::new_blocking(GpuDecodeConfig {
             backend_preference: request.gpu.backend_preference,
-            enable_gpu_timestamps: false,
         })?;
         let mut preview = GpuPreviewTextureRenderer::new(backend.device())?;
         let mut scratch = GpuDecodeScratch::new();
@@ -353,6 +351,7 @@ fn run_cpu_display_loop(
     Ok(output)
 }
 
+#[rustfmt::skip]
 fn process_cpu_display_payload(
     container: &McrawContainer,
     payload: PayloadFrame,
@@ -366,11 +365,11 @@ fn process_cpu_display_payload(
     let metadata = container.frame_metadata(frame_number)?;
     let facts =
         DisplayFrameFacts::from_typed_metadata(container.container_metadata(), metadata, false)?;
-    let mut timings = DecodeFrameTimings::default();
     cpu_decoder.prepare_compressed(payload.data.len());
     payload.data.copy_into(cpu_decoder.compressed_mut());
-    let (decoded, _) = cpu_decoder
-        .decode_loaded_payload_to_decoded_bayer_u16_frame(facts.dimensions, &mut timings)?;
+    let (decoded, _) = cpu_decoder.decode_loaded_payload_to_decoded_bayer_u16_frame(
+        facts.dimensions,
+    )?;
     let pixel_bytes = decoded.into_owned_le_bytes();
     render_cpu_bytes_to_preview(
         backend,

@@ -24,7 +24,6 @@ pub const OPTIMIZER_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 pub const OPTIMIZER_MINIMUM_FRAMES_MESSAGE: &str =
     "Optimization testing requires at least 600 frames for accuracy.";
 const DISPLAY_WARMUP_FRAMES: usize = 30;
-const KEEP_REPORTS_ENV: &str = "MCRAW4VULKAN_KEEP_OPTIMIZER_REPORTS";
 
 pub type OptimizerResult<T> = Result<T, OptimizerError>;
 
@@ -110,7 +109,6 @@ pub struct OptimizerRunConfig {
     pub input_path: PathBuf,
     pub mcraw4vulkan_exe: PathBuf,
     pub frames: usize,
-    pub keep_reports: bool,
     pub hard_timeout: Duration,
     pub total_ram_bytes: Option<u64>,
 }
@@ -119,23 +117,15 @@ impl OptimizerRunConfig {
     pub fn user_facing(
         input_path: PathBuf,
         mcraw4vulkan_exe: PathBuf,
-        keep_reports: bool,
         total_ram_bytes: Option<u64>,
     ) -> Self {
         Self {
             input_path,
             mcraw4vulkan_exe,
             frames: OPTIMIZER_DECISION_FRAMES,
-            keep_reports,
             hard_timeout: OPTIMIZER_HARD_TIMEOUT,
             total_ram_bytes,
         }
-    }
-
-    pub fn keep_reports_from_env() -> bool {
-        std::env::var(KEEP_REPORTS_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
     }
 }
 
@@ -220,6 +210,7 @@ impl OptimizerShelloutRunner {
         Self { config }
     }
 
+    #[rustfmt::skip]
     pub fn run(&self) -> OptimizerResult<OptimizerRunOutcome> {
         if !self.config.mcraw4vulkan_exe.exists() {
             return Err(OptimizerError::ExecutableNotFound(
@@ -229,11 +220,15 @@ impl OptimizerShelloutRunner {
         let report_dir = create_optimizer_temp_report_dir()?;
         match self.run_with_report_dir(&report_dir) {
             Ok(outcome) => {
-                finish_report_dir(&report_dir, self.config.keep_reports, true)?;
+                finish_report_dir(
+                    &report_dir,
+                )?;
                 Ok(outcome)
             }
             Err(error) => {
-                let _ = finish_report_dir(&report_dir, self.config.keep_reports, false);
+                let _ = finish_report_dir(
+                    &report_dir,
+                );
                 Err(error)
             }
         }
@@ -1401,17 +1396,11 @@ pub fn create_optimizer_temp_report_dir() -> OptimizerResult<PathBuf> {
     Ok(dir)
 }
 
-fn finish_report_dir(report_dir: &Path, keep_reports: bool, success: bool) -> OptimizerResult<()> {
-    if !keep_reports {
-        fs::remove_dir_all(report_dir)?;
-    } else {
-        let reason = if success {
-            "optimizer reports retained"
-        } else {
-            "optimizer reports retained after failure"
-        };
-        eprintln!("{reason}: {}", report_dir.display());
-    }
+#[rustfmt::skip]
+fn finish_report_dir(
+    report_dir: &Path,
+) -> OptimizerResult<()> {
+    fs::remove_dir_all(report_dir)?;
     Ok(())
 }
 

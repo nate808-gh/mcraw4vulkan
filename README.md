@@ -38,7 +38,7 @@ optimizer workflows.
 ## Supported operating systems
 
 - Linux uses FUSE3 for virtual DNG mounts.
-- macOS uses macFUSE for virtual DNG mounts. GPU work follows the
+- macOS uses macFUSE FSKit for virtual DNG mounts under `$HOME/mcraw4vulkan`. GPU work follows the
   MoltenVK-compatible Vulkan path.
 - Windows uses Projected File System (ProjFS) for virtual DNG mounts.
 
@@ -167,9 +167,7 @@ in the user's home or profile directory. Press Ctrl-C to stop it. Unmount one
 clip with `mcraw4vulkan dng unmount FILE.mcraw`, or use
 `mcraw4vulkan dng unmount all` for mcraw4vulkan-owned mounts.
 
-The macFUSE VFS supports a maximum of 64 simultaneous mounts system-wide.
-Other macFUSE volumes consume the same mount slots; this is not an
-mcraw4vulkan memory limit.
+macOS uses one owned FSKit mount process per clip. Close applications using mounted DNGs before normal unmount or Quit; busy volumes retain their owner. See [macOS setup and build requirements](packaging/macos/README.txt).
 
 ## Optimizer
 

@@ -120,13 +120,8 @@ pub struct ResolvedStrictPipeColor {
     tint: f64,
     low_temperature_weight: f64,
     t50: [f64; 9],
-    #[allow(dead_code)] // retained for exact portable resolver-vector coverage
     camera_to_linear_bt2020: [f64; 9],
-    #[allow(dead_code)] // retained for exact portable resolver-vector coverage
-    camera_to_normalized_ncl: [f64; 9],
     camera_to_normalized_ncl_f32: [f32; 9],
-    #[allow(dead_code)] // retained for exact portable convergence coverage
-    convergence_iterations: u32,
 }
 
 impl ResolvedStrictPipeColor {
@@ -553,7 +548,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
                 break;
             }
         }
-        let convergence_iterations =
+        let _convergence_iterations =
             converged_iteration.ok_or(StrictMotionCamColorError::WhiteSolveNonconvergent {
                 iterations: WHITE_MAX_ITERATIONS,
             })?;
@@ -615,9 +610,7 @@ impl StrictMotionCamForwardMatrixColorV2 {
             low_temperature_weight: facts.weight_low,
             t50: t50.0,
             camera_to_linear_bt2020: camera_to_linear_bt2020.0,
-            camera_to_normalized_ncl: camera_to_normalized_ncl.0,
             camera_to_normalized_ncl_f32,
-            convergence_iterations,
         })
     }
 }

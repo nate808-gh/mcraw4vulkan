@@ -264,9 +264,6 @@ impl OneSharedComputeTwoReadbackDirectYuv12Scheduler {
         source_range: DirectYuv12SourceFrameRange,
         configured_memory_budget_bytes: u64,
     ) -> Result<Self, DirectYuv12PipelineError> {
-        if backend.gpu_timestamp_support().enabled {
-            return Err(DirectYuv12PipelineError::SharedDecoderTimestampsEnabled);
-        }
         Self::new_with_effective_depth(
             backend,
             source_range,
@@ -1214,11 +1211,6 @@ fn validate_decoder_allocation_limits(
         ("packed output", allocation.packed_output_bytes),
         ("params", allocation.params_bytes),
         ("retained readback", allocation.retained_readback_bytes),
-        (
-            "retained mappable output",
-            allocation.retained_mappable_output_bytes,
-        ),
-        ("timestamp buffers", allocation.timestamp_buffer_bytes),
     ] {
         validate_decoder_buffer_limit(buffer, "max_buffer_size", required_bytes, max_buffer_size)?;
     }
@@ -1380,7 +1372,6 @@ pub struct DirectYuv12NonfiniteCategories {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectYuv12PipelineError {
-    SharedDecoderTimestampsEnabled,
     InvalidReadbackDepth {
         effective_readback_slots: usize,
     },
@@ -1487,10 +1478,6 @@ pub enum DirectYuv12PipelineError {
 impl fmt::Display for DirectYuv12PipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SharedDecoderTimestampsEnabled => write!(
-                formatter,
-                "shared decoder scheduling requires runtime backend timestamps disabled"
-            ),
             Self::InvalidReadbackDepth {
                 effective_readback_slots,
             } => write!(

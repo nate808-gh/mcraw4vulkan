@@ -1,955 +1,1438 @@
-use std::error::Error;
-use std::ffi::{CString, c_char, c_int, c_void};
-use std::fmt;
-use std::fs;
+use crate::abi::*;
+use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
+use mcraw4vulkan_core::macfuse_location::{MacFuseRuntime, bounded_command};
+use std::cell::Cell;
+use std::ffi::{CStr, CString, OsStr, c_char, c_int, c_void};
 use std::io;
-use std::marker::PhantomData;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::rc::Rc;
-use std::sync::OnceLock;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
-
-const CLEANUP_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
-const CLEANUP_OBSERVE_POLL: Duration = Duration::from_millis(25);
-
-#[repr(C)]
-struct FuseArgs {
-    argc: c_int,
-    argv: *mut *mut c_char,
-    allocated: c_int,
+pub type FsResult<T> = Result<T, i32>;
+#[derive(Clone, Debug)]
+pub struct Metadata {
+    pub inode: u64,
+    pub len: u64,
+    pub directory: bool,
+    pub permissions: u16,
+    pub links: u32,
+    pub seconds: i64,
+    pub nanos: u32,
+}
+#[derive(Clone, Debug)]
+pub struct DirectoryEntry {
+    pub name: std::ffi::OsString,
+    pub metadata: Metadata,
+    pub next_cookie: u64,
+}
+/// Safe filesystem operation surface. The buffer is borrowed only for this call;
+/// the implementation owns inode, handle, cache and generated-frame lifetimes.
+pub trait CallbackFileSystem: Send + Sync + 'static {
+    fn getattr(&self, path: &Path) -> FsResult<Metadata>;
+    fn open(&self, path: &Path) -> FsResult<u64>;
+    fn release(&self, handle: u64) -> FsResult<()>;
+    fn read(&self, path: &Path, handle: u64, offset: u64, buffer: &mut [u8]) -> FsResult<usize>;
+    fn readdir(&self, path: &Path, cookie: u64) -> FsResult<Vec<DirectoryEntry>>;
 }
 
-enum FuseSession {}
-
-struct MacFuseApi {
-    opt_add_arg: unsafe extern "C" fn(*mut FuseArgs, *const c_char) -> c_int,
-    opt_free_args: unsafe extern "C" fn(*mut FuseArgs),
-    // Exported compatibility ABI, not the newer header's versioned wrapper.
-    session_new:
-        unsafe extern "C" fn(*mut FuseArgs, *const c_void, usize, *mut c_void) -> *mut FuseSession,
-    session_mount: unsafe extern "C" fn(*mut FuseSession, *const c_char) -> c_int,
-    session_fd: unsafe extern "C" fn(*mut FuseSession) -> c_int,
-    session_exit: unsafe extern "C" fn(*mut FuseSession),
-    session_unmount: unsafe extern "C" fn(*mut FuseSession),
-    session_destroy: unsafe extern "C" fn(*mut FuseSession),
+struct Api {
+    new: unsafe extern "C" fn(
+        *mut Args,
+        *const c_void,
+        usize,
+        *const Version,
+        *mut c_void,
+    ) -> *mut c_void,
+    mount: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
+    run: unsafe extern "C" fn(*mut c_void) -> c_int,
+    destroy: unsafe extern "C" fn(*mut c_void),
+    add_arg: unsafe extern "C" fn(*mut Args, *const c_char) -> c_int,
+    free_args: unsafe extern "C" fn(*mut Args),
+    context: unsafe extern "C" fn() -> *mut Context,
     _library: Library,
+    _framework: Library,
 }
-
-// macFUSE's asynchronous workers can retain session references after destroy.
-// Keep a successfully resolved library owned for the process lifetime, including
-// those workers. Failed loads/resolutions never enter this cache and may retry.
-static MACFUSE_API: OnceLock<MacFuseApi> = OnceLock::new();
-
-impl MacFuseApi {
-    fn load() -> io::Result<&'static Self> {
-        if let Some(api) = MACFUSE_API.get() {
+// Vendor asynchronous workers may outlive native destroy. Successful tables
+// remain loaded, keyed by canonical library identity; failed loads never cache.
+type ApiKey = (PathBuf, u64, u64, u64, i64, i64);
+static APIS: OnceLock<Mutex<Vec<(ApiKey, &'static Api)>>> = OnceLock::new();
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! { static CALLBACK_API:Cell<Option<&'static Api>> = const {Cell::new(None)}; }
+impl Api {
+    fn load(runtime: &MacFuseRuntime) -> io::Result<&'static Self> {
+        let metadata = std::fs::metadata(&runtime.library)?;
+        let key = (
+            runtime.library.clone(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        );
+        let mut cache = APIS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .map_err(|_| io::Error::other("native API cache poisoned"))?;
+        if let Some((_, api)) = cache.iter().find(|(p, _)| p == &key) {
             return Ok(api);
         }
-        let path = mcraw4vulkan_core::macfuse_location::library_from_environment()?;
-        // SAFETY: load only the selected installed macFUSE FUSE3 library. Its
-        // initialization is part of explicit mounting, never application startup.
-        // RTLD_NOW rejects unresolved native dependencies before any API call.
-        let library =
-            unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_LOCAL) }.map_err(|error| {
-                io::Error::other(format!(
-                    "could not load macFUSE FUSE3 library {}: {error}",
-                    path.display()
-                ))
-            })?;
-        let api = Self::from_library(library)?;
-        Ok(MACFUSE_API.get_or_init(|| api))
-    }
-
-    fn from_library(library: Library) -> io::Result<Self> {
-        // SAFETY: these are the eight supported libfuse3 ABI functions previously
-        // linked here, with identical C signatures. Copying each typed pointer is
-        // safe because this table owns the library. Resolve all entries before
-        // any call; an error drops the library without creating a native session.
-        unsafe {
-            Ok(Self {
-                opt_add_arg: *library
-                    .get(b"fuse_opt_add_arg\0")
-                    .map_err(|error| io::Error::other(format!("fuse_opt_add_arg: {error}")))?,
-                opt_free_args: *library
-                    .get(b"fuse_opt_free_args\0")
-                    .map_err(|error| io::Error::other(format!("fuse_opt_free_args: {error}")))?,
-                session_new: *library
-                    .get(b"fuse_session_new\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_new: {error}")))?,
-                session_mount: *library
-                    .get(b"fuse_session_mount\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_mount: {error}")))?,
-                session_fd: *library
-                    .get(b"fuse_session_fd\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_fd: {error}")))?,
-                session_exit: *library
-                    .get(b"fuse_session_exit\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_exit: {error}")))?,
-                session_unmount: *library
-                    .get(b"fuse_session_unmount\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_unmount: {error}")))?,
-                session_destroy: *library
-                    .get(b"fuse_session_destroy\0")
-                    .map_err(|error| io::Error::other(format!("fuse_session_destroy: {error}")))?,
+        if cache
+            .iter()
+            .any(|(prior, _)| prior.0 == key.0 && prior != &key)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "provider client changed after loading; a fresh mount host is required",
+            ));
+        }
+        // SAFETY: discovery verifies vendor code identity. Symbols resolve only
+        // from this local handle; the table retains that handle for all workers.
+        let library = unsafe {
+            Library::open(
+                Some(&runtime.library),
+                RTLD_NOW | RTLD_LOCAL | libc::RTLD_FIRST,
+            )
+        }
+        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
+        unsafe fn symbol<T: Copy>(l: &Library, n: &[u8]) -> io::Result<T> {
+            // SAFETY: callers supply the header-verified signature of each name.
+            unsafe {
+                l.get::<T>(n)
+                    .map(|p| *p)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))
+            }
+        }
+        // SAFETY: macFUSE 5.4 uses a delay-initialized MFMount dependency.
+        // Load and pin its verified installation explicitly before construction;
+        // packaging checks the same dependency path. This is deferred until Mount,
+        // and never loads or registers a filesystem extension by itself.
+        let framework = unsafe {
+            Library::open(
+                Some(&runtime.framework),
+                RTLD_NOW | RTLD_LOCAL | libc::RTLD_FIRST,
+            )
+        }
+        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
+        for name in [b"MFMount\0".as_slice(), b"MFChannelCreate\0".as_slice()] {
+            let address = unsafe { symbol::<*const c_void>(&framework, name)? };
+            verify_image(address, &runtime.framework)?;
+        }
+        // SAFETY: the vendor-verified FUSE3 version query has no arguments and
+        // does not create a session. Reject unverified ABI generations before
+        // passing any provider-specific structure.
+        let version =
+            unsafe { symbol::<unsafe extern "C" fn() -> c_int>(&library, b"fuse_version\0")?() };
+        if !supported_abi(version) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported provider FUSE3 ABI {version}"),
+            ));
+        }
+        // SAFETY: ABI checked against the matching macFUSE FUSE3 headers, including
+        // the five-argument _fuse_new_31 (not its four-argument compatibility name).
+        let api = unsafe {
+            Self {
+                new: symbol(&library, b"_fuse_new_31\0")?,
+                mount: symbol(&library, b"fuse_mount\0")?,
+                run: symbol(&library, b"fuse_loop\0")?,
+                destroy: symbol(&library, b"fuse_destroy\0")?,
+                add_arg: symbol(&library, b"fuse_opt_add_arg\0")?,
+                free_args: symbol(&library, b"fuse_opt_free_args\0")?,
+                context: symbol(&library, b"fuse_get_context\0")?,
                 _library: library,
-            })
+                _framework: framework,
+            }
+        };
+        // Two-level Mach-O binding plus RTLD_FIRST prevents another provider's
+        // identically named API from satisfying this table. Check every entry's
+        // actual image before any constructor owns callbacks.
+        for address in [
+            api.new as *const c_void,
+            api.mount as *const c_void,
+            api.run as *const c_void,
+            api.destroy as *const c_void,
+            api.add_arg as *const c_void,
+            api.free_args as *const c_void,
+            api.context as *const c_void,
+        ] {
+            verify_image(address, &runtime.library)?;
         }
+        let api = Box::leak(Box::new(api));
+        cache.push((key, api));
+        Ok(api)
     }
 }
-
-unsafe extern "C" {
-    // Public, thread-safe macOS mount-table API. The returned allocation is
-    // caller-owned and must be released with free(3).
-    fn getmntinfo_r_np(entries: *mut *mut libc::statfs, flags: c_int) -> c_int;
+fn verify_image(address: *const c_void, expected: &Path) -> io::Result<()> {
+    // SAFETY: address comes from a live selected library handle. dladdr writes
+    // one Dl_info; its image name remains valid while that handle is retained.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(address, &mut info) } == 0
+        || info.dli_fname.is_null()
+        || std::fs::canonicalize(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes(),
+        ))? != expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "macFUSE API or framework binding is outside the verified installation",
+        ));
+    }
+    Ok(())
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MacFuseSessionErrorKind {
-    NativeSetup,
-    ReaderSetup,
-    MountObservation,
-    Busy,
-    Unmount,
-    Worker,
-    Cleanup,
+fn supported_abi(version: c_int) -> bool {
+    version == 318
 }
-
-#[derive(Debug)]
-pub struct MacFuseSessionError {
-    kind: MacFuseSessionErrorKind,
-    operation: &'static str,
-    mountpoint: PathBuf,
-    source: Option<io::Error>,
-    cleanup_failures: Vec<String>,
+struct State {
+    fs: Arc<dyn CallbackFileSystem>,
+    initialized: AtomicBool,
+    challenge: CString,
+    challenge_seen: AtomicBool,
+    release_native: AtomicBool,
+    loop_returned: AtomicBool,
+    native_destroyed: AtomicBool,
+    failed: AtomicBool,
 }
-
-impl MacFuseSessionError {
-    fn new(
-        kind: MacFuseSessionErrorKind,
-        operation: &'static str,
-        mountpoint: &Path,
-        source: Option<io::Error>,
-    ) -> Self {
-        Self {
-            kind,
-            operation,
-            mountpoint: mountpoint.to_path_buf(),
-            source,
-            cleanup_failures: Vec::new(),
+fn request<T>(f: impl FnOnce(&State) -> FsResult<T>) -> FsResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CALLBACK_API.with(|slot| {
+            let api = slot.get().ok_or(libc::EIO)?;
+            // SAFETY: called synchronously on the single fuse_loop thread. The
+            // library's TLS context owns private_data independently of requester
+            // credentials (which FSKit need not supply). The worker retains State
+            // until the loop stops and native destroy completes.
+            let context = unsafe { (api.context)().as_ref() }.ok_or(libc::EIO)?;
+            let state =
+                unsafe { context.private_data.cast::<State>().as_ref() }.ok_or(libc::EIO)?;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(state)))
+                .unwrap_or(Err(libc::EIO));
+            if matches!(result, Err(libc::EIO)) {
+                state.failed.store(true, Ordering::Release);
+            }
+            result
+        })
+    }))
+    .unwrap_or(Err(libc::EIO))
+}
+unsafe fn path<'a>(p: *const c_char) -> FsResult<&'a Path> {
+    if p.is_null() {
+        return Err(libc::EINVAL);
+    }
+    // SAFETY: FUSE supplies a NUL-terminated path valid for this callback only.
+    Ok(Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(p) }.to_bytes(),
+    )))
+}
+fn code(r: FsResult<()>) -> c_int {
+    r.map_or_else(|e| -e, |()| 0)
+}
+fn attr(m: &Metadata) -> libc::stat {
+    // SAFETY: all-zero is valid for the system C stat structure; populate all
+    // visible metadata, including Darwin birthtime, before handing it to FUSE.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    st.st_ino = m.inode;
+    st.st_mode = (if m.directory {
+        libc::S_IFDIR
+    } else {
+        libc::S_IFREG
+    }) | m.permissions;
+    st.st_nlink = m.links.min(u16::MAX as u32) as u16;
+    // SAFETY: getuid/getgid take no pointers and are process identity queries.
+    st.st_uid = unsafe { libc::getuid() };
+    st.st_gid = unsafe { libc::getgid() };
+    st.st_size = m.len.min(i64::MAX as u64) as i64;
+    st.st_blocks = m.len.div_ceil(512).min(i64::MAX as u64) as i64;
+    st.st_blksize = 512;
+    st.st_atime = m.seconds;
+    st.st_atime_nsec = i64::from(m.nanos);
+    st.st_mtime = m.seconds;
+    st.st_mtime_nsec = i64::from(m.nanos);
+    st.st_ctime = m.seconds;
+    st.st_ctime_nsec = i64::from(m.nanos);
+    st.st_birthtime = m.seconds;
+    st.st_birthtime_nsec = i64::from(m.nanos);
+    st
+}
+unsafe extern "C" fn getattr(p: *const c_char, out: *mut libc::stat, _: *mut FileInfo) -> c_int {
+    code(request(|s| {
+        if !p.is_null() && unsafe { CStr::from_ptr(p) } == s.challenge.as_c_str() {
+            // An unpredictable metadata request from the pinned root descriptor
+            // binds startup to this callback owner, not to pathname occupancy.
+            s.challenge_seen.store(true, Ordering::Release);
+            return Err(libc::ENOENT);
         }
-    }
-
-    fn with_cleanup_failures(mut self, failures: Vec<String>) -> Self {
-        self.cleanup_failures = failures;
-        self
-    }
-
-    pub fn kind(&self) -> MacFuseSessionErrorKind {
-        self.kind
-    }
-
-    pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
-    }
-
-    pub fn cleanup_failures(&self) -> &[String] {
-        &self.cleanup_failures
-    }
-
-    pub fn raw_os_error(&self) -> Option<i32> {
-        self.source.as_ref().and_then(io::Error::raw_os_error)
-    }
-}
-
-impl fmt::Display for MacFuseSessionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} for {}",
-            self.operation,
-            self.mountpoint.display()
-        )?;
-        if let Some(source) = &self.source {
-            write!(formatter, ": {source}")?;
+        let m = s.fs.getattr(unsafe { path(p) }?)?;
+        if m.len > i64::MAX as u64 {
+            return Err(libc::EOVERFLOW);
         }
-        for failure in &self.cleanup_failures {
-            write!(formatter, "; terminal cleanup also failed: {failure}")?;
+        if out.is_null() {
+            return Err(libc::EINVAL);
+        }
+        unsafe { out.write(attr(&m)) };
+        Ok(())
+    }))
+}
+unsafe extern "C" fn open(p: *const c_char, fi: *mut FileInfo) -> c_int {
+    code(request(|s| {
+        let fi = unsafe { fi.as_mut() }.ok_or(libc::EINVAL)?;
+        if fi.flags & libc::O_TRUNC != 0 || fi.flags & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(libc::EROFS);
+        }
+        fi.fh = s.fs.open(unsafe { path(p) }?)?;
+        Ok(())
+    }))
+}
+unsafe extern "C" fn release(_: *const c_char, fi: *mut FileInfo) -> c_int {
+    code(request(|s| {
+        s.fs.release(unsafe { fi.as_ref() }.ok_or(libc::EBADF)?.fh)
+    }))
+}
+unsafe extern "C" fn read(
+    p: *const c_char,
+    b: *mut c_char,
+    n: usize,
+    o: libc::off_t,
+    fi: *mut FileInfo,
+) -> c_int {
+    request(|s| {
+        if o < 0 || n > c_int::MAX as usize || (b.is_null() && n != 0) {
+            return Err(libc::EINVAL);
+        }
+        let h = unsafe { fi.as_ref() }.map_or(0, |f| f.fh);
+        // SAFETY: FUSE provides exactly n writable bytes for this synchronous
+        // request. No pointer or slice escapes; zero length needs no pointer.
+        let buffer = if n == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(b.cast::<u8>(), n) }
+        };
+        let count = s.fs.read(unsafe { path(p) }?, h, o as u64, buffer)?;
+        if count > n {
+            return Err(libc::EIO);
+        }
+        Ok(count as c_int)
+    })
+    .unwrap_or_else(|e| -e)
+}
+unsafe extern "C" fn readdir(
+    p: *const c_char,
+    b: *mut c_void,
+    fill: Fill,
+    o: libc::off_t,
+    _: *mut FileInfo,
+    _: c_int,
+) -> c_int {
+    code(request(|s| {
+        if o < 0 {
+            return Err(libc::EINVAL);
+        }
+        for entry in s.fs.readdir(unsafe { path(p) }?, o as u64)? {
+            let name = CString::new(entry.name.as_bytes()).map_err(|_| libc::EIO)?;
+            let st = attr(&entry.metadata);
+            let cookie = i64::try_from(entry.next_cookie).map_err(|_| libc::EOVERFLOW)?;
+            // SAFETY: fill belongs to this request/provider; neither local name
+            // nor stat is retained. Nonzero means full; resume uses next_cookie.
+            if unsafe { fill(b, name.as_ptr(), &st, cookie, 0) } != 0 {
+                break;
+            }
         }
         Ok(())
-    }
+    }))
 }
-
-impl Error for MacFuseSessionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| source as &(dyn Error + 'static))
+unsafe extern "C" fn opendir(p: *const c_char, _: *mut FileInfo) -> c_int {
+    code(request(|s| {
+        if s.fs.getattr(unsafe { path(p) }?)?.directory {
+            Ok(())
+        } else {
+            Err(libc::ENOTDIR)
+        }
+    }))
+}
+unsafe extern "C" fn access(p: *const c_char, mask: c_int) -> c_int {
+    code(request(|s| {
+        let m = s.fs.getattr(unsafe { path(p) }?)?;
+        if mask & libc::W_OK != 0 {
+            return Err(libc::EROFS);
+        }
+        if mask & libc::X_OK != 0 && m.permissions & 0o111 == 0 {
+            return Err(libc::EACCES);
+        }
+        Ok(())
+    }))
+}
+unsafe extern "C" fn getxattr(
+    p: *const c_char,
+    _: *const c_char,
+    _: *mut c_char,
+    _: usize,
+) -> c_int {
+    code(request(|s| {
+        s.fs.getattr(unsafe { path(p) }?)?;
+        Err(libc::ENOATTR)
+    }))
+}
+unsafe extern "C" fn listxattr(p: *const c_char, _: *mut c_char, _: usize) -> c_int {
+    code(request(|s| {
+        s.fs.getattr(unsafe { path(p) }?)?;
+        Ok(())
+    }))
+}
+unsafe extern "C" fn statfs(_: *const c_char, p: *mut libc::statvfs) -> c_int {
+    if p.is_null() {
+        return -libc::EINVAL;
+    }
+    // SAFETY: callback receives one writable statvfs; zero initializes optional fields.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    s.f_bsize = 512;
+    s.f_frsize = 512;
+    s.f_blocks = 1_048_576;
+    s.f_bfree = s.f_blocks;
+    s.f_bavail = s.f_blocks;
+    s.f_files = 1_000_000;
+    s.f_ffree = s.f_files;
+    s.f_favail = s.f_files;
+    s.f_namemax = 255;
+    unsafe { p.write(s) };
+    0
+}
+unsafe extern "C" fn init(_: *mut c_void, cfg: *mut ConfigPrefix) -> *mut c_void {
+    request(|s| {
+        if let Some(c) = unsafe { cfg.as_mut() } {
+            c.use_ino = 1;
+        }
+        s.initialized.store(true, Ordering::Release);
+        Ok((s as *const State).cast_mut().cast::<c_void>())
+    })
+    .unwrap_or(ptr::null_mut())
+}
+unsafe extern "C" fn ok(_: *const c_char, _: *mut FileInfo) -> c_int {
+    0
+}
+unsafe extern "C" fn sync(_: *const c_char, _: c_int, _: *mut FileInfo) -> c_int {
+    0
+}
+// Mutation signatures remain distinct; no unlike function-pointer casts.
+unsafe extern "C" fn ro1(_: *const c_char) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn ro2(_: *const c_char, _: *const c_char) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn rename(_: *const c_char, _: *const c_char, _: u32) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn mkdir(_: *const c_char, _: libc::mode_t) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn mknod(_: *const c_char, _: libc::mode_t, _: libc::dev_t) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn chmod(_: *const c_char, _: libc::mode_t, _: *mut FileInfo) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn chown(_: *const c_char, _: u32, _: u32, _: *mut FileInfo) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn truncate(_: *const c_char, _: libc::off_t, _: *mut FileInfo) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn write(
+    _: *const c_char,
+    _: *const c_char,
+    _: usize,
+    _: libc::off_t,
+    _: *mut FileInfo,
+) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn setxattr(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: usize,
+    _: c_int,
+) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn utimens(
+    _: *const c_char,
+    _: *const libc::timespec,
+    _: *mut FileInfo,
+) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn setattr(
+    _: *const c_char,
+    _: *mut c_void,
+    _: c_int,
+    _: *mut FileInfo,
+) -> c_int {
+    -libc::EROFS
+}
+unsafe extern "C" fn chflags(_: *const c_char, _: *mut FileInfo, _: u32) -> c_int {
+    -libc::EROFS
+}
+fn operations() -> OperationsTail {
+    OperationsTail {
+        mknod: Some(mknod),
+        mkdir: Some(mkdir),
+        unlink: Some(ro1),
+        rmdir: Some(ro1),
+        symlink: Some(ro2),
+        rename: Some(rename),
+        link: Some(ro2),
+        chmod: Some(chmod),
+        chown: Some(chown),
+        truncate: Some(truncate),
+        open: Some(open),
+        read: Some(read),
+        write: Some(write),
+        statfs: Some(statfs),
+        flush: Some(ok),
+        release: Some(release),
+        fsync: Some(sync),
+        setxattr: Some(setxattr),
+        getxattr: Some(getxattr),
+        listxattr: Some(listxattr),
+        removexattr: Some(ro2),
+        opendir: Some(opendir),
+        readdir: Some(readdir),
+        releasedir: Some(ok),
+        fsyncdir: Some(sync),
+        init: Some(init),
+        access: Some(access),
+        create: Some(chmod),
+        utimens: Some(utimens),
+        ..Default::default()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnmountOutcome {
-    /// The ordinary unmount call disconnected the observed mount.
     Unmounted,
-    /// The observed mount was already absent, or this guard had already been
-    /// finalized; any retained worker/native ownership has been released.
     AlreadyUnmounted,
 }
-
-/// Owns the native macFUSE session and fuser's sole request reader together.
-///
-/// The `Rc` marker makes this guard neither `Send` nor `Sync`: all native
-/// lifecycle calls and Drop therefore remain on the thread that constructed
-/// the session. The fuser request loop itself runs on its own managed worker.
 pub struct MacFuseSession {
-    worker: Option<fuser::BackgroundSession>,
-    native: Option<NativeSession>,
+    directory: MountDirectory,
+    worker: Option<JoinHandle<io::Result<i32>>>,
     mountpoint: PathBuf,
-    _thread_bound: PhantomData<Rc<()>>,
+    binding: Option<MountBinding>,
+    probe: Option<JoinHandle<io::Result<MountBinding>>>,
+    state: Arc<State>,
+    cancellation: Arc<AtomicBool>,
 }
-
 impl MacFuseSession {
-    pub fn mount<FS>(
-        filesystem: FS,
-        mountpoint: impl AsRef<Path>,
-        native_options: &[String],
-        config: fuser::Config,
-    ) -> Result<Self, MacFuseSessionError>
-    where
-        FS: fuser::Filesystem + Send + 'static,
-    {
-        let requested_mountpoint = mountpoint.as_ref();
-        let mountpoint = fs::canonicalize(requested_mountpoint).map_err(|source| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "could not resolve the macFUSE mount target before native setup",
-                requested_mountpoint,
-                Some(source),
-            )
-        })?;
-        let (mut native, channel) = NativeSession::open_channel(&mountpoint, native_options)?;
-        let acl = config.acl;
-
-        let session = match fuser::Session::from_fd(filesystem, channel, acl, config) {
-            Ok(session) => session,
-            Err(source) => {
-                let cleanup = native.cancel_and_destroy();
-                return Err(MacFuseSessionError::new(
-                    MacFuseSessionErrorKind::ReaderSetup,
-                    "registry fuser failed its Session::from_fd handshake",
-                    &mountpoint,
-                    Some(source),
-                )
-                .with_cleanup_failures(cleanup));
-            }
-        };
-
-        if let Err(source) = native.capture_mount_identity(CLEANUP_OBSERVE_TIMEOUT) {
-            drop(session);
-            let cleanup = native.cancel_and_destroy();
-            return Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::MountObservation,
-                "could not identify the mounted macFUSE session",
-                &mountpoint,
-                Some(source),
-            )
-            .with_cleanup_failures(cleanup));
-        }
-
-        let worker = match session.spawn() {
-            Ok(worker) => worker,
-            Err(source) => {
-                let cleanup = native.cancel_and_destroy();
-                return Err(MacFuseSessionError::new(
-                    MacFuseSessionErrorKind::ReaderSetup,
-                    "registry fuser failed to start its request worker",
-                    &mountpoint,
-                    Some(source),
-                )
-                .with_cleanup_failures(cleanup));
-            }
-        };
-
-        Ok(Self {
-            worker: Some(worker),
-            native: Some(native),
-            mountpoint,
-            _thread_bound: PhantomData,
-        })
-    }
-
-    /// Returns the one resolved absolute target used for native mount,
-    /// observation, and unmount operations.
-    pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
-    }
-
-    /// Returns the mount-table status of this session's resolved target.
-    ///
-    /// Retaining native ownership after an external unmount does not make this
-    /// return `true`. An observation failure is reported distinctly from a
-    /// confirmed absence.
-    pub fn is_mounted(&self) -> Result<bool, MacFuseSessionError> {
-        let Some(native) = self.native.as_ref() else {
-            return Ok(false);
-        };
-        native.owned_mount_is_present().map_err(|source| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::MountObservation,
-                "could not inspect the macOS mount table for this session",
-                &self.mountpoint,
-                Some(source),
-            )
-        })
-    }
-
-    /// Attempts one ordinary, non-forced unmount.
-    ///
-    /// A refusal or mount-observation error before disconnection leaves this
-    /// guard, its native owner, its reader, and its provider retained. In
-    /// particular, `Busy` is the actual `EBUSY` from macOS `unmount(2)` and can
-    /// be retried on this same value after the busy resource is released.
-    ///
-    /// Once unmount succeeds, or absence is observed after an external
-    /// unmount, teardown is terminal. A `Worker` error returned after that
-    /// point reports failed worker finalization; it does not mean the mount is
-    /// still live or that this guard remains retryable.
-    pub fn try_unmount(&mut self) -> Result<UnmountOutcome, MacFuseSessionError> {
-        let Some(native) = self.native.as_ref() else {
-            return Ok(UnmountOutcome::AlreadyUnmounted);
-        };
-
-        match native.owned_mount_is_present() {
-            Ok(false) => return self.finish_disconnected(UnmountOutcome::AlreadyUnmounted),
-            Ok(true) => {}
-            Err(source) => {
-                return Err(MacFuseSessionError::new(
-                    MacFuseSessionErrorKind::MountObservation,
-                    "could not inspect the macOS mount table before unmount",
-                    &self.mountpoint,
-                    Some(source),
-                ));
-            }
-        }
-
-        // SAFETY: `native.mountpoint_c` is a live, NUL-terminated path for the
-        // duration of the call. `unmount(2)` does not retain the pointer. Flags
-        // are zero, so this is an ordinary (never forced) unmount. Its documented
-        // synchronous result reports success only after VFS disassociates the
-        // filesystem from this mountpoint.
-        let result = unsafe { libc::unmount(native.mountpoint_c.as_ptr(), 0) };
-        if result != 0 {
-            // Capture errno before mount-table inspection or any cleanup call.
-            let source = io::Error::last_os_error();
-            if source.raw_os_error() == Some(libc::EBUSY) {
-                return Err(MacFuseSessionError::new(
-                    MacFuseSessionErrorKind::Busy,
-                    "macOS refused the orderly unmount because the mount is busy",
-                    &self.mountpoint,
-                    Some(source),
-                ));
-            }
-
-            // An external unmount may have won the race after the initial
-            // observation. Finalize only if our recorded mount identity is gone.
-            if matches!(native.owned_mount_is_present(), Ok(false)) {
-                return self.finish_disconnected(UnmountOutcome::AlreadyUnmounted);
-            }
-            return Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::Unmount,
-                "macOS rejected the orderly unmount",
-                &self.mountpoint,
-                Some(source),
+    pub fn mount(
+        fs: Arc<dyn CallbackFileSystem>,
+        directory: MountDirectory,
+        runtime: MacFuseRuntime,
+        volume: &str,
+        cancellation: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DNG mount canceled",
             ));
         }
-
-        self.finish_disconnected(UnmountOutcome::Unmounted)
-    }
-
-    /// Blocks until an external unmount ends fuser's reader, then verifies the
-    /// recorded mount identity has disappeared before releasing native state.
-    pub fn wait_until_unmounted(mut self) -> Result<(), MacFuseSessionError> {
-        let worker_result = self.join_worker();
-        let presence_result = self
-            .native
-            .as_ref()
-            .map_or(Ok(false), NativeSession::owned_mount_is_present);
-
-        match (worker_result, presence_result) {
-            (Ok(()), Ok(false)) => {
-                self.release_native_orderly();
-                Ok(())
-            }
-            (worker_result, presence_result) => {
-                let mut primary = match worker_result {
-                    Err(source) => MacFuseSessionError::new(
-                        MacFuseSessionErrorKind::Worker,
-                        "registry fuser request worker ended with an error",
-                        &self.mountpoint,
-                        Some(source),
-                    ),
-                    Ok(()) => match presence_result {
-                        Ok(true) => MacFuseSessionError::new(
-                            MacFuseSessionErrorKind::MountObservation,
-                            "request worker ended while its macFUSE mount remained present",
-                            &self.mountpoint,
-                            None,
-                        ),
-                        Err(source) => MacFuseSessionError::new(
-                            MacFuseSessionErrorKind::MountObservation,
-                            "could not confirm disappearance after the request worker ended",
-                            &self.mountpoint,
-                            Some(source),
-                        ),
-                        Ok(false) => unreachable!(),
-                    },
-                };
-                let cleanup = self.terminal_cleanup();
-                primary.cleanup_failures.extend(cleanup);
-                Err(primary)
-            }
-        }
-    }
-
-    /// Terminates a session that cannot be kept as a usable mounted provider.
-    /// This is intentionally separate from retryable orderly unmount.
-    pub fn abort(mut self) -> Result<(), MacFuseSessionError> {
-        let failures = self.terminal_cleanup();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::Cleanup,
-                "terminal macFUSE session cleanup failed",
-                &self.mountpoint,
-                None,
-            )
-            .with_cleanup_failures(failures))
-        }
-    }
-
-    fn finish_disconnected(
-        &mut self,
-        outcome: UnmountOutcome,
-    ) -> Result<UnmountOutcome, MacFuseSessionError> {
-        let worker_result = self.join_worker();
-        self.release_native_orderly();
-        worker_result.map(|()| outcome).map_err(|source| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::Worker,
-                "registry fuser request worker failed during orderly teardown",
-                &self.mountpoint,
-                Some(source),
-            )
-        })
-    }
-
-    fn join_worker(&mut self) -> io::Result<()> {
-        match self.worker.take() {
-            Some(worker) => worker.join(),
-            None => Ok(()),
-        }
-    }
-
-    fn release_native_orderly(&mut self) {
-        if let Some(mut native) = self.native.take() {
-            // The OS mount is already gone and the duplicate fuser descriptor
-            // has been joined/dropped. This call reconciles macFUSE's internal
-            // mount state; its void return is not used as evidence of success.
-            native.request_native_unmount();
-            native.destroy();
-        }
-    }
-
-    fn terminal_cleanup(&mut self) -> Vec<String> {
-        let mut failures = Vec::new();
-        if let Some(native) = self.native.as_mut() {
-            let _ = native.force_os_unmount_if_present();
-            native.force_unmount();
-            if let Err(error) = native.force_os_unmount_until_absent(CLEANUP_OBSERVE_TIMEOUT) {
-                failures.push(format!("forced OS unmount: {error}"));
-            }
-        }
-
-        if let Err(error) = self.join_worker() {
-            failures.push(format!("request worker join: {error}"));
-        }
-        if let Some(mut native) = self.native.take() {
-            if let Err(error) = native.wait_until_owned_mount_absent(CLEANUP_OBSERVE_TIMEOUT) {
-                failures.push(format!("mount disappearance: {error}"));
-            }
-            native.destroy();
-        }
-        failures
-    }
-}
-
-impl Drop for MacFuseSession {
-    fn drop(&mut self) {
-        // Dropping the final owner is terminal abandonment, not an ordinary
-        // retryable unmount. A public forced VFS unmount closes the request
-        // channel, and macFUSE's documented exit/unmount path then reconciles
-        // its native state. Joining before destroying the caller reference
-        // keeps the provider and descriptor ordering intact.
-        // Every operation here returns normally; errors are deliberately
-        // ignored because Drop cannot report them and must not panic while
-        // unwinding.
-        let _ = self.terminal_cleanup();
-    }
-}
-
-struct OwnedFuseArgs {
-    api: &'static MacFuseApi,
-    raw: FuseArgs,
-}
-
-impl OwnedFuseArgs {
-    fn new(api: &'static MacFuseApi, options: &[String]) -> io::Result<Self> {
-        let mut args = Self {
-            api,
-            raw: FuseArgs {
-                argc: 0,
-                argv: ptr::null_mut(),
-                allocated: 0,
-            },
-        };
-        args.add("mcraw4vulkan")?;
-        for option in options {
-            args.add("-o")?;
-            args.add(option)?;
-        }
-        Ok(args)
-    }
-
-    fn add(&mut self, value: &str) -> io::Result<()> {
-        let value = CString::new(value).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a native libfuse3 argument contains an interior NUL byte",
-            )
-        })?;
-        // SAFETY: `self.raw` is the exclusively owned public `fuse_args`
-        // structure and `value` remains valid for the call. libfuse3 copies the
-        // argument into its own mutable vector. The API documents only an
-        // allocation-failure outcome, so no potentially stale errno is added.
-        if unsafe { (self.api.opt_add_arg)(&mut self.raw, value.as_ptr()) } == -1 {
+        if ACTIVE.swap(true, Ordering::AcqRel) {
             return Err(io::Error::other(
-                "libfuse3 could not allocate its argument vector",
+                "one native session per mount process is required; launch each clip through its owned CLI process",
             ));
+        }
+        let result = Self::start(fs, directory, runtime, volume, cancellation);
+        if result.is_err() {
+            ACTIVE.store(false, Ordering::Release);
+        }
+        result
+    }
+    fn start(
+        fs: Arc<dyn CallbackFileSystem>,
+        mut directory: MountDirectory,
+        runtime: MacFuseRuntime,
+        volume: &str,
+        cancellation: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        // Refuse mounting before creating native work on systems without the
+        // instance-bound cleanup API. Preview/export can still run there.
+        let _ = instance_unmount_api()?;
+        let api = Api::load(&runtime)?;
+        let target = directory.path.clone();
+        if mounted(&target)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mountpoint is already mounted",
+            ));
+        }
+        let cpath = CString::new(target.as_os_str().as_bytes())?;
+        let options = mount_options(volume);
+        let mut random = [0u8; 24];
+        // SAFETY: arc4random_buf initializes precisely this owned byte array.
+        unsafe { libc::arc4random_buf(random.as_mut_ptr().cast(), random.len()) };
+        let challenge = CString::new(format!(
+            "{}.mcraw4vulkan-owner-{}",
+            std::path::MAIN_SEPARATOR,
+            random
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>()
+        ))?;
+        let state = Arc::new(State {
+            fs,
+            initialized: AtomicBool::new(false),
+            challenge,
+            challenge_seen: AtomicBool::new(false),
+            release_native: AtomicBool::new(false),
+            loop_returned: AtomicBool::new(false),
+            native_destroyed: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
+        });
+        let worker_state = state.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker_target = target.clone();
+        directory.cleanup_on_drop = false;
+        let worker = thread::Builder::new()
+            .name("dng-fuse3".into())
+            .spawn(move || {
+                CALLBACK_API.with(|s| s.set(Some(api)));
+                let mut args = Args {
+                    argc: 0,
+                    argv: ptr::null_mut(),
+                    allocated: 0,
+                };
+                for arg in ["mcraw4vulkan", "-o", &options] {
+                    let arg = CString::new(arg)?;
+                    // SAFETY: same provider allocates/frees argv; it copies arg.
+                    if unsafe { (api.add_arg)(&mut args, arg.as_ptr()) } != 0 {
+                        unsafe { (api.free_args)(&mut args) };
+                        return Err(io::Error::other("FUSE argument allocation failed"));
+                    }
+                }
+                let mac = MacOperations {
+                    getattr: Some(getattr),
+                    setattr: Some(setattr),
+                    tail: operations(),
+                    chflags: Some(chflags),
+                    setvolname: Some(ro1),
+                    monitor: None,
+                    statx: None,
+                };
+                let op = (&mac as *const MacOperations).cast();
+                let size = std::mem::size_of_val(&mac);
+                let version = Version {
+                    major: 3,
+                    minor: 18,
+                    hotfix: 2,
+                    flags: 0,
+                };
+                // SAFETY: typed provider table, version flags explicitly disable
+                // Darwin extensions. State lives through loop and destroy. No
+                // per-session signal handlers overwrite the application lifecycle.
+                if worker_cancellation.load(Ordering::Acquire) {
+                    unsafe { (api.free_args)(&mut args) };
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "DNG mount canceled before native creation",
+                    ));
+                }
+                worker_state
+                    .native_destroyed
+                    .store(false, Ordering::Release);
+                let raw = unsafe {
+                    (api.new)(
+                        &mut args,
+                        op,
+                        size,
+                        &version,
+                        Arc::as_ptr(&worker_state).cast_mut().cast(),
+                    )
+                };
+                unsafe { (api.free_args)(&mut args) };
+                if raw.is_null() {
+                    worker_state.native_destroyed.store(true, Ordering::Release);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "FUSE3 constructor rejected initialization",
+                    ));
+                }
+                let mount = unsafe { (api.mount)(raw, cpath.as_ptr()) };
+                if mount != 0 {
+                    let error = io::Error::last_os_error();
+                    unsafe { (api.destroy)(raw) };
+                    worker_state.native_destroyed.store(true, Ordering::Release);
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("FUSE3 mount rejected: {error}"),
+                    ));
+                }
+                let result = unsafe { (api.run)(raw) };
+                worker_state.loop_returned.store(true, Ordering::Release);
+                // Native unmount is deliberately not used: macFUSE can capture a
+                // DADisk by pathname during late startup. Only the instance-bound
+                // owner may detach.
+                // Destroy closes this session's transport after reconciliation.
+                while !worker_state.release_native.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                let detached = !mounted(&worker_target)?;
+                unsafe { (api.destroy)(raw) };
+                worker_state.native_destroyed.store(true, Ordering::Release);
+                CALLBACK_API.with(|s| s.set(None));
+                if detached && !worker_state.failed.load(Ordering::Acquire) && result == 0 {
+                    Ok(result)
+                } else {
+                    Err(io::Error::other(format!(
+                        "macFUSE FSKit loop return={result}, detached={detached}"
+                    )))
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                directory.cleanup_on_drop = true; // No worker was started.
+                return Err(error);
+            }
+        };
+        let mut session = Self {
+            directory,
+            worker: Some(worker),
+            mountpoint: target,
+            binding: None,
+            probe: None,
+            state: state.clone(),
+            cancellation,
+        };
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            if session.cancellation.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "DNG mount canceled",
+                ));
+            }
+            if session.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                session.finish()?;
+                return Err(io::Error::new(
+                    if state.initialized.load(Ordering::Acquire) {
+                        io::ErrorKind::Other
+                    } else {
+                        io::ErrorKind::Unsupported
+                    },
+                    "FUSE3 startup ended before ready",
+                ));
+            }
+            if state.loop_returned.load(Ordering::Acquire) && !mounted(&session.mountpoint)? {
+                state.release_native.store(true, Ordering::Release);
+            }
+            session.poll_binding()?;
+            if state.initialized.load(Ordering::Acquire)
+                && session.binding.is_some()
+                && session.is_mounted()?
+            {
+                verify_fskit_mount(&session.mountpoint)?;
+                // This final acquire is the publication boundary. Cancellation is
+                // latched forever; a subsequent cancellation is owned shutdown.
+                if session.cancellation.load(Ordering::Acquire) {
+                    continue;
+                }
+                return Ok(session);
+            }
+            if Instant::now() >= end {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FUSE3 startup did not become ready within 20 seconds",
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn poll_binding(&mut self) -> io::Result<()> {
+        if self.binding.is_some() {
+            return Ok(());
+        }
+        if self.probe.as_ref().is_some_and(JoinHandle::is_finished) {
+            let result = self
+                .probe
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| io::Error::other("ownership probe panicked"))?;
+            let binding = result?;
+            self.binding = Some(binding);
+        } else if self.probe.is_none()
+            && !self.state.loop_returned.load(Ordering::Acquire)
+            && mounted(&self.mountpoint)?
+        {
+            let target = self.mountpoint.clone();
+            let state = self.state.clone();
+            self.probe = Some(
+                thread::Builder::new()
+                    .name("dng-mount-identity".into())
+                    .spawn(move || bind_mount(&target, &state))?,
+            );
         }
         Ok(())
     }
-}
-
-impl Drop for OwnedFuseArgs {
-    fn drop(&mut self) {
-        // SAFETY: this value owns the mutable argv allocated by libfuse3.
-        // `fuse_opt_free_args` accepts the zero/null initial state and clears
-        // partial allocation after any failed add or constructor call.
-        unsafe { (self.api.opt_free_args)(&mut self.raw) };
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-// Practical mount-table checks for the application's already uniquely named
-// target. These fields reject an unexpected entry during ordinary operation;
-// they are not a race-proof kernel mount-instance identifier.
-struct MountIdentity {
-    mountpoint: Vec<u8>,
-    source: Vec<u8>,
-    filesystem_type: Vec<u8>,
-}
-
-struct NativeSession {
-    api: &'static MacFuseApi,
-    raw: Option<NonNull<FuseSession>>,
-    mountpoint_c: CString,
-    mountpoint_key: Vec<u8>,
-    identity: Option<MountIdentity>,
-    mount_requested: bool,
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-impl NativeSession {
-    fn open_channel(
-        mountpoint: &Path,
-        options: &[String],
-    ) -> Result<(Self, OwnedFd), MacFuseSessionError> {
-        let mountpoint_c = CString::new(mountpoint.as_os_str().as_bytes()).map_err(|_| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "the macFUSE mountpoint contains an interior NUL byte",
-                mountpoint,
-                None,
-            )
-        })?;
-        let api = MacFuseApi::load().map_err(|source| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "could not acquire the macFUSE FUSE3 API",
-                mountpoint,
-                Some(source),
-            )
-        })?;
-        let mut args = OwnedFuseArgs::new(api, options).map_err(|source| {
-            MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "could not build the native libfuse3 argument vector",
-                mountpoint,
-                Some(source),
-            )
-        })?;
-
-        // SAFETY: `args` is live and valid for the call. The exported macFUSE
-        // compatibility ABI accepts null operations for an external dispatcher;
-        // no Rust callback or userdata pointer is retained. libfuse3 parses or
-        // copies the argument data before returning.
-        let raw = unsafe { (api.session_new)(&mut args.raw, ptr::null(), 0, ptr::null_mut()) };
-        let Some(raw) = NonNull::new(raw) else {
-            // This constructor documents null as rejection but does not promise
-            // errno, so report the outcome without attaching stale errno.
-            return Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "native libfuse3 rejected the session or mount options",
-                mountpoint,
-                None,
-            ));
-        };
-
-        let mut owner = Self {
-            api,
-            raw: Some(raw),
-            mountpoint_c,
-            mountpoint_key: mountpoint.as_os_str().as_bytes().to_vec(),
-            identity: None,
-            mount_requested: false,
-            _thread_bound: PhantomData,
-        };
-
-        // SAFETY: `owner` holds the live caller reference and `mountpoint_c` is
-        // a valid NUL-terminated path for the call. macFUSE copies the path when
-        // accepting its deferred mount request.
-        let mount_result =
-            unsafe { (owner.api.session_mount)(raw.as_ptr(), owner.mountpoint_c.as_ptr()) };
-        if mount_result != 0 {
-            let cleanup = owner.cancel_and_destroy();
-            // `fuse_session_mount` documents only its zero/-1 outcome, not
-            // errno. Do not attach whatever errno cleanup or an earlier call
-            // happened to leave behind.
-            return Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "native libfuse3 failed to create the mount session",
-                mountpoint,
-                None,
-            )
-            .with_cleanup_failures(cleanup));
+    fn reconcile_pending(&mut self) {
+        let mut announced = self.worker.as_ref().is_some_and(|w| !w.is_finished())
+            || self.probe.as_ref().is_some_and(|p| !p.is_finished());
+        if announced {
+            eprintln!(
+                "DNG mount cleanup pending: macFUSE FSKit; target={}; owner={}; waiting for owned native work",
+                self.mountpoint.display(),
+                std::process::id()
+            );
         }
-        owner.mount_requested = true;
-
-        // SAFETY: `__error` returns this thread's live errno slot. Clearing it
-        // prevents a failure path that does not set errno from being mislabeled
-        // with an earlier call's value. `raw` remains protected by the caller
-        // reference. The returned descriptor is borrowed from macFUSE and is
-        // not adopted by Rust.
-        let borrowed_fd = unsafe {
-            *libc::__error() = 0;
-            (owner.api.session_fd)(raw.as_ptr())
-        };
-        if borrowed_fd < 0 {
-            // `fuse_session_fd`'s macOS implementation reports the channel
-            // creation failure through errno. Capture it immediately, before
-            // forced startup cleanup can overwrite it.
-            let source =
-                last_native_error("native libfuse3 failed to provide its mount channel descriptor");
-            let cleanup = owner.cancel_and_destroy();
-            return Err(MacFuseSessionError::new(
-                MacFuseSessionErrorKind::NativeSetup,
-                "native libfuse3 failed to provide its mount channel descriptor",
-                mountpoint,
-                Some(source),
-            )
-            .with_cleanup_failures(cleanup));
-        }
-
-        // SAFETY: macFUSE guarantees its descriptor is valid until native
-        // unmount. `owner` is live for this operation, and the temporary borrow
-        // is used only to duplicate the descriptor. fuser receives the duplicate
-        // as `OwnedFd`; ownership of macFUSE's original is never transferred.
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(borrowed_fd) };
-        let channel = match borrowed_fd.try_clone_to_owned() {
-            Ok(channel) => channel,
-            Err(source) => {
-                let cleanup = owner.cancel_and_destroy();
-                return Err(MacFuseSessionError::new(
-                    MacFuseSessionErrorKind::NativeSetup,
-                    "could not duplicate macFUSE's borrowed channel descriptor",
-                    mountpoint,
-                    Some(source),
-                )
-                .with_cleanup_failures(cleanup));
-            }
-        };
-
-        Ok((owner, channel))
-    }
-
-    fn capture_mount_identity(&mut self, timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
+        // Runs only in the existing isolated CLI mount owner, never the GUI.
+        // A timed-out native call remains here, visibly owned. No fallback or
+        // success is possible until both workers and the volume are reconciled.
         loop {
-            self.identity = self.find_mount_identity()?;
-            if self.identity.is_some() {
-                return Ok(());
+            let _ = self.poll_binding();
+            let result = self.try_unmount();
+            if result.is_ok() && self.probe.is_none() {
+                break;
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "the new macFUSE mount was absent from the macOS mount table after {:.3}s",
-                        timeout.as_secs_f64()
-                    ),
-                ));
+            if !announced {
+                eprintln!(
+                    "DNG mount cleanup pending: macFUSE FSKit; target={}; owner={}; {}",
+                    self.mountpoint.display(),
+                    std::process::id(),
+                    result
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "identity probe still running".into())
+                );
+                announced = true;
             }
-            thread::sleep(CLEANUP_OBSERVE_POLL);
+            thread::sleep(Duration::from_millis(100));
         }
     }
-
-    fn find_mount_identity(&self) -> io::Result<Option<MountIdentity>> {
-        let table = MountTable::load()?;
-        Ok(table.entries().iter().find_map(|entry| {
-            let mountpoint = c_field_bytes(&entry.f_mntonname);
-            (self.mountpoint_key == mountpoint).then(|| MountIdentity {
-                mountpoint,
-                source: c_field_bytes(&entry.f_mntfromname),
-                filesystem_type: c_field_bytes(&entry.f_fstypename),
-            })
-        }))
+    pub fn instance_id(&self) -> io::Result<String> {
+        self.is_mounted()?;
+        self.binding
+            .as_ref()
+            .map(|b| format_identity(&b.identity))
+            .ok_or_else(|| io::Error::other("mount ownership is not established"))
     }
-
-    fn owned_mount_is_present(&self) -> io::Result<bool> {
-        let Some(identity) = &self.identity else {
-            // Native cancellation is valid before the handshake records the
-            // application's mount-table key, but lack of that key cannot prove
-            // that the asynchronous helper or mount is absent.
-            return Err(io::Error::other(
-                "the session has no recorded mount-table identity, so mount presence is unknown",
-            ));
-        };
-        let table = MountTable::load()?;
-        Ok(table.entries().iter().any(|entry| {
-            MountIdentity {
-                mountpoint: c_field_bytes(&entry.f_mntonname),
-                source: c_field_bytes(&entry.f_mntfromname),
-                filesystem_type: c_field_bytes(&entry.f_fstypename),
-            } == *identity
-        }))
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
     }
-
-    fn request_native_unmount(&mut self) {
-        if let Some(raw) = self.raw {
-            // SAFETY: this object owns the live caller reference. The function
-            // is void and asynchronous on macOS; callers never interpret it as
-            // success. macFUSE serializes repeated requests internally.
-            unsafe { (self.api.session_unmount)(raw.as_ptr()) };
-        }
+    pub fn is_mounted(&self) -> io::Result<bool> {
+        let current = mount_identity(&self.mountpoint)?;
+        owned_observation(self.binding.as_ref().map(|b| &b.identity), current.as_ref())
     }
-
-    fn force_unmount(&mut self) {
-        if self.mount_requested {
-            if let Some(raw) = self.raw {
-                // SAFETY: the caller reference is live and all lifecycle access is
-                // confined to the constructing thread. `exit` marks an incomplete
-                // or abandoned request service terminal; macFUSE's documented
-                // unmount path then closes the channel and requests a forced backend
-                // unmount. No Rust pointer is shared with its native worker.
-                unsafe {
-                    (self.api.session_exit)(raw.as_ptr());
-                    (self.api.session_unmount)(raw.as_ptr());
-                }
-            }
+    pub fn try_unmount(&mut self) -> io::Result<UnmountOutcome> {
+        let present = self.is_mounted()?;
+        if present {
+            let binding = self.binding.as_ref().ok_or_else(|| {
+                io::Error::other("cleanup pending: mount ownership is not established")
+            })?;
+            unmount_binding(binding)?;
         }
-    }
-
-    fn force_os_unmount_if_present(&self) -> io::Result<()> {
-        let present = self.owned_mount_is_present()?;
-        if !present {
-            return Ok(());
+        if self.is_mounted()? {
+            return Err(io::Error::other("unmount returned before detachment"));
         }
-
-        // SAFETY: `mountpoint_c` remains a valid NUL-terminated path for the
-        // call and is not retained. This forced public VFS operation is used
-        // only after the final owner has entered terminal abandonment with a
-        // recorded mount-table identity, never in response to an ordinary
-        // retryable Busy result. It closes the kernel channel even if
-        // macFUSE's Disk Arbitration cleanup cannot create a DADisk reference.
-        let result = unsafe { libc::unmount(self.mountpoint_c.as_ptr(), libc::MNT_FORCE) };
-        if result == 0 {
-            return Ok(());
-        }
-
-        // Preserve the syscall failure before checking whether macFUSE's own
-        // concurrent forced-unmount request won the race.
-        let source = io::Error::last_os_error();
-        if matches!(self.owned_mount_is_present(), Ok(false)) {
-            Ok(())
+        self.state.release_native.store(true, Ordering::Release);
+        self.finish()?;
+        Ok(if present {
+            UnmountOutcome::Unmounted
         } else {
-            Err(source)
-        }
-    }
-
-    fn force_os_unmount_until_absent(&self, timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.force_os_unmount_if_present() {
-                Ok(()) => return Ok(()),
-                Err(error) if Instant::now() >= deadline => {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!(
-                            "forced unmount remained refused after {:.3}s: {error}",
-                            timeout.as_secs_f64()
-                        ),
-                    ));
-                }
-                Err(_) => thread::sleep(CLEANUP_OBSERVE_POLL),
-            }
-        }
-    }
-
-    fn wait_until_owned_mount_absent(&self, timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if !self.owned_mount_is_present()? {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "the recorded macFUSE mount remained present after {:.3}s",
-                        timeout.as_secs_f64()
-                    ),
-                ));
-            }
-            thread::sleep(CLEANUP_OBSERVE_POLL);
-        }
-    }
-
-    fn cancel_and_destroy(&mut self) -> Vec<String> {
-        let mut failures = Vec::new();
-        // Before an identity is recorded, pathname-based forced unmount is not
-        // authorized and absence cannot be observed through this owner. The
-        // native exit/unmount path still cancels the delayed/connecting mount;
-        // macFUSE's callback holds its own counted session reference.
-        let can_observe_mount = self.identity.is_some();
-        if can_observe_mount {
-            let _ = self.force_os_unmount_if_present();
-        }
-        self.force_unmount();
-        if can_observe_mount {
-            if let Err(error) = self.force_os_unmount_until_absent(CLEANUP_OBSERVE_TIMEOUT) {
-                failures.push(format!("forced OS unmount: {error}"));
-            }
-            if let Err(error) = self.wait_until_owned_mount_absent(CLEANUP_OBSERVE_TIMEOUT) {
-                failures.push(format!("mount disappearance: {error}"));
-            }
-        }
-        self.destroy();
-        failures
-    }
-
-    fn destroy(&mut self) {
-        if let Some(raw) = self.raw.take() {
-            // SAFETY: this releases exactly the caller reference returned by
-            // `fuse_session_new`. No fuser reader remains when called by the
-            // composite guard. During construction failure or NativeSession
-            // Drop, forced channel shutdown precedes release. macFUSE's own
-            // asynchronous workers retain separate counted references, so
-            // releasing this caller reference does not invalidate their state.
-            unsafe { (self.api.session_destroy)(raw.as_ptr()) };
-            self.mount_requested = false;
-        }
-    }
-}
-
-impl Drop for NativeSession {
-    fn drop(&mut self) {
-        // Handles partial construction, including a native channel created
-        // before any fuser reader exists. In that pre-identity state this
-        // requests source-supported native cancellation but does not claim
-        // mount/helper disappearance was observed. This never panics; the
-        // composite MacFuseSession performs the stronger reader-join ordering
-        // once a worker has been established.
-        let _ = self.cancel_and_destroy();
-    }
-}
-
-struct MountTable {
-    entries: NonNull<libc::statfs>,
-    len: usize,
-}
-
-impl MountTable {
-    fn load() -> io::Result<Self> {
-        let mut entries = ptr::null_mut();
-        // SAFETY: `entries` is a valid out-pointer. `getmntinfo_r_np` allocates
-        // and initializes `count` statfs records, transfers that allocation to
-        // this caller, and does not retain the out-pointer itself.
-        let count = unsafe { getmntinfo_r_np(&mut entries, libc::MNT_NOWAIT) };
-        if count <= 0 {
-            // The API promises errno on failure; capture it before any call that
-            // might modify thread-local errno.
-            return Err(io::Error::last_os_error());
-        }
-        let Some(entries) = NonNull::new(entries) else {
-            return Err(io::Error::other(
-                "getmntinfo_r_np returned a positive count with a null allocation",
-            ));
-        };
-        Ok(Self {
-            entries,
-            len: count as usize,
+            UnmountOutcome::AlreadyUnmounted
         })
     }
+    fn finish(&mut self) -> io::Result<()> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while self.worker.as_ref().is_some_and(|w| !w.is_finished()) {
+            if Instant::now() >= end {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native worker has not exited; retaining its state and library in this mount process",
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(w) = self.worker.take() {
+            let result = w
+                .join()
+                .map_err(|_| io::Error::other("FUSE3 worker panicked"))?;
+            result?;
+        }
+        if self.probe.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "ownership probe cleanup is still pending",
+            ));
+        }
+        if self.state.native_destroyed.load(Ordering::Acquire) && !mounted(&self.mountpoint)? {
+            self.directory.cleanup();
+        } else if self.directory.cleanup_pending {
+            self.directory.cleanup_pending = false;
+            eprintln!(
+                "DNG mount folder retained: {}: native teardown or detachment is not confirmed",
+                self.mountpoint.display()
+            );
+        }
+        ACTIVE.store(false, Ordering::Release);
+        Ok(())
+    }
 
-    fn entries(&self) -> &[libc::statfs] {
-        // SAFETY: construction accepts only the non-null allocation and exact
-        // initialized element count returned by `getmntinfo_r_np`. The slice is
-        // bounded by `self`, which frees the allocation only in Drop.
-        unsafe { std::slice::from_raw_parts(self.entries.as_ptr(), self.len) }
+    pub fn wait_until_unmounted(mut self) -> io::Result<()> {
+        while self.worker.as_ref().is_some_and(|w| !w.is_finished()) {
+            let present = self.is_mounted()?;
+            if !present {
+                self.state.release_native.store(true, Ordering::Release);
+            }
+            if self.state.failed.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "DNG callback failed; reconciling this mount before exit",
+                ));
+            }
+            if self.cancellation.load(Ordering::Acquire) {
+                match self.try_unmount() {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::ResourceBusy => {
+                        thread::sleep(Duration::from_secs(1));
+                        eprintln!("DNG volume is busy; close its files and retry unmount: {e}");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        self.finish()
     }
 }
-
-impl Drop for MountTable {
+impl Drop for MacFuseSession {
     fn drop(&mut self) {
-        // SAFETY: `getmntinfo_r_np` transferred this allocation to the caller
-        // with the documented requirement that it be released using free(3).
-        // This guard owns it exactly once and no derived slice outlives Drop.
-        unsafe { libc::free(self.entries.as_ptr().cast()) };
+        if self.worker.is_some() || self.probe.is_some() || ACTIVE.load(Ordering::Acquire) {
+            // Dropping a rejected attempt is not user cancellation. The request
+            // token belongs to the CLI/GUI owner and is never reset or synthesized here.
+            self.reconcile_pending();
+        }
     }
 }
 
-fn c_field_bytes<const N: usize>(field: &[c_char; N]) -> Vec<u8> {
-    field
-        .iter()
-        .map(|value| *value as u8)
-        .take_while(|value| *value != 0)
-        .collect()
+// The source marker identifies a reusable backing leaf, not a mounted instance.
+// Removal also requires its original pinned identity and a reconciled session.
+const LEAF_OWNER: &CStr = c"org.mcraw4vulkan.mount-source";
+fn leaf_key(source: &Path) -> Vec<u8> {
+    let mut key = b"v1\0".to_vec();
+    key.extend_from_slice(source.as_os_str().as_bytes());
+    key
+}
+fn ordinary_leaf(path: &Path) -> io::Result<std::fs::File> {
+    if mounted(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "mount leaf is occupied",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("mount leaf has no parent"))?;
+    // SAFETY: geteuid has no pointer arguments or process mutation.
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.dev() != std::fs::metadata(parent)?.dev()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "mount leaf is not a same-user directory on its parent's filesystem",
+        ));
+    }
+    Ok(file)
+}
+pub fn reusable_mount_directory(path: &Path, source: &Path) -> io::Result<bool> {
+    let file = match ordinary_leaf(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let expected = leaf_key(source);
+    if expected.len() > 8192 {
+        return Ok(false);
+    }
+    let mut value = vec![0u8; expected.len() + 1];
+    // SAFETY: the pinned ordinary-directory descriptor, terminated attribute
+    // name and writable buffer remain valid throughout this bounded xattr call.
+    let n = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            LEAF_OWNER.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    let matches = n == expected.len() as isize && value[..expected.len()] == expected;
+    if matches && std::fs::read_dir(path)?.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the existing DNG mount folder contains files; preserve them and empty the folder before mounting",
+        ));
+    }
+    Ok(matches)
+}
+/// Pins the ordinary backing directory before native work starts. This is not
+/// mounted-instance authority. The session disarms Drop until native teardown.
+pub struct MountDirectory {
+    path: PathBuf,
+    parent: std::fs::File,
+    leaf: std::fs::File,
+    name: CString,
+    key: Vec<u8>,
+    owned: bool,
+    marker_required: bool,
+    cleanup_on_drop: bool,
+    cleanup_pending: bool,
+}
+impl MountDirectory {
+    pub fn prepare(path: &Path, source: &Path) -> io::Result<Self> {
+        let key = leaf_key(source);
+        if key.len() > 8192 || !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid mount leaf or source identity",
+            ));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("mount leaf has no name"))?;
+        let parent_path = std::fs::canonicalize(
+            path.parent()
+                .ok_or_else(|| io::Error::other("mount leaf has no parent"))?,
+        )?;
+        let path = parent_path.join(name);
+        let name = CString::new(name.as_bytes())?;
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&parent_path)?;
+        if mounted(&path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mount leaf is occupied",
+            ));
+        }
+        // Exclusive creation never adopts or marks an existing user directory.
+        let created = match std::fs::create_dir(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e),
+        };
+        let leaf = match ordinary_leaf(&path) {
+            Ok(leaf) => leaf,
+            Err(error) => {
+                // Creation and open are not atomic. Without the original pinned
+                // identity, reopening this name cannot authorize rollback.
+                eprintln!(
+                    "DNG mount folder retained: {}: backing identity was not established during preparation: {error}",
+                    path.display()
+                );
+                return Err(error);
+            }
+        };
+        // Serialize cooperating mount owners even while native startup has not
+        // published a mount. Holding the backing vnode does not pin the volume.
+        if unsafe { libc::flock(leaf.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            // No rollback may delete beneath a cooperating owner holding this
+            // leaf, even if this attempt originally created the directory.
+            eprintln!(
+                "DNG mount folder retained: {}: backing directory lock was not acquired during preparation: {error}",
+                path.display()
+            );
+            return Err(error);
+        }
+        let owned = created || leaf_owner_matches(&leaf, &key);
+        let mut directory = Self {
+            path,
+            parent,
+            leaf,
+            name,
+            key,
+            owned,
+            marker_required: !created,
+            cleanup_on_drop: true,
+            cleanup_pending: true,
+        };
+        if std::fs::read_dir(&directory.path)?.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                "mount folder contains files",
+            ));
+        }
+        if created {
+            // SAFETY: descriptor, terminated name and bounded value are live.
+            // If marking fails, only this exclusively created, pinned empty
+            // directory can be removed, before any native startup is possible.
+            if unsafe {
+                libc::fsetxattr(
+                    directory.leaf.as_raw_fd(),
+                    LEAF_OWNER.as_ptr(),
+                    directory.key.as_ptr().cast(),
+                    directory.key.len(),
+                    0,
+                    libc::XATTR_CREATE,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            directory.marker_required = true;
+        }
+        Ok(directory)
+    }
+
+    fn remove_empty(&self) -> io::Result<bool> {
+        if mounted(&self.path)? {
+            return Err(io::Error::other(
+                "a filesystem still occupies the mount path",
+            ));
+        }
+        let parent_now = std::fs::symlink_metadata(self.path.parent().unwrap())?;
+        let parent = self.parent.metadata()?;
+        if !parent_now.is_dir() || !same_directory(&parent_now, &parent) {
+            return Err(io::Error::other("backing parent identity changed"));
+        }
+        // SAFETY: the pinned parent and one normal, terminated leaf name remain
+        // live. O_NOFOLLOW refuses replacement symlinks, including broken ones.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        let current = unsafe { std::fs::File::from_raw_fd(fd) };
+        let expected = self.leaf.metadata()?;
+        if !same_directory(&current.metadata()?, &expected)
+            || (self.marker_required && !leaf_owner_matches(&current, &self.key))
+        {
+            return Err(io::Error::other(
+                "backing leaf identity or source marker changed",
+            ));
+        }
+        let mut final_stat: libc::stat = unsafe { std::mem::zeroed() };
+        // Recheck the name relative to the same parent immediately before rmdir.
+        // POSIX has no inode-conditional rmdir: an uncooperative writer can still
+        // race the final check/unlinkat. This is not a directory security boundary.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                &mut final_stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if final_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || final_stat.st_dev as u64 != expected.dev()
+            || final_stat.st_ino != expected.ino()
+        {
+            return Err(io::Error::other("backing leaf changed before removal"));
+        }
+        // Nonrecursive removal is the emptiness check, including hidden entries.
+        // No child, marker, or parent is ever removed to make this succeed.
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        Ok(true)
+    }
+
+    fn cleanup(&mut self) {
+        if !self.cleanup_pending {
+            return;
+        }
+        self.cleanup_pending = false;
+        let outcome = if self.owned {
+            self.remove_empty()
+        } else {
+            Err(io::Error::other(
+                "directory was supplied by the user, without matching application ownership",
+            ))
+        };
+        match outcome {
+            Ok(true) => eprintln!("DNG mount folder removed: {}", self.path.display()),
+            Ok(false) => eprintln!("DNG mount folder already absent: {}", self.path.display()),
+            Err(error) => eprintln!(
+                "DNG mount folder retained: {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+}
+impl Drop for MountDirectory {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            self.cleanup();
+        }
+    }
+}
+fn same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+fn leaf_owner_matches(file: &std::fs::File, expected: &[u8]) -> bool {
+    let mut value = vec![0u8; expected.len() + 1];
+    // SAFETY: the descriptor, attribute name and bounded output buffer are live.
+    let n = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            LEAF_OWNER.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    n == expected.len() as isize && value[..expected.len()] == *expected
 }
 
-fn last_native_error(context: &str) -> io::Error {
-    let error = io::Error::last_os_error();
-    if error.raw_os_error().is_some_and(|code| code != 0) {
-        error
+struct MountBinding {
+    identity: MountIdentity,
+    // O_EVTONLY pins the actual root vnode without making normal eject busy.
+    root: std::fs::File,
+}
+fn bind_mount(target: &Path, state: &State) -> io::Result<MountBinding> {
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(target)?;
+    let relative = CString::new(&state.challenge.as_bytes()[1..])?;
+    // SAFETY: both stat structures are initialized writable C objects; the
+    // descriptor and challenge string remain live through these synchronous calls.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    state.challenge_seen.store(false, Ordering::Release);
+    let result = unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != -1
+        || io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
+        || !state.challenge_seen.load(Ordering::Acquire)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "target did not answer this mount owner's challenge; refusing path cleanup",
+        ));
+    }
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(root.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let identity = identity_from_statfs(&stat);
+    owned_observation(Some(&identity), mount_identity(target)?.as_ref())?;
+    Ok(MountBinding { identity, root })
+}
+type Funmount = unsafe extern "C" fn(c_int, c_int) -> c_int;
+fn instance_unmount_api() -> io::Result<(Library, Funmount)> {
+    // Deferred OS API: no new eager symbol on older supported systems. The
+    // descriptor pins this filesystem, so a replacement path cannot be targeted.
+    // No path-based fallback is allowed if the instance operation is unavailable.
+    let library =
+        unsafe { Library::open(Some("/usr/lib/libSystem.B.dylib"), RTLD_NOW | RTLD_LOCAL) }
+            .map_err(io::Error::other)?;
+    let function = unsafe { library.get::<Funmount>(b"funmount\0") }.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "DNG mounting requires macOS support for instance-bound unmount; other application features remain available",
+        )
+    })?;
+    let function = *function;
+    Ok((library, function))
+}
+fn unmount_binding(binding: &MountBinding) -> io::Result<()> {
+    let (_library, function) = instance_unmount_api()?;
+    // SAFETY: the pinned root descriptor and verified OS function remain live
+    // through this call. MNT_NOBLOCK requests normal, non-forced instance unmount.
+    if unsafe { function(binding.root.as_raw_fd(), libc::MNT_NOBLOCK) } == 0 {
+        Ok(())
     } else {
-        io::Error::other(context.to_string())
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EBUSY) {
+            Err(io::Error::new(io::ErrorKind::ResourceBusy, e))
+        } else {
+            Err(e)
+        }
+    }
+}
+unsafe extern "C" {
+    fn getmntinfo_r_np(entries: *mut *mut libc::statfs, flags: c_int) -> c_int;
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountIdentity {
+    fsid: [i32; 2],
+    source: Vec<u8>,
+    kind: Vec<u8>,
+}
+fn owned_observation(
+    owned: Option<&MountIdentity>,
+    current: Option<&MountIdentity>,
+) -> io::Result<bool> {
+    if current.is_some() && (owned.is_none() || current != owned) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "mount identity changed",
+        ));
+    }
+    Ok(current.is_some())
+}
+
+fn mount_identity(path: &Path) -> io::Result<Option<MountIdentity>> {
+    let mut entries = ptr::null_mut();
+    // SAFETY: public NOWAIT mount-table snapshot never resolves through a
+    // possibly blocked mount. Its caller-owned allocation is freed exactly once.
+    let count = unsafe { getmntinfo_r_np(&mut entries, libc::MNT_NOWAIT) };
+    let Some(entries) = NonNull::new(entries) else {
+        return Err(io::Error::last_os_error());
+    };
+    if count < 0 {
+        unsafe { libc::free(entries.as_ptr().cast()) };
+        return Err(io::Error::last_os_error());
+    }
+    let found = unsafe { std::slice::from_raw_parts(entries.as_ptr(), count as usize) }
+        .iter()
+        .find_map(|s| {
+            let bytes: Vec<u8> = s
+                .f_mntonname
+                .iter()
+                .map(|c| *c as u8)
+                .take_while(|c| *c != 0)
+                .collect();
+            (bytes == path.as_os_str().as_bytes()).then(|| identity_from_statfs(s))
+        });
+    unsafe { libc::free(entries.as_ptr().cast()) };
+    Ok(found)
+}
+
+fn identity_from_statfs(s: &libc::statfs) -> MountIdentity {
+    fn bytes(a: &[c_char]) -> Vec<u8> {
+        a.iter().map(|c| *c as u8).take_while(|c| *c != 0).collect()
+    }
+    MountIdentity {
+        // SAFETY: Darwin's fsid is exactly two 32-bit words, size checked by transmute.
+        fsid: unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(s.f_fsid) },
+        source: bytes(&s.f_mntfromname),
+        kind: bytes(&s.f_fstypename),
     }
 }
 
-// Native lifecycle tests use test-owned process inspection and termination and
-// are intentionally retained only in the private validation source.
+pub fn mounted(path: &Path) -> io::Result<bool> {
+    Ok(mount_identity(path)?.is_some())
+}
+
+fn mount_options(volume: &str) -> String {
+    format!(
+        "ro,quiet,volname={},backend=fskit",
+        volume.replace([',', '\0'], "_")
+    )
+}
+fn verify_fskit_mount(path: &Path) -> io::Result<()> {
+    let table = bounded_command("/sbin/mount", &[])?;
+    if !table.status.success() {
+        return Err(io::Error::other("could not observe FSKit mount table"));
+    }
+    let text = String::from_utf8_lossy(&table.stdout);
+    let suffix = format!(" on {} (", path.display());
+    let line = text
+        .lines()
+        .find(|l| l.contains(&suffix))
+        .ok_or_else(|| io::Error::other("ready FSKit mount absent from mount table"))?;
+    if !line.starts_with("macfuse://") || !line.contains("(macfuse,") || !line.contains(", fskit,")
+    {
+        return Err(io::Error::other(format!(
+            "unexpected FSKit mount identity: {line}"
+        )));
+    }
+    Ok(())
+}
+
+/// Mount-table identity only; never touches files through the mounted volume.
+pub fn mount_instance_id(path: &Path) -> io::Result<Option<String>> {
+    Ok(mount_identity(path)?.as_ref().map(format_identity))
+}
+fn format_identity(m: &MountIdentity) -> String {
+    let bytes = m
+        .kind
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(m.source.iter().copied());
+    format!(
+        "owned-v2:{:08x}{:08x}-{}",
+        m.fsid[0],
+        m.fsid[1],
+        bytes.map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+/// A registry request must supply the identity published by the owning session.
+/// Opening a replacement path cannot authorize it: the pinned descriptor must
+/// match that saved identity before the instance-bound unmount operation.
+pub fn unmount_instance(path: &Path, expected: &str) -> io::Result<UnmountOutcome> {
+    if !expected.starts_with("owned-v2:") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "legacy or missing mount ownership; use its owning process or Finder",
+        ));
+    }
+    if !mounted(path)? {
+        return Ok(UnmountOutcome::AlreadyUnmounted);
+    }
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    // SAFETY: valid live descriptor and one writable system statfs structure.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(root.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let binding = MountBinding {
+        root,
+        identity: identity_from_statfs(&stat),
+    };
+    if format_identity(&binding.identity) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "registered mount was replaced; refusing unmount",
+        ));
+    }
+    unmount_binding(&binding)?;
+    Ok(UnmountOutcome::Unmounted)
+}

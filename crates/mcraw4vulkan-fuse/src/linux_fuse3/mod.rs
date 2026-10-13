@@ -9,14 +9,12 @@ mod mount;
 pub use crate::virtual_fs::{
     AUDIO_WAV_INODE, AudioWavMetadata, CLIP_DIR_INODE, CachedDngFrame,
     DEFAULT_DNG_CACHE_FRAME_CAPACITY, DEFAULT_PREFETCH_FORWARD_FRAMES, DngFrameByteCache,
-    DngFrameCacheStats, DngFrameGenerator, DngGenerationBackend, DngGenerationConfig,
-    DngGenerationTimings, FIRST_FRAME_INODE, GeneratedDngFrame, InodeMap,
-    LOWER_MEMORY_DNG_CACHE_FRAME_CAPACITY, LOWER_MEMORY_PREFETCH_FORWARD_FRAMES,
-    LOWEST_MEMORY_DNG_CACHE_FRAME_CAPACITY, LOWEST_MEMORY_PREFETCH_FORWARD_FRAMES, LazyAudioWav,
-    LazyAudioWavConfig, ROOT_INODE, ReadStatsSnapshot, VirtualDirEntry, VirtualFileBytes,
-    VirtualFileKind, VirtualFileMetadata, VirtualFileSystem, VirtualFileSystemConfig,
-    VirtualFileSystemStatsSnapshot, VirtualMetadataProvider, VirtualNode, VirtualReadData,
-    VirtualRuntimeStats, VirtualRuntimeStatsSnapshot,
+    DngFrameGenerator, DngGenerationBackend, DngGenerationConfig, FIRST_FRAME_INODE,
+    GeneratedDngFrame, InodeMap, LOWER_MEMORY_DNG_CACHE_FRAME_CAPACITY,
+    LOWER_MEMORY_PREFETCH_FORWARD_FRAMES, LOWEST_MEMORY_DNG_CACHE_FRAME_CAPACITY,
+    LOWEST_MEMORY_PREFETCH_FORWARD_FRAMES, LazyAudioWav, LazyAudioWavConfig, ROOT_INODE,
+    VirtualDirEntry, VirtualFileBytes, VirtualFileKind, VirtualFileMetadata, VirtualFileSystem,
+    VirtualFileSystemConfig, VirtualMetadataProvider, VirtualNode, VirtualReadData,
 };
 
 pub use crate::virtual_timestamp::{
@@ -27,11 +25,7 @@ pub use crate::virtual_timestamp::{
 pub use fuser_fs::LinuxFuse3FileSystem;
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)]
-pub(crate) use fuser_fs::LinuxSharedRootFuse3FileSystem;
-#[cfg(target_os = "linux")]
-#[allow(unused_imports)]
 pub(crate) use fuser_fs::LinuxSingleClipRootFuse3FileSystem;
 pub use mount::{
-    MountHandle, MountManager, MountRequest, MountpointUnmountStatus, SharedRootMountHandle,
-    SharedRootMountRequest, SharedRootMountedClip, unmount_owned_mountpoint,
+    MountHandle, MountManager, MountRequest, MountpointUnmountStatus, unmount_owned_mountpoint,
 };

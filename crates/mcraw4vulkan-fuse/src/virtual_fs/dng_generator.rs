@@ -1,14 +1,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mcraw4vulkan_core::{
     BayerPattern, DecodedBayerU16Frame, FrameDimensions, FrameNumber, FramePayloadLayout, FrameRate,
 };
+use mcraw4vulkan_cpu::CpuFrameDecoder;
 use mcraw4vulkan_cpu::raw_decoder::validate_frame_payload;
-use mcraw4vulkan_cpu::{CpuFrameDecoder, DecodeFrameTimings};
 use mcraw4vulkan_dngwriter::{
     DngFrameDescription, DngOutputCorrection, DngSinkDecodeSource, DngSinkFrame,
     DngSinkVignetteMode, DngWriter, DngWriterConfig, build_dng_frame_description_for_sink,
@@ -79,7 +78,7 @@ impl Default for DngGenerationConfig {
     }
 }
 
-// Complete DNG bytes for one frame plus timing information.
+// Complete DNG bytes for one frame.
 //
 // This is the output that the virtual read path caches and exposes as a normal
 // file. Platform adapters should slice these bytes for random reads instead of
@@ -88,31 +87,6 @@ impl Default for DngGenerationConfig {
 pub struct GeneratedDngFrame {
     pub frame_index: usize,
     pub bytes: Vec<u8>,
-    pub timings: DngGenerationTimings,
-}
-
-// Timing and byte-count breakdown for one DNG frame generation.
-//
-// These counters are instrumentation only. They do not change output bytes,
-// cache behavior, or Resolve-facing file semantics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DngGenerationTimings {
-    pub raw_payload_bytes: u64,
-    pub decoded_pixel_bytes: u64,
-    pub final_dng_bytes: u64,
-
-    pub dng_description_time: Duration,
-    pub payload_read_time: Duration,
-    pub decode_time: Duration,
-    pub gpu_work_plan_time: Duration,
-    pub gpu_cpu_prepare_time: Duration,
-    pub gpu_upload_time: Duration,
-    pub gpu_encode_submit_time: Duration,
-    pub gpu_wait_map_time: Duration,
-    pub gpu_readback_convert_time: Duration,
-    pub gpu_dispatch_readback_time: Duration,
-    pub dng_build_time: Duration,
-    pub total_time: Duration,
 }
 
 // Reusable frame generator for complete DNG byte buffers.
@@ -205,6 +179,7 @@ impl DngFrameGenerator {
         Self::open_with_prepared_geometry(path, config, None)
     }
 
+    #[rustfmt::skip]
     pub(crate) fn open_with_prepared_geometry(
         path: &Path,
         config: DngGenerationConfig,
@@ -235,7 +210,6 @@ impl DngFrameGenerator {
             DngGenerationBackend::Gpu { backend_preference } => {
                 let gpu_backend_result = GpuDecodeBackend::new_blocking(GpuDecodeConfig {
                     backend_preference,
-                    ..GpuDecodeConfig::default()
                 })
                 .context("failed to create GPU backend for DNG generation");
                 let gpu_backend = gpu_backend_result?;
@@ -475,21 +449,12 @@ impl DngFrameByteLenCalculator {
 struct PreparedGpuCanonicalDngFrame {
     frame_index: usize,
     dng_description: DngFrameDescription,
-    dng_description_time: Duration,
-    payload_read_time: Duration,
-    raw_payload_bytes: u64,
     exact_pixel_byte_len: usize,
-    decoded_pixel_bytes: u64,
 }
 
 struct ConsumedGpuCanonicalDngFrame {
     frame_index: usize,
     bytes: Vec<u8>,
-    dng_description_time: Duration,
-    payload_read_time: Duration,
-    raw_payload_bytes: u64,
-    decoded_pixel_bytes: u64,
-    dng_build_time: Duration,
 }
 
 fn select_gpu_canonical_dng_batch_route(
@@ -634,44 +599,13 @@ fn generate_frames_gpu_canonical_dng_in_flight(
         }
     };
 
-    anyhow::ensure!(
-        output.values.len() == output.timings.len(),
-        "in-flight DNG generation returned {} values for {} timing rows",
-        output.values.len(),
-        output.timings.len()
-    );
-
     output
         .values
         .into_iter()
-        .zip(output.timings)
-        .map(|(consumed, gpu_timings)| {
-            let decode_time = gpu_timings.total;
-            let final_dng_bytes = usize_to_u64(consumed.bytes.len(), "final DNG byte length")?;
+        .map(|consumed| {
             Ok(GeneratedDngFrame {
                 frame_index: consumed.frame_index,
                 bytes: consumed.bytes,
-                timings: DngGenerationTimings {
-                    raw_payload_bytes: consumed.raw_payload_bytes,
-                    decoded_pixel_bytes: consumed.decoded_pixel_bytes,
-                    final_dng_bytes,
-                    dng_description_time: consumed.dng_description_time,
-                    payload_read_time: consumed.payload_read_time,
-                    decode_time,
-                    gpu_work_plan_time: gpu_timings.work_plan,
-                    gpu_cpu_prepare_time: gpu_timings.cpu_prepare,
-                    gpu_upload_time: gpu_timings.upload,
-                    gpu_encode_submit_time: gpu_timings.encode_submit,
-                    gpu_wait_map_time: gpu_timings.wait_map,
-                    gpu_readback_convert_time: gpu_timings.readback_convert,
-                    gpu_dispatch_readback_time: gpu_timings.dispatch_readback,
-                    dng_build_time: consumed.dng_build_time,
-                    total_time: consumed
-                        .dng_description_time
-                        .saturating_add(consumed.payload_read_time)
-                        .saturating_add(decode_time)
-                        .saturating_add(consumed.dng_build_time),
-                },
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -697,35 +631,25 @@ fn prepare_gpu_canonical_dng_frame(
         bail_unsupported_gpu_decode::<()>(payload_layout)?;
     }
 
-    let description_start = Instant::now();
     let dng_description =
         dng_description_for_container_frame(container, frame_number, vignette_mode.into())
             .with_context(|| format!("failed to build DNG description for frame {frame_index}"))?;
-    let dng_description_time = description_start.elapsed();
-
-    let payload_start = Instant::now();
     let raw_payload = raw_payload_vec_for_frame(container, frame_number)
         .with_context(|| format!("failed to read raw payload for frame {frame_index}"))?;
-    let payload_read_time = payload_start.elapsed();
-    let raw_payload_bytes = usize_to_u64(raw_payload.len(), "raw payload byte length")?;
 
     let exact_pixel_byte_len = exact_pixel_byte_len(dng_description.dimensions)?;
-    let decoded_pixel_bytes = usize_to_u64(exact_pixel_byte_len, "frame u16 pixel byte length")?;
 
     Ok((
         PreparedGpuCanonicalDngFrame {
             frame_index,
             dng_description,
-            dng_description_time,
-            payload_read_time,
-            raw_payload_bytes,
             exact_pixel_byte_len,
-            decoded_pixel_bytes,
         },
         raw_payload,
     ))
 }
 
+#[rustfmt::skip]
 fn consume_gpu_canonical_dng_frame(
     prepared: &RefCell<HashMap<usize, PreparedGpuCanonicalDngFrame>>,
     dng_writer: &DngWriter,
@@ -752,7 +676,6 @@ fn consume_gpu_canonical_dng_frame(
     .with_context(|| {
         format!("mapped in-flight GPU output/frame contract mismatch for frame {frame_index}")
     })?;
-    let dng_build_start = Instant::now();
     let bytes = dng_writer
         .write_uncompressed_frame_from_decoded_bayer_u16_frame_to_vec(
             &prepared_frame.dng_description,
@@ -761,16 +684,10 @@ fn consume_gpu_canonical_dng_frame(
         .with_context(|| {
             format!("failed to build in-flight canonical GPU DNG bytes for frame {frame_index}")
         })?;
-    let dng_build_time = dng_build_start.elapsed();
 
     Ok(ConsumedGpuCanonicalDngFrame {
         frame_index,
         bytes,
-        dng_description_time: prepared_frame.dng_description_time,
-        payload_read_time: prepared_frame.payload_read_time,
-        raw_payload_bytes: prepared_frame.raw_payload_bytes,
-        decoded_pixel_bytes: prepared_frame.decoded_pixel_bytes,
-        dng_build_time,
     })
 }
 
@@ -788,6 +705,7 @@ fn bail_unsupported_gpu_decode<T>(payload_layout: FramePayloadLayout) -> Result<
 //
 // This is a free helper rather than an &mut self method so generate_frame() can
 // borrow DngFrameGenerator fields independently without double-borrowing self.
+#[rustfmt::skip]
 fn generate_frame_cpu(
     container: &McrawContainer,
     cpu_frame_decoder: &mut CpuFrameDecoder,
@@ -796,25 +714,15 @@ fn generate_frame_cpu(
     gpu_vignette: Option<&mut ActiveGpuVignetteBackend>,
     frame_index: usize,
 ) -> Result<GeneratedDngFrame> {
-    let total_start = Instant::now();
     let frame_number = frame_number_from_index(frame_index)?;
-    let (entry_byte_len, entry_dimensions) = {
-        let entry = container.frame_entry(frame_number)?;
-        (
-            entry.byte_len,
-            container
-                .resolved_frame_geometry(frame_number)?
-                .extraction(),
-        )
-    };
-
-    let description_start = Instant::now();
+    container.frame_entry(frame_number)?;
+    let entry_dimensions = container
+        .resolved_frame_geometry(frame_number)?
+        .extraction();
+    let entry_byte_len = container.frame_entry(frame_number)?.byte_len;
     let dng_description =
         dng_description_for_container_frame(container, frame_number, vignette_mode.into())
             .with_context(|| format!("failed to build DNG description for frame {frame_index}"))?;
-    let dng_description_time = description_start.elapsed();
-
-    let payload_start = Instant::now();
     cpu_frame_decoder.prepare_compressed(entry_byte_len as usize);
     container
         .read_video_payload_into(frame_number, cpu_frame_decoder.compressed_mut())
@@ -823,39 +731,31 @@ fn generate_frame_cpu(
         cpu_frame_decoder.compressed_mut(),
         container.resolved_frame_geometry(frame_number)?,
     )?;
-    let payload_read_time = payload_start.elapsed();
-
-    let decode_start = Instant::now();
     let frame_metadata = container.frame_metadata(frame_number)?;
     let payload_layout = frame_metadata.payload_layout()?;
-    let mut decode_timings = DecodeFrameTimings::default();
     let (decoded_bayer_frame, _raw_decode_info) = cpu_frame_decoder
         .decode_loaded_payload_to_decoded_bayer_u16_frame_with_layout(
             entry_dimensions,
             payload_layout,
-            &mut decode_timings,
         )
         .with_context(|| format!("failed to CPU-decode frame {frame_index}"))?;
     let decoded_bayer_frame = decoded_bayer_frame
         .with_resolved_geometry(container.resolved_frame_geometry(frame_number)?)?;
 
-    let (sink_frame, gpu_timings) = match vignette_mode {
+    let sink_frame = match vignette_mode {
         DngSinkVignetteMode::None => {
             let owned_frame = DecodedBayerU16Frame::from_owned_le_bytes(
                 decoded_bayer_frame.dimensions(),
                 decoded_bayer_frame.into_owned_le_bytes(),
             )
             .context("CPU decoded Bayer U16 frame failed sink validation")?;
-            (
-                DngSinkFrame::new(
-                    frame_number,
-                    owned_frame,
-                    vignette_mode,
-                    DngSinkDecodeSource::CpuFallbackNoVig,
-                    dng_description,
-                )?,
-                None,
-            )
+            DngSinkFrame::new(
+                frame_number,
+                owned_frame,
+                vignette_mode,
+                DngSinkDecodeSource::CpuFallbackNoVig,
+                dng_description,
+            )?
         }
         DngSinkVignetteMode::LumaPlane0 => {
             let gpu_vignette = gpu_vignette.context(
@@ -903,53 +803,22 @@ fn generate_frame_cpu(
                 .with_context(|| {
                     format!("failed to GPU-correct CPU-decoded frame {frame_index}")
                 })?;
-            (
-                DngSinkFrame::new(
-                    frame_number,
-                    corrected.value,
-                    vignette_mode,
-                    DngSinkDecodeSource::CpuFallbackGpuVignette,
-                    dng_description,
-                )?,
-                Some(corrected.timings),
-            )
+            DngSinkFrame::new(
+                frame_number,
+                corrected.value,
+                vignette_mode,
+                DngSinkDecodeSource::CpuFallbackGpuVignette,
+                dng_description,
+            )?
         }
     };
-    let decode_time = decode_start.elapsed();
-
-    let decoded_pixel_bytes = usize_to_u64(
-        sink_frame.pixel_bytes_le().len(),
-        "decoded Bayer U16 byte length",
-    )?;
-
-    let dng_build_start = Instant::now();
     let bytes = dng_writer
         .write_uncompressed_dng_sink_frame_to_vec(&sink_frame)
         .with_context(|| format!("failed to build CPU DNG bytes for frame {frame_index}"))?;
-    let dng_build_time = dng_build_start.elapsed();
-    let final_dng_bytes = usize_to_u64(bytes.len(), "final DNG byte length")?;
-    let gpu_timings = gpu_timings.unwrap_or_default();
 
     Ok(GeneratedDngFrame {
         frame_index,
         bytes,
-        timings: DngGenerationTimings {
-            raw_payload_bytes: u64::from(entry_byte_len),
-            decoded_pixel_bytes,
-            final_dng_bytes,
-            dng_description_time,
-            payload_read_time,
-            decode_time,
-            gpu_work_plan_time: gpu_timings.work_plan,
-            gpu_cpu_prepare_time: gpu_timings.cpu_prepare,
-            gpu_upload_time: gpu_timings.upload,
-            gpu_encode_submit_time: gpu_timings.encode_submit,
-            gpu_wait_map_time: gpu_timings.wait_map,
-            gpu_readback_convert_time: gpu_timings.readback_convert,
-            gpu_dispatch_readback_time: gpu_timings.dispatch_readback,
-            dng_build_time,
-            total_time: total_start.elapsed(),
-        },
     })
 }
 
@@ -960,6 +829,7 @@ fn generate_frame_cpu(
 // Vec inside that closure, before the GPU readback buffer is unmapped. This
 // path is the DNG/FUSE sink boundary that validators compare against the CPU
 // fallback DNG bytes.
+#[rustfmt::skip]
 fn generate_frame_gpu_canonical_dng(
     container: &McrawContainer,
     dng_writer: &DngWriter,
@@ -968,7 +838,6 @@ fn generate_frame_gpu_canonical_dng(
     raw_payload_scratch: &mut Vec<u8>,
     frame_index: usize,
 ) -> Result<GeneratedDngFrame> {
-    let total_start = Instant::now();
     let frame_number = frame_number_from_index(frame_index)?;
     let frame_metadata = container.frame_metadata(frame_number)?;
     let payload_layout = frame_metadata.payload_layout()?;
@@ -976,24 +845,15 @@ fn generate_frame_gpu_canonical_dng(
         bail_unsupported_gpu_decode::<()>(payload_layout)?;
     }
 
-    let description_start = Instant::now();
     let dng_description =
         dng_description_for_container_frame(container, frame_number, vignette_mode.into())
             .with_context(|| format!("failed to build DNG description for frame {frame_index}"))?;
-    let dng_description_time = description_start.elapsed();
-
-    let payload_start = Instant::now();
     container
         .read_video_payload_into(frame_number, raw_payload_scratch)
         .with_context(|| format!("failed to read raw payload for frame {frame_index}"))?;
-    let payload_read_time = payload_start.elapsed();
-    let raw_payload_bytes = usize_to_u64(raw_payload_scratch.len(), "raw payload byte length")?;
 
     let exact_pixel_byte_len = exact_pixel_byte_len(dng_description.dimensions)?;
-    let decoded_pixel_bytes = usize_to_u64(exact_pixel_byte_len, "frame u16 pixel byte length")?;
-
-    let decode_start = Instant::now();
-    let (sink_frame, gpu_timings) = match vignette_mode {
+    let sink_frame = match vignette_mode {
         DngSinkVignetteMode::None => match payload_layout {
             FramePayloadLayout::CompressedRawcodecType7 => {
                 let output = gpu_backend
@@ -1019,7 +879,7 @@ fn generate_frame_gpu_canonical_dng(
                     )
                     .with_context(|| format!("failed to GPU-decode mapped frame {frame_index}"))?;
 
-                (output.value, output.timings)
+                output.value
             }
             FramePayloadLayout::BinnedRaw16Type6 { row_stride } => {
                 let output = gpu_backend
@@ -1048,7 +908,7 @@ fn generate_frame_gpu_canonical_dng(
                         format!("failed to GPU-decode legacy raw16 mapped frame {frame_index}")
                     })?;
 
-                (output.value, output.timings)
+                output.value
             }
         },
         DngSinkVignetteMode::LumaPlane0 => {
@@ -1111,7 +971,7 @@ fn generate_frame_gpu_canonical_dng(
                             )
                         })?;
 
-                    (output.value, output.timings)
+                    output.value
                 }
                 FramePayloadLayout::BinnedRaw16Type6 { row_stride } => {
                     let output = gpu_backend
@@ -1147,42 +1007,20 @@ fn generate_frame_gpu_canonical_dng(
                             )
                         })?;
 
-                    (output.value, output.timings)
+                    output.value
                 }
             }
         }
     };
-    let decode_time = decode_start.elapsed();
-
-    let dng_build_start = Instant::now();
     let bytes = dng_writer
         .write_uncompressed_dng_sink_frame_to_vec(&sink_frame)
         .with_context(|| {
             format!("failed to build canonical GPU DNG bytes for frame {frame_index}")
         })?;
-    let dng_build_time = dng_build_start.elapsed();
-    let final_dng_bytes = usize_to_u64(bytes.len(), "final DNG byte length")?;
 
     Ok(GeneratedDngFrame {
         frame_index,
         bytes,
-        timings: DngGenerationTimings {
-            raw_payload_bytes,
-            decoded_pixel_bytes,
-            final_dng_bytes,
-            dng_description_time,
-            payload_read_time,
-            decode_time,
-            gpu_work_plan_time: gpu_timings.work_plan,
-            gpu_cpu_prepare_time: gpu_timings.cpu_prepare,
-            gpu_upload_time: gpu_timings.upload,
-            gpu_encode_submit_time: gpu_timings.encode_submit,
-            gpu_wait_map_time: gpu_timings.wait_map,
-            gpu_readback_convert_time: gpu_timings.readback_convert,
-            gpu_dispatch_readback_time: gpu_timings.dispatch_readback,
-            dng_build_time,
-            total_time: total_start.elapsed(),
-        },
     })
 }
 
@@ -1214,13 +1052,13 @@ fn mapped_prefix_to_owned_frame(
         .context("mapped GPU output/frame contract mismatch")
 }
 
+#[rustfmt::skip]
 fn create_gpu_vignette_backend(
     backend_preference: GpuBackendPreference,
     label: &str,
 ) -> Result<ActiveGpuVignetteBackend> {
     let backend = GpuDecodeBackend::new_blocking(GpuDecodeConfig {
         backend_preference,
-        ..GpuDecodeConfig::default()
     })
     .with_context(|| format!("failed to create GPU backend for {label}"))?;
     let state = create_gpu_vignette_state(&backend)?;
@@ -1429,11 +1267,6 @@ fn source_video_frame_rate(container: &McrawContainer) -> Option<FrameRate> {
         .timing
         .video_reported_frame_rate
         .map(FrameRate::reduced)
-}
-
-// Convert usize byte counts into u64 counters for instrumentation.
-fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
-    u64::try_from(value).with_context(|| format!("{label} does not fit in u64"))
 }
 
 // Convert a usize frame index to the shared typed FrameNumber.

@@ -35,6 +35,7 @@ pub struct DngMountRunConfig {
     pub backend: DngGenerationBackend,
     pub vignette_mode: DngSinkVignetteMode,
     pub mountpoint_path: PathBuf,
+    pub default_mount_location: bool,
     pub cache_frame_capacity: usize,
     pub prefetch_forward_frames: usize,
     pub generation_execution_policy: DngGenerationExecutionPolicy,
@@ -64,6 +65,15 @@ struct DngUnmountRegistryOutcome {
 pub trait DngUnmountAdapter {
     fn unmount_owned_mountpoint(&self, mountpoint: &Path) -> Result<PlatformUnmountOutcome>;
 
+    fn unmount_registered_mountpoint(
+        &self,
+        mountpoint: &Path,
+        records: &[DngMountRegistryRecord],
+    ) -> Result<PlatformUnmountOutcome> {
+        let _ = records;
+        self.unmount_owned_mountpoint(mountpoint)
+    }
+
     fn cleanup_stale_shared_root_mountpoint(
         &self,
         mountpoint: &Path,
@@ -80,6 +90,27 @@ pub struct RealDngUnmountAdapter;
 impl DngUnmountAdapter for RealDngUnmountAdapter {
     fn unmount_owned_mountpoint(&self, mountpoint: &Path) -> Result<PlatformUnmountOutcome> {
         Ok(unmount_owned_mountpoint(mountpoint)?.into())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unmount_registered_mountpoint(
+        &self,
+        mountpoint: &Path,
+        records: &[DngMountRegistryRecord],
+    ) -> Result<PlatformUnmountOutcome> {
+        let Some(current) = mcraw4vulkan_fuse::macos_mount_instance_id(mountpoint)? else {
+            return Ok(PlatformUnmountOutcome::NotMounted);
+        };
+        if records.is_empty()
+            || records
+                .iter()
+                .any(|r| r.instance_id.as_deref() != Some(&current))
+        {
+            bail!(
+                "the registered DNG volume identity changed or predates identity tracking; use its owning process or Finder to eject it"
+            )
+        }
+        mcraw4vulkan_fuse::unmount_registered_instance(mountpoint, &current)
     }
 
     #[cfg(target_os = "windows")]
@@ -153,6 +184,7 @@ impl DngMountRunConfig {
             backend: dng_backend_from_app_policy(policy.backend),
             vignette_mode: policy.vignette,
             mountpoint_path,
+            default_mount_location: matches!(policy.mount, DngMountPolicy::AutoTemp),
             cache_frame_capacity: DEFAULT_DNG_CACHE_FRAME_CAPACITY,
             prefetch_forward_frames: DEFAULT_PREFETCH_FORWARD_FRAMES,
             generation_execution_policy: DngGenerationExecutionPolicy::Inflight2Default,
@@ -208,13 +240,64 @@ pub fn run_dng_mount_with_registry(
             &source_path,
             all_records,
         )?;
-        ensure_common_parent_available(&config.mountpoint_path, &all_records)?;
+        #[cfg(not(target_os = "macos"))]
+        let child_mountpoint = {
+            ensure_common_parent_available(&config.mountpoint_path, &all_records)?;
+            create_unique_child_mountpoint(&config.mountpoint_path, &source_path, &all_records)?
+        };
         #[cfg(target_os = "macos")]
-        ensure_macos_common_parent_not_active_mount(&config.mountpoint_path)?;
-        let child_mountpoint =
-            create_unique_child_mountpoint(&config.mountpoint_path, &source_path, &all_records)?;
+        let child_mountpoint = if config.default_mount_location {
+            ensure_common_parent_available(&config.mountpoint_path, &all_records)?;
+            ensure_macos_common_parent_not_active_mount(&config.mountpoint_path)?;
+            create_unique_child_mountpoint(&config.mountpoint_path, &source_path, &all_records)?
+        } else {
+            let path = &config.mountpoint_path;
+            if !path.is_absolute() || path.file_name().is_none() {
+                bail!("explicit mountpoint must be an absolute child path")
+            }
+            if !matches!(
+                classify_macos_mountpoint(path)?,
+                MacosMountpointClassification::NotMounted
+            ) {
+                bail!(
+                    "explicit mountpoint is already occupied: {}",
+                    path.display()
+                );
+            }
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                bail!(
+                    "explicit mountpoint must be a real directory: {}",
+                    path.display()
+                );
+            }
+            if path.exists() {
+                ensure_mountpoint_available(path)?;
+            } else if !path.parent().is_some_and(Path::is_dir) {
+                bail!("explicit mountpoint parent must exist: {}", path.display());
+            }
+            DngChildMountpoint {
+                path: path.clone(),
+                folder_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            }
+        };
 
+        #[cfg(target_os = "macos")]
+        let cancellation = {
+            let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = token.clone();
+            ctrlc::try_set_handler(move || {
+                signal.store(true, std::sync::atomic::Ordering::Release)
+            })
+            .context("could not register mount cancellation handler")?;
+            token
+        };
         let request = MountRequest {
+            #[cfg(target_os = "macos")]
+            cancellation,
+
             input_path: source_path.clone(),
             mount_point: child_mountpoint.path.clone(),
             mount_name: child_mountpoint.folder_name.clone(),
@@ -230,17 +313,25 @@ pub fn run_dng_mount_with_registry(
         let handle = match manager.mount(request) {
             Ok(handle) => handle,
             Err(error) => {
+                #[cfg(not(target_os = "macos"))]
                 let _ = remove_empty_dir_if_exists(&child_mountpoint.path);
                 return Err(error);
             }
         };
         #[cfg(target_os = "macos")]
         let mut handle = handle;
+        #[cfg(target_os = "macos")]
+        let child_mountpoint = DngChildMountpoint {
+            path: handle.mount_point.clone(),
+            folder_name: child_mountpoint.folder_name,
+        };
 
         let mount_index_start = registry.load_records()?.len().saturating_add(1);
         #[cfg(target_os = "windows")]
         let instance_id = Some(handle.instance_id().to_hyphenated_string());
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        let instance_id = Some(handle.instance_id()?);
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let instance_id = None;
         let record = DngMountRegistryRecord::new_with_instance_id(
             source_path.clone(),
@@ -250,6 +341,7 @@ pub fn run_dng_mount_with_registry(
         );
         if let Err(error) = registry.add_record(record.clone()) {
             let _ = handle.unmount();
+            #[cfg(not(target_os = "macos"))]
             let _ = remove_empty_dir_if_exists(&child_mountpoint.path);
             return Err(error)
                 .context("failed to register DNG mount after platform mount succeeded");
@@ -269,8 +361,12 @@ pub fn run_dng_mount_with_registry(
         let wait_result = handle.wait_until_unmounted();
         if wait_result.is_ok() {
             let _ = registry.remove_mount_ids(std::slice::from_ref(&record.mount_id));
+            #[cfg(not(target_os = "macos"))]
             let _ = remove_empty_dir_if_exists(&child_mountpoint.path);
-            let _ = remove_empty_dir_if_exists(&config.mountpoint_path);
+            #[cfg(not(target_os = "macos"))]
+            if config.mountpoint_path != Path::new("/Volumes") {
+                let _ = remove_empty_dir_if_exists(&config.mountpoint_path);
+            }
         }
         wait_result
     }
@@ -295,6 +391,8 @@ fn format_mount_start_message(
     common_parent_path: &Path,
     child_mountpoint: &DngChildMountpoint,
 ) -> String {
+    #[cfg(target_os = "macos")]
+    let common_parent_path = child_mountpoint.path.parent().unwrap_or(common_parent_path);
     format!(
         "mounted {} at {}; serving in foreground\ncommon parent: {}\nclip folder: {}\npress Ctrl-C to stop\nor run mcraw4vulkan dng unmount FILE.mcraw from another terminal\nor run mcraw4vulkan dng unmount all from another terminal",
         source_path.display(),
@@ -477,6 +575,16 @@ fn ensure_common_parent_available(
         );
     }
 
+    #[cfg(target_os = "macos")]
+    if common_parent
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        bail!(
+            "DNG common parent must be a real directory: {}",
+            common_parent.display()
+        );
+    }
     if common_parent.exists() {
         if !common_parent.is_dir() {
             bail!(
@@ -651,12 +759,18 @@ fn create_unique_child_mountpoint(
     records: &[DngMountRegistryRecord],
 ) -> Result<DngChildMountpoint> {
     let child = choose_unique_child_mountpoint(common_parent, source_path, records)?;
+    // The native owner prepares and pins the backing leaf, including failures
+    // before native startup. Naming remains independent of retained directories.
+    #[cfg(target_os = "macos")]
+    return Ok(child);
+    #[cfg(not(target_os = "macos"))]
     fs::create_dir(&child.path).map_err(|error| {
         anyhow::anyhow!(
             "failed to create DNG child mountpoint {}: {error}",
             child.path.display()
         )
     })?;
+    #[cfg(not(target_os = "macos"))]
     Ok(child)
 }
 
@@ -682,7 +796,12 @@ fn choose_unique_child_mountpoint(
     };
 
     for candidate in &candidates {
-        if !child_mountpoint_name_conflicts(common_parent, records, &candidate.visible)? {
+        if !child_mountpoint_name_conflicts(
+            common_parent,
+            source_path,
+            records,
+            &candidate.visible,
+        )? {
             return dng_child_mountpoint(common_parent, &candidate.visible);
         }
     }
@@ -693,7 +812,7 @@ fn choose_unique_child_mountpoint(
             "{}__{}__{}",
             last_candidate.sanitized_stem, full_suffix, disambiguator
         );
-        if !child_mountpoint_name_conflicts(common_parent, records, &visible)? {
+        if !child_mountpoint_name_conflicts(common_parent, source_path, records, &visible)? {
             return dng_child_mountpoint(common_parent, &visible);
         }
     }
@@ -723,49 +842,55 @@ fn validate_child_mountpoint_name(folder_name: &str) -> Result<()> {
 
 fn child_mountpoint_name_conflicts(
     common_parent: &Path,
+    source_path: &Path,
     records: &[DngMountRegistryRecord],
     candidate: &str,
 ) -> Result<bool> {
-    if common_parent.join(candidate).exists() {
-        return Ok(true);
-    }
-
-    for entry in match fs::read_dir(common_parent) {
-        Ok(read_dir) => read_dir,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to read DNG common parent {}: {error}",
-                common_parent.display()
-            ));
-        }
-    } {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to inspect child entry in DNG common parent {}",
-                common_parent.display()
-            )
-        })?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(candidate)
-        {
-            return Ok(true);
-        }
-    }
-
-    Ok(records.iter().any(|record| {
+    #[cfg(not(target_os = "macos"))]
+    let _ = source_path;
+    if records.iter().any(|record| {
         record
             .mountpoint_path
             .parent()
             .is_some_and(|parent| parent == common_parent)
-            && record.mountpoint_path.file_name().is_some_and(|file_name| {
-                file_name.to_string_lossy().eq_ignore_ascii_case(candidate)
-            })
-    }))
+            && record
+                .mountpoint_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(candidate))
+    }) {
+        return Ok(true);
+    }
+    for entry in match fs::read_dir(common_parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read DNG common parent {}",
+                    common_parent.display()
+                )
+            });
+        }
+    } {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case(candidate) {
+            #[cfg(target_os = "macos")]
+            if name == candidate
+                && mcraw4vulkan_fuse::macos_macfuse::reusable_mount_directory(
+                    &entry.path(),
+                    source_path,
+                )?
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn remove_empty_dir_if_exists(path: &Path) -> Result<()> {
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
@@ -802,7 +927,7 @@ fn unmount_registry_records(
         summary.attempted += 1;
         let mountpoint_path = group.mountpoint_path;
         let records = group.records;
-        let outcome = match adapter.unmount_owned_mountpoint(&mountpoint_path) {
+        let outcome = match adapter.unmount_registered_mountpoint(&mountpoint_path, &records) {
             Ok(outcome) => outcome,
             Err(error) => {
                 match adapter.cleanup_stale_shared_root_mountpoint(&mountpoint_path, &records) {
@@ -869,6 +994,12 @@ fn unmount_registry_records(
 }
 
 fn cleanup_completed_mountpoint_dirs(mountpoints: &[PathBuf]) {
+    // A completed mount identity does not prove ownership of a directory that
+    // subsequently appears at its pathname. On macOS only the native session
+    // retains the backing-leaf evidence and removes it after reconciliation.
+    #[cfg(target_os = "macos")]
+    let _ = mountpoints;
+    #[cfg(not(target_os = "macos"))]
     for mountpoint in mountpoints {
         if !is_dng_child_mountpoint_cleanup_candidate(mountpoint) {
             continue;
@@ -880,6 +1011,7 @@ fn cleanup_completed_mountpoint_dirs(mountpoints: &[PathBuf]) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn is_dng_child_mountpoint_cleanup_candidate(mountpoint: &Path) -> bool {
     mountpoint.file_name().is_some()
         && mountpoint

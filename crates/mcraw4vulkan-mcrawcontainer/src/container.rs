@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use mcraw4vulkan_core::frame_index::{AudioChunkEntry, FrameEntry};
 use mcraw4vulkan_core::{
@@ -32,24 +31,6 @@ pub struct McrawContainer {
     geometry_analysis_performed: OnceLock<bool>,
     video_frame_rate_info: VideoFrameRateInfo,
     audio_sync_info: Option<AudioSyncInfo>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct McrawContainerOpenPhaseTiming {
-    pub start_offset: Duration,
-    pub duration: Duration,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct McrawContainerOpenTimings {
-    pub total: Duration,
-    pub parse_clip: McrawContainerOpenPhaseTiming,
-    pub container_metadata_parse: McrawContainerOpenPhaseTiming,
-    pub frame_metadata_json_parse_loop: McrawContainerOpenPhaseTiming,
-    pub audio_metadata_index_sync_setup: McrawContainerOpenPhaseTiming,
-    pub parsed_all_frame_metadata: bool,
-    pub parsed_frame_metadata_count: usize,
-    pub parsed_audio_metadata: bool,
 }
 
 impl McrawContainer {
@@ -351,75 +332,40 @@ impl McrawContainer {
         .map_err(|e| McrawContainerError::InvalidPayloadSpan(format!("frame {}: {e}", frame.0)))
     }
 
+    #[rustfmt::skip]
     pub fn open(path: &Path) -> Result<Self, McrawContainerError> {
-        Self::open_inner(path, McrawContainerOpenMode::Full, None)
-    }
-
-    pub fn open_with_timing(
-        path: &Path,
-        timings: &mut McrawContainerOpenTimings,
-    ) -> Result<Self, McrawContainerError> {
-        *timings = McrawContainerOpenTimings::default();
-        Self::open_inner(path, McrawContainerOpenMode::Full, Some(timings))
-    }
-
-    pub fn open_for_display(path: &Path) -> Result<Self, McrawContainerError> {
-        Self::open_inner(path, McrawContainerOpenMode::DisplayFast, None)
-    }
-
-    pub fn open_for_display_with_timing(
-        path: &Path,
-        timings: &mut McrawContainerOpenTimings,
-    ) -> Result<Self, McrawContainerError> {
-        *timings = McrawContainerOpenTimings::default();
-        Self::open_inner(path, McrawContainerOpenMode::DisplayFast, Some(timings))
-    }
-
-    pub fn open_for_display_with_audio(path: &Path) -> Result<Self, McrawContainerError> {
-        Self::open_inner(path, McrawContainerOpenMode::DisplayWithAudio, None)
-    }
-
-    pub fn open_for_display_with_audio_with_timing(
-        path: &Path,
-        timings: &mut McrawContainerOpenTimings,
-    ) -> Result<Self, McrawContainerError> {
-        *timings = McrawContainerOpenTimings::default();
         Self::open_inner(
-            path,
-            McrawContainerOpenMode::DisplayWithAudio,
-            Some(timings),
+            path, McrawContainerOpenMode::Full,
         )
     }
 
+    #[rustfmt::skip]
+    pub fn open_for_display(path: &Path) -> Result<Self, McrawContainerError> {
+        Self::open_inner(
+            path, McrawContainerOpenMode::DisplayFast,
+        )
+    }
+
+    #[rustfmt::skip]
+    pub fn open_for_display_with_audio(path: &Path) -> Result<Self, McrawContainerError> {
+        Self::open_inner(
+            path, McrawContainerOpenMode::DisplayWithAudio,
+        )
+    }
+
+    #[rustfmt::skip]
     fn open_inner(
         path: &Path,
         mode: McrawContainerOpenMode,
-        mut timings: Option<&mut McrawContainerOpenTimings>,
     ) -> Result<Self, McrawContainerError> {
-        let total_start = timings.as_ref().map(|_| Instant::now());
-
-        let parse_start = total_start.map(|_| Instant::now());
         let parsed = match mode {
             McrawContainerOpenMode::Full | McrawContainerOpenMode::DisplayWithAudio => {
                 parse_clip(path)?
             }
             McrawContainerOpenMode::DisplayFast => parse_clip_for_display(path)?,
         };
-        record_open_phase(
-            total_start,
-            parse_start,
-            timings.as_deref_mut(),
-            |timings| &mut timings.parse_clip,
-        );
 
-        let metadata_start = total_start.map(|_| Instant::now());
         let container_metadata = ContainerMetadata::parse(&parsed.container_metadata_json)?;
-        record_open_phase(
-            total_start,
-            metadata_start,
-            timings.as_deref_mut(),
-            |timings| &mut timings.container_metadata_parse,
-        );
 
         let frame_count = parsed.frame_count() as u32;
         if frame_count == 0 {
@@ -428,27 +374,15 @@ impl McrawContainer {
             ));
         }
 
-        let frame_metadata_start = total_start.map(|_| Instant::now());
         let prepared_frames = match mode {
             McrawContainerOpenMode::Full => prepare_full_frame_index_and_metadata(&parsed)?,
             McrawContainerOpenMode::DisplayFast | McrawContainerOpenMode::DisplayWithAudio => {
                 prepare_display_frame_index_and_metadata(&parsed)?
             }
         };
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.parsed_all_frame_metadata = mode == McrawContainerOpenMode::Full;
-            timings.parsed_frame_metadata_count = prepared_frames.parsed_metadata_count;
-        }
 
-        record_open_phase(
-            total_start,
-            frame_metadata_start,
-            timings.as_deref_mut(),
-            |timings| &mut timings.frame_metadata_json_parse_loop,
-        );
-
-        let audio_parse_index_start = total_start.map(|_| Instant::now());
-        let (audio_chunks, audio_info, audio_parse_index_duration) = match mode {
+        let (audio_chunks, audio_info,
+        ) = match mode {
             McrawContainerOpenMode::Full | McrawContainerOpenMode::DisplayWithAudio => {
                 let audio_metadata = AudioDataMetadata::parse_sources(
                     &parsed.container_metadata_json,
@@ -459,14 +393,11 @@ impl McrawContainer {
                 (
                     audio_chunks,
                     audio_info,
-                    audio_parse_index_start.map(|start| start.elapsed()),
                 )
             }
-            McrawContainerOpenMode::DisplayFast => (Vec::new(), None, None),
+            McrawContainerOpenMode::DisplayFast => (Vec::new(), None,
+            ),
         };
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.parsed_audio_metadata = mode.includes_audio_metadata();
-        }
 
         let video_frame_rate_info =
             derive_video_frame_rate_info(&prepared_frames.video_timestamps_ns);
@@ -487,26 +418,11 @@ impl McrawContainer {
             video_reported_frame_rate.unwrap_or_else(|| FrameRate::integer(24)),
         );
 
-        let audio_sync_start = total_start.map(|_| Instant::now());
         let audio_sync_info = build_audio_sync_info(
             video_frame_rate_info.first_timestamp_ns,
             audio_chunks.first(),
             audio_info,
         );
-        if let (Some(total_start), Some(parse_index_start), Some(parse_index_duration)) = (
-            total_start,
-            audio_parse_index_start,
-            audio_parse_index_duration,
-        ) {
-            if let Some(timings) = timings.as_deref_mut() {
-                timings.audio_metadata_index_sync_setup = McrawContainerOpenPhaseTiming {
-                    start_offset: parse_index_start.duration_since(total_start),
-                    duration: parse_index_duration
-                        + audio_sync_start.map_or(Duration::ZERO, |start| start.elapsed()),
-                };
-            }
-        }
-
         let display_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -532,7 +448,7 @@ impl McrawContainer {
             audio_chunks,
         };
 
-        let result = Ok(Self {
+        Ok(Self {
             parsed_clip: parsed,
             container_metadata,
             frame_metadata: prepared_frames.frame_metadata,
@@ -544,11 +460,7 @@ impl McrawContainer {
             geometry_analysis_performed: OnceLock::new(),
             video_frame_rate_info,
             audio_sync_info,
-        });
-        if let (Some(total_start), Some(timings)) = (total_start, timings) {
-            timings.total = total_start.elapsed();
-        }
-        result
+        })
     }
 
     pub fn clip_info(&self) -> &McrawClipInfo {
@@ -756,18 +668,11 @@ enum McrawContainerOpenMode {
     DisplayWithAudio,
 }
 
-impl McrawContainerOpenMode {
-    fn includes_audio_metadata(self) -> bool {
-        matches!(self, Self::Full | Self::DisplayWithAudio)
-    }
-}
-
 struct PreparedFrameIndexAndMetadata {
     frames: Vec<FrameEntry>,
     frame_metadata: Vec<OnceLock<FrameMetadata>>,
     video_timestamps_ns: Vec<u64>,
     clip_dimensions: FrameDimensions,
-    parsed_metadata_count: usize,
 }
 
 fn prepare_full_frame_index_and_metadata(
@@ -819,7 +724,6 @@ fn prepare_full_frame_index_and_metadata(
         frame_metadata,
         video_timestamps_ns,
         clip_dimensions,
-        parsed_metadata_count: frame_count,
     })
 }
 
@@ -854,7 +758,6 @@ fn prepare_display_frame_index_and_metadata(
         frame_metadata,
         video_timestamps_ns,
         clip_dimensions,
-        parsed_metadata_count: 1,
     })
 }
 
@@ -887,22 +790,6 @@ fn frame_entry_from_parsed(
         dimensions,
         is_key_frame: true,
     }
-}
-
-fn record_open_phase(
-    total_start: Option<Instant>,
-    phase_start: Option<Instant>,
-    timings: Option<&mut McrawContainerOpenTimings>,
-    field: impl FnOnce(&mut McrawContainerOpenTimings) -> &mut McrawContainerOpenPhaseTiming,
-) {
-    let (Some(total_start), Some(phase_start), Some(timings)) = (total_start, phase_start, timings)
-    else {
-        return;
-    };
-    *field(timings) = McrawContainerOpenPhaseTiming {
-        start_offset: phase_start.duration_since(total_start),
-        duration: phase_start.elapsed(),
-    };
 }
 
 fn build_audio_index(

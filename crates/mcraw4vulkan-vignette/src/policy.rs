@@ -37,16 +37,6 @@ impl VignetteCorrectionPolicy {
             Self::LumaPlane0 => "luma-plane-0",
         }
     }
-
-    pub fn from_label_for_private_cli(value: &str) -> Option<Self> {
-        match value {
-            "motioncam-compatible-pixel-v1" | "motioncam-compatible" => {
-                Some(Self::MotionCamCompatiblePixelDomainV1)
-            }
-            "luma-plane-0" | "motioncam-compatible-luma" => Some(Self::LumaPlane0),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

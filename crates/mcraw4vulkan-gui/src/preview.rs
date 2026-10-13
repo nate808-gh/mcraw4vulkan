@@ -306,7 +306,6 @@ impl PreviewPlaybackControl {
 
 struct PreviewAdapterContext {
     info: wgpu::AdapterInfo,
-    features: wgpu::Features,
 }
 
 enum PreviewStopReason {
@@ -846,7 +845,6 @@ impl GuiPreview {
         frame: RenderFrameContext<'_>,
         target: Option<EmbeddedDisplayPreviewTarget>,
         adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
         advance: bool,
     ) -> PreviewFrameStatus {
         let state = std::mem::replace(&mut self.state, PreviewState::Inactive);
@@ -860,7 +858,6 @@ impl GuiPreview {
                 target,
                 PreviewAdapterContext {
                     info: adapter_info,
-                    features: adapter_features,
                 },
                 advance,
                 startup,
@@ -922,16 +919,14 @@ impl GuiPreview {
                         EmbeddedDisplayPreview::from_prepared(
                             prepared,
                             adapter.info,
-                            adapter.features,
                             frame.device.clone(),
                             frame.queue.clone(),
                             frame.surface_format,
                             target,
                         )
-                        .map(|core| (core, ()))
                 };
                 match core {
-                    Ok((core, _create_timings)) => {
+                    Ok(core) => {
                         if let Some(message) = sound_warning {
                             self.pending_status = Some(message);
                         }

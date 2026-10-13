@@ -3,6 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::filesystem_view::{
+    FileSystemReadData as LinuxFuse3ReadData, FileSystemView as LinuxFuse3FileSystemView,
+};
 use anyhow::Result;
 #[cfg(target_os = "macos")]
 use fuser::ReplyXTimes;
@@ -11,12 +14,10 @@ use fuser::{
     INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
-use tracing::info;
 
-use crate::shared_root::{SharedRootVirtualFileSystem, SingleClipRootVirtualFileSystem};
+use crate::shared_root::SingleClipRootVirtualFileSystem;
 use crate::virtual_fs::{
     VirtualDirEntry, VirtualFileKind, VirtualFileMetadata, VirtualFileSystem, VirtualNode,
-    VirtualReadData,
 };
 
 // Attribute and entry cache TTL returned to the kernel.
@@ -25,7 +26,7 @@ use crate::virtual_fs::{
 // is safe and avoids immediate repeated getattr/lookup churn.
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 512;
-const READ_STATS_LOG_INTERVAL: u64 = 2048;
+
 const STATFS_BLOCKS: u64 = 1_048_576;
 const STATFS_FILES: u64 = 1_000_000;
 const MAX_NAME_LENGTH: u32 = 255;
@@ -76,41 +77,11 @@ impl LinuxFuse3FileSystem {
             next_file_handle: AtomicU64::new(1),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn inner(&self) -> &VirtualFileSystem {
-        self.fs.as_ref()
-    }
 }
 
-#[allow(dead_code)]
-pub(crate) type LinuxSharedRootFuse3FileSystem = LinuxFuse3FileSystem<SharedRootVirtualFileSystem>;
 #[allow(dead_code)]
 pub(crate) type LinuxSingleClipRootFuse3FileSystem =
     LinuxFuse3FileSystem<SingleClipRootVirtualFileSystem>;
-
-impl LinuxSharedRootFuse3FileSystem {
-    #[allow(dead_code)]
-    pub(crate) fn new_shared_root(fs: Arc<SharedRootVirtualFileSystem>) -> Self {
-        Self {
-            fs,
-            attr_owner: FuserFileAttrOwner::default(),
-            next_file_handle: AtomicU64::new(1),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn new_shared_root_with_owner(
-        fs: Arc<SharedRootVirtualFileSystem>,
-        attr_owner: FuserFileAttrOwner,
-    ) -> Self {
-        Self {
-            fs,
-            attr_owner,
-            next_file_handle: AtomicU64::new(1),
-        }
-    }
-}
 
 impl LinuxSingleClipRootFuse3FileSystem {
     #[allow(dead_code)]
@@ -118,18 +89,6 @@ impl LinuxSingleClipRootFuse3FileSystem {
         Self {
             fs,
             attr_owner: FuserFileAttrOwner::default(),
-            next_file_handle: AtomicU64::new(1),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn new_single_clip_root_with_owner(
-        fs: Arc<SingleClipRootVirtualFileSystem>,
-        attr_owner: FuserFileAttrOwner,
-    ) -> Self {
-        Self {
-            fs,
-            attr_owner,
             next_file_handle: AtomicU64::new(1),
         }
     }
@@ -232,8 +191,6 @@ where
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.fs.record_open();
-
         match self.getattr_metadata(ino.0) {
             Ok(Some(metadata)) if metadata.kind == VirtualFileKind::RegularFile => {
                 let handle = self.next_regular_file_handle();
@@ -292,8 +249,6 @@ where
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.fs.record_opendir();
-
         match self.getattr_metadata(ino.0) {
             Ok(Some(metadata)) if metadata.kind == VirtualFileKind::Directory => {
                 reply.opened(FileHandle(ino.0), FopenFlags::empty());
@@ -447,215 +402,14 @@ where
         match self.read_data_for_handle(ino.0, _fh.0, offset, size) {
             Ok(Some(read_data)) => {
                 reply.data(read_data.as_slice());
-                self.fs.maybe_log_read_stats();
             }
             Ok(None) => {
                 reply.error(Errno::EISDIR);
-                self.fs.maybe_log_read_stats();
             }
             Err(_) => {
                 reply.error(Errno::EIO);
-                self.fs.maybe_log_read_stats();
             }
         }
-    }
-}
-
-pub trait LinuxFuse3ReadData {
-    fn as_slice(&self) -> &[u8];
-}
-
-impl LinuxFuse3ReadData for VirtualReadData {
-    fn as_slice(&self) -> &[u8] {
-        VirtualReadData::as_slice(self)
-    }
-}
-
-impl LinuxFuse3ReadData for Vec<u8> {
-    fn as_slice(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-pub trait LinuxFuse3FileSystemView: Send + Sync + 'static {
-    type ReadData<'a>: LinuxFuse3ReadData
-    where
-        Self: 'a;
-
-    fn lookup(&self, parent_inode: u64, name: &OsStr) -> Result<Option<VirtualFileMetadata>>;
-    fn getattr(&self, inode: u64) -> Result<Option<VirtualFileMetadata>>;
-    fn readdir(&self, inode: u64) -> Result<Option<Vec<VirtualDirEntry>>>;
-    fn read_data(&self, inode: u64, offset: u64, size: u32) -> Result<Option<Self::ReadData<'_>>>;
-    fn read_data_for_handle(
-        &self,
-        inode: u64,
-        handle: u64,
-        offset: u64,
-        size: u32,
-    ) -> Result<Option<Self::ReadData<'_>>> {
-        let _ = handle;
-        self.read_data(inode, offset, size)
-    }
-    fn parent_inode_for_directory(&self, inode: u64) -> Option<u64>;
-
-    fn open_file_handle(&self, _inode: u64, _handle: u64) -> Result<()> {
-        Ok(())
-    }
-
-    fn release_file_handle(&self, _inode: u64, _handle: u64) {}
-
-    fn record_open(&self) {}
-
-    fn record_opendir(&self) {}
-
-    fn maybe_log_read_stats(&self) {}
-}
-
-impl LinuxFuse3FileSystemView for VirtualFileSystem {
-    type ReadData<'a> = VirtualReadData;
-
-    fn lookup(&self, parent_inode: u64, name: &OsStr) -> Result<Option<VirtualFileMetadata>> {
-        VirtualFileSystem::lookup(self, parent_inode, name)
-    }
-
-    fn getattr(&self, inode: u64) -> Result<Option<VirtualFileMetadata>> {
-        VirtualFileSystem::getattr(self, inode)
-    }
-
-    fn readdir(&self, inode: u64) -> Result<Option<Vec<VirtualDirEntry>>> {
-        VirtualFileSystem::readdir(self, inode)
-    }
-
-    fn read_data(&self, inode: u64, offset: u64, size: u32) -> Result<Option<Self::ReadData<'_>>> {
-        VirtualFileSystem::read_data(self, inode, offset, size)
-    }
-
-    fn read_data_for_handle(
-        &self,
-        inode: u64,
-        handle: u64,
-        offset: u64,
-        size: u32,
-    ) -> Result<Option<Self::ReadData<'_>>> {
-        VirtualFileSystem::read_data_for_handle(self, inode, handle, offset, size)
-    }
-
-    fn parent_inode_for_directory(&self, inode: u64) -> Option<u64> {
-        VirtualFileSystem::parent_inode_for_directory(self, inode)
-    }
-
-    fn open_file_handle(&self, inode: u64, handle: u64) -> Result<()> {
-        VirtualFileSystem::open_file_handle(self, inode, handle)
-    }
-
-    fn release_file_handle(&self, _inode: u64, handle: u64) {
-        VirtualFileSystem::release_file_handle(self, handle);
-    }
-
-    fn record_open(&self) {
-        VirtualFileSystem::record_open(self);
-    }
-
-    fn record_opendir(&self) {
-        VirtualFileSystem::record_opendir(self);
-    }
-
-    fn maybe_log_read_stats(&self) {
-        let Ok(snapshot) = self.stats_snapshot() else {
-            return;
-        };
-
-        let read_count = snapshot.runtime.read.read_count;
-
-        if read_count > 0 && read_count % READ_STATS_LOG_INTERVAL == 0 {
-            if let Ok(summary) = self.stats_summary_line() {
-                info!("mcraw4vulkan FUSE stats: {summary}");
-            }
-        }
-    }
-}
-
-impl LinuxFuse3FileSystemView for SharedRootVirtualFileSystem {
-    type ReadData<'a> = Vec<u8>;
-
-    fn lookup(&self, parent_inode: u64, name: &OsStr) -> Result<Option<VirtualFileMetadata>> {
-        SharedRootVirtualFileSystem::lookup(self, parent_inode, name)
-    }
-
-    fn getattr(&self, inode: u64) -> Result<Option<VirtualFileMetadata>> {
-        SharedRootVirtualFileSystem::getattr(self, inode)
-    }
-
-    fn readdir(&self, inode: u64) -> Result<Option<Vec<VirtualDirEntry>>> {
-        SharedRootVirtualFileSystem::readdir(self, inode)
-    }
-
-    fn read_data(&self, inode: u64, offset: u64, size: u32) -> Result<Option<Self::ReadData<'_>>> {
-        SharedRootVirtualFileSystem::read_data(self, inode, offset, size)
-    }
-
-    fn read_data_for_handle(
-        &self,
-        inode: u64,
-        handle: u64,
-        offset: u64,
-        size: u32,
-    ) -> Result<Option<Self::ReadData<'_>>> {
-        SharedRootVirtualFileSystem::read_data_for_handle(self, inode, handle, offset, size)
-    }
-
-    fn parent_inode_for_directory(&self, inode: u64) -> Option<u64> {
-        SharedRootVirtualFileSystem::parent_inode_for_directory(self, inode)
-    }
-
-    fn open_file_handle(&self, inode: u64, handle: u64) -> Result<()> {
-        SharedRootVirtualFileSystem::open_file_handle(self, inode, handle)
-    }
-
-    fn release_file_handle(&self, inode: u64, handle: u64) {
-        SharedRootVirtualFileSystem::release_file_handle(self, inode, handle);
-    }
-}
-
-impl LinuxFuse3FileSystemView for SingleClipRootVirtualFileSystem {
-    type ReadData<'a> = Vec<u8>;
-
-    fn lookup(&self, parent_inode: u64, name: &OsStr) -> Result<Option<VirtualFileMetadata>> {
-        SingleClipRootVirtualFileSystem::lookup(self, parent_inode, name)
-    }
-
-    fn getattr(&self, inode: u64) -> Result<Option<VirtualFileMetadata>> {
-        SingleClipRootVirtualFileSystem::getattr(self, inode)
-    }
-
-    fn readdir(&self, inode: u64) -> Result<Option<Vec<VirtualDirEntry>>> {
-        SingleClipRootVirtualFileSystem::readdir(self, inode)
-    }
-
-    fn read_data(&self, inode: u64, offset: u64, size: u32) -> Result<Option<Self::ReadData<'_>>> {
-        SingleClipRootVirtualFileSystem::read_data(self, inode, offset, size)
-    }
-
-    fn read_data_for_handle(
-        &self,
-        inode: u64,
-        handle: u64,
-        offset: u64,
-        size: u32,
-    ) -> Result<Option<Self::ReadData<'_>>> {
-        SingleClipRootVirtualFileSystem::read_data_for_handle(self, inode, handle, offset, size)
-    }
-
-    fn parent_inode_for_directory(&self, inode: u64) -> Option<u64> {
-        SingleClipRootVirtualFileSystem::parent_inode_for_directory(self, inode)
-    }
-
-    fn open_file_handle(&self, inode: u64, handle: u64) -> Result<()> {
-        SingleClipRootVirtualFileSystem::open_file_handle(self, inode, handle)
-    }
-
-    fn release_file_handle(&self, inode: u64, handle: u64) {
-        SingleClipRootVirtualFileSystem::release_file_handle(self, inode, handle);
     }
 }
 

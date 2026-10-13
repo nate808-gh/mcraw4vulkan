@@ -134,7 +134,7 @@ impl MountBackendKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::LinuxFuse3 => "FUSE3",
-            Self::MacosMacFuse => "macFUSE",
+            Self::MacosMacFuse => "macFUSE FSKit",
             Self::WindowsProjFs => "ProjFS",
             Self::Unsupported => "Mount backend",
         }

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::gui_process::configure_gui_process;
 use crate::gui_settings::{DecodeMode, OptimizerProfile};
 
+#[cfg(not(target_os = "macos"))]
 const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const EXIT_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DNG_PROCESS_OUTPUT_TAIL_LINES: usize = 8;
@@ -253,6 +254,13 @@ pub enum DngActionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DngProcessEvent {
+    #[cfg(target_os = "macos")]
+    MountFolderRetained { status: String },
+    MountCleanupPending {
+        entry_id: u64,
+        display_name: String,
+        status: String,
+    },
     MountBecameActive {
         entry_id: u64,
         display_name: String,
@@ -356,6 +364,20 @@ impl DngProcessController {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn cancel_starting_mounts(&mut self) {
+        for mount in self.mounts.iter_mut().filter(|m| !m.active) {
+            if mount.process.try_wait().ok().flatten().is_none() {
+                // Signal only our retained child. Its CLI cancellation owner
+                // stops the entire selection request, including pending fallback.
+                let _ = Command::new("/bin/kill")
+                    .args(["-INT", &mount.process.id().to_string()])
+                    .status();
+                mount.stopping = true;
+            }
+        }
+    }
+
     pub fn mark_mount_stopping(&mut self, entry_id: u64) {
         for mount in &mut self.mounts {
             if mount.entry_id == entry_id {
@@ -366,10 +388,20 @@ impl DngProcessController {
 
     pub fn poll(&mut self) -> Vec<DngProcessEvent> {
         let mut events = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut folder_warnings = Vec::new();
 
         let mut index = 0;
         while index < self.mounts.len() {
             for line in self.mounts[index].output.drain() {
+                if line.starts_with("DNG mount cleanup pending:") {
+                    self.mounts[index].stopping = true;
+                    events.push(DngProcessEvent::MountCleanupPending {
+                        entry_id: self.mounts[index].entry_id,
+                        display_name: self.mounts[index].display_name.clone(),
+                        status: line.clone(),
+                    });
+                }
                 if let Some(mount_path) = parse_dng_mount_path_from_cli_line(&line) {
                     self.mounts[index].mount_path = Some(mount_path);
                 }
@@ -400,6 +432,15 @@ impl DngProcessController {
                         push_output_tail(&mut self.mounts[index].output_tail, line);
                     }
                     let mount = self.mounts.remove(index);
+                    #[cfg(target_os = "macos")]
+                    for line in &mount.output_tail {
+                        // Our own completion diagnostic, not a native-error classifier.
+                        if line.starts_with("DNG mount folder retained:") {
+                            folder_warnings.push(DngProcessEvent::MountFolderRetained {
+                                status: line.clone(),
+                            });
+                        }
+                    }
                     let success = status.success();
                     let status = format_process_status(&status.to_string(), &mount.output_tail);
                     events.push(DngProcessEvent::MountExited {
@@ -412,22 +453,17 @@ impl DngProcessController {
                     });
                 }
                 Err(error) => {
-                    for line in self.mounts[index]
-                        .output
-                        .drain_for(DNG_PROCESS_EXIT_DRAIN_TIMEOUT)
-                    {
-                        push_output_tail(&mut self.mounts[index].output_tail, line);
+                    // A failed observation is not child exit. Keep the owner and
+                    // inhibit late readiness/fallback instead of dropping it.
+                    if !self.mounts[index].stopping {
+                        self.mounts[index].stopping = true;
+                        events.push(DngProcessEvent::MountCleanupPending {
+                            entry_id: self.mounts[index].entry_id,
+                            display_name: self.mounts[index].display_name.clone(),
+                            status: error.to_string(),
+                        });
                     }
-                    let mount = self.mounts.remove(index);
-                    let status = format_process_status(&error.to_string(), &mount.output_tail);
-                    events.push(DngProcessEvent::MountExited {
-                        entry_id: mount.entry_id,
-                        display_name: mount.display_name,
-                        active: mount.active,
-                        stopping: mount.stopping,
-                        success: false,
-                        status,
-                    });
+                    index += 1;
                 }
             }
         }
@@ -473,12 +509,33 @@ impl DngProcessController {
             }
         }
 
+        // Folder retention does not make a detached volume mounted/failed.
+        // Present warnings after successful unmount summaries from this poll.
+        #[cfg(target_os = "macos")]
+        events.extend(folder_warnings);
         events
     }
 
-    // Give explicit unmount a bounded chance to finish, then attempt to kill and
-    // wait for exit of each retained process before clearing the controller's ownership state.
+    // Normal macOS Quit drains asynchronously through poll(). Unexpected final
+    // teardown must retain its mount owners instead of killing them below live
+    // native callbacks. Busy/pending mounts keep the application open for retry.
     pub fn cleanup_on_exit(&mut self, unmount_all: &DngCommandSpec) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.has_active_work() {
+                self.cancel_starting_mounts();
+                let _ = self.start_unmount_all(unmount_all);
+                while self.has_active_work() {
+                    let _ = self.poll();
+                    thread::sleep(EXIT_CLEANUP_POLL_INTERVAL);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.cleanup_with_process_termination(unmount_all);
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn cleanup_with_process_termination(&mut self, unmount_all: &DngCommandSpec) {
         if let Ok(mut process) = unmount_all.spawn_silent() {
             if !wait_bounded(&mut process, EXIT_CLEANUP_TIMEOUT) {
                 let _ = process.kill();
@@ -490,6 +547,7 @@ impl DngProcessController {
             let _ = mount.process.kill();
             let _ = mount.process.wait();
         }
+        #[cfg(not(target_os = "macos"))]
         for action in &mut self.actions {
             let _ = action.process.kill();
             let _ = action.process.wait();
@@ -518,6 +576,7 @@ fn format_process_status(status: &str, output_tail: &[String]) -> String {
     format!("{status}; CLI output: {}", output_tail.join(" | "))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn wait_bounded(process: &mut ProcessHandle, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -538,10 +597,20 @@ fn parse_dng_mount_path_from_cli_line(line: &str) -> Option<PathBuf> {
 
 impl Drop for DngProcessController {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.cancel_starting_mounts();
+            while self.has_active_work() {
+                let _ = self.poll();
+                thread::sleep(EXIT_CLEANUP_POLL_INTERVAL);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         for mount in &mut self.mounts {
             let _ = mount.process.kill();
             let _ = mount.process.wait();
         }
+        #[cfg(not(target_os = "macos"))]
         for action in &mut self.actions {
             let _ = action.process.kill();
             let _ = action.process.wait();

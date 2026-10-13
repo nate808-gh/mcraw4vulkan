@@ -17,7 +17,7 @@ mod strict_color;
 mod timing;
 
 pub use audio_metadata::AudioDataMetadata;
-pub use container::{McrawContainer, McrawContainerOpenPhaseTiming, McrawContainerOpenTimings};
+pub use container::McrawContainer;
 pub use container_metadata::{
     BlackLevel, ColorIlluminant, ColorMatrix, ContainerMetadata, DeviceSpecificProfile,
     SensorArrangement, WhiteLevel,

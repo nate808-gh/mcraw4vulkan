@@ -25,6 +25,37 @@ const BATCH_LOG_LIMIT: usize = 1024 * 1024;
 const POLL: Duration = Duration::from_millis(50);
 static ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
+/// Final movie encoding preset; independent of the selected FFmpeg encoder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportOutputKind {
+    #[default]
+    ProRes4444,
+    ProResProxy,
+}
+
+impl ExportOutputKind {
+    pub fn directory_name(self) -> &'static str {
+        match self {
+            Self::ProRes4444 => "exported_movies",
+            Self::ProResProxy => "exported_proxies",
+        }
+    }
+
+    fn movie_suffix(self) -> &'static str {
+        match self {
+            Self::ProRes4444 => PIPE_PRORES_FILE_SUFFIX,
+            Self::ProResProxy => "_prores_proxy_bt2020_applelog.mov",
+        }
+    }
+
+    fn sidecar_suffix(self) -> &'static str {
+        match self {
+            Self::ProRes4444 => PIPE_PRORES_SIDECAR_SUFFIX,
+            Self::ProResProxy => "_prores_proxy_bt2020_applelog.json",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportOptions {
     pub backend: ComputeBackendChoice,
@@ -46,6 +77,7 @@ pub enum ProducerLocation {
 
 #[derive(Debug, Clone)]
 pub struct ExportRequest {
+    pub output_kind: ExportOutputKind,
     pub inputs: ExportInputs,
     pub options: ExportOptions,
     pub producer: ProducerLocation,
@@ -351,6 +383,7 @@ fn discover(inputs: ExportInputs, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
 
 #[derive(Debug)]
 struct Job {
+    output_kind: ExportOutputKind,
     geometry_handoff: Option<String>,
     row: usize,
     source: PathBuf,
@@ -373,6 +406,7 @@ fn plan(
     paths: Vec<PathBuf>,
     cwd: &Path,
     dest: &Path,
+    output_kind: ExportOutputKind,
     result: &mut ExportResult,
     cancel: &AtomicBool,
 ) -> VecDeque<Job> {
@@ -413,8 +447,8 @@ fn plan(
                 source.to_str().is_some(),
                 "producer CLI requires a UTF-8 source path"
             );
-            let movie = dest.join(format!("{stem}{PIPE_PRORES_FILE_SUFFIX}"));
-            let json = dest.join(format!("{stem}{PIPE_PRORES_SIDECAR_SUFFIX}"));
+            let movie = dest.join(format!("{stem}{}", output_kind.movie_suffix()));
+            let json = dest.join(format!("{stem}{}", output_kind.sidecar_suffix()));
             let crate::pipe_cli::PreparedPipeExportFacts {
                 facts,
                 frames,
@@ -429,6 +463,7 @@ fn plan(
             result.snapshot.rows[row].reason = recovery_message.unwrap_or_default();
             *names.entry(stem.to_uppercase()).or_default() += 1;
             Ok(Some(Job {
+                output_kind,
                 geometry_handoff,
                 row,
                 source: source.clone(),
@@ -1227,6 +1262,7 @@ impl VideoSlot {
                 .args(pipe_example::encoder_args_for(
                     &slot.files.job.facts,
                     config.encoder,
+                    slot.files.job.output_kind,
                 ))
                 .args(["-progress", "pipe:1", "-nostats"])
                 .arg(&slot.files.video)
@@ -1439,14 +1475,22 @@ fn run_batch(
     let setup = (|| -> Result<(RunnerConfig, VecDeque<Job>)> {
         let cwd = std::env::current_dir()?;
         let destination = absolute(
-            &crate::dng_mount::default_dng_shared_mount_root()?.join("exported_movies"),
+            &crate::dng_mount::default_dng_shared_mount_root()?
+                .join(request.output_kind.directory_name()),
             &cwd,
         );
         result.snapshot.destination = destination.clone();
         let paths = discover(request.inputs, &cancel)?;
         result.snapshot.total = paths.len();
         ensure!(!paths.is_empty(), "no .mcraw files to export");
-        let jobs = plan(paths, &cwd, &destination, &mut result, &cancel);
+        let jobs = plan(
+            paths,
+            &cwd,
+            &destination,
+            request.output_kind,
+            &mut result,
+            &cancel,
+        );
         pending_rows = jobs.iter().map(|job| job.row).collect();
         result.snapshot.video = Some("Preparing export and checking FFmpeg".into());
         *lock(&state) = result.snapshot.clone();

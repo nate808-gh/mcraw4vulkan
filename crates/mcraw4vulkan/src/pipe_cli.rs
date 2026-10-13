@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use mcraw4vulkan_core::{
     BayerPattern, FrameDimensions, FrameNumber, FramePayloadLayout, McrawClipInfo,
 };
-use mcraw4vulkan_cpu::{CpuFrameDecoder, DecodeFrameTimings};
+use mcraw4vulkan_cpu::CpuFrameDecoder;
 use mcraw4vulkan_fuse::{AudioWavMetadata, LazyAudioWav, LazyAudioWavConfig};
 use mcraw4vulkan_gpu::{
     GpuBackendPreference, GpuDecodeBackend, GpuDecodeConfig, GpuDecodeRequiredLimits,
@@ -1086,6 +1086,7 @@ fn collect_pipe_frame_contexts_without_decode(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
 pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
     input_path: &Path,
     selected_backend: PipeCliBackend,
@@ -1119,7 +1120,6 @@ pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
     let backend = GpuDecodeBackend::new_blocking_with_required_limits(
         GpuDecodeConfig {
             backend_preference,
-            ..GpuDecodeConfig::default()
         },
         required_limits,
     )?;
@@ -1189,12 +1189,10 @@ pub(crate) fn stream_pipe_frames<S: DirectYuv12FrameSink>(
                 decoder
                     .compressed_mut()
                     .extend_from_slice(payload.data.as_slice());
-                let mut timings = DecodeFrameTimings::default();
                 let (decoded, _) = decoder
                     .decode_loaded_payload_to_decoded_bayer_u16_frame_with_layout(
                         preflight.geometry.extraction(),
                         context.layout,
-                        &mut timings,
                     )
                     .with_context(|| format!("CPU decoding PIPE logical frame {index}"))?;
                 let decoded_bytes = decoded

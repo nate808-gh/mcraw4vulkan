@@ -3,22 +3,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mcraw4vulkan_core::{BayerPattern, FrameDimensions, FrameNumber, FramePayloadLayout};
-use mcraw4vulkan_cpu::{CpuFrameDecoder, DecodeFrameTimings};
+use mcraw4vulkan_cpu::CpuFrameDecoder;
 use mcraw4vulkan_display::{
     DisplayFpsMeter, DisplayFpsOverlay, DisplayFramePacer, DisplayPresentInput, DisplayPresentMode,
     DisplayPresentTarget, DisplayScaleMode, DisplaySize, DisplaySourceTransfer,
     DisplayTexturePresenter, DisplayTransferStrategy, fit_aspect_preserving,
 };
 use mcraw4vulkan_display_sound::{DisplaySoundError, DisplaySoundPlan, DisplaySoundSession};
-use mcraw4vulkan_gpu::{
-    GpuBackendPreference, GpuDecodeBackend, GpuDecodeConfig, OptionalGpuVignetteCorrection,
-};
+use mcraw4vulkan_gpu::{GpuDecodeBackend, OptionalGpuVignetteCorrection};
 use mcraw4vulkan_mcrawcontainer::{
     ColorIlluminant, ContainerMetadata, FrameMetadata, LensShadingMap, McrawContainer,
-    McrawContainerOpenTimings, SensorArrangement,
+    SensorArrangement,
     payload_reader::{
-        PayloadFeeder, PayloadFeederOptions, PayloadFeederPoll, PayloadFeederSpawnTimings,
-        PayloadFrame, PayloadReadPlan,
+        PayloadFeeder, PayloadFeederOptions, PayloadFeederPoll, PayloadFrame, PayloadReadPlan,
     },
 };
 use mcraw4vulkan_render::{
@@ -105,7 +102,6 @@ pub struct DisplayCliRunConfig {
     pub overlay: DisplayCliOverlay,
     pub sound: DisplayCliSound,
     pub payload_feeder_options: PayloadFeederOptions,
-    pub startup_timing: bool,
 }
 
 impl DisplayCliRunConfig {
@@ -119,7 +115,6 @@ impl DisplayCliRunConfig {
             overlay: DisplayCliOverlay::WithOverlay,
             sound: DisplayCliSound::Silent,
             payload_feeder_options: PayloadFeederOptions::production_default(),
-            startup_timing: false,
         }
     }
 
@@ -142,13 +137,6 @@ impl DisplayCliRunConfig {
         match self.vsync {
             DisplayCliVsync::Vsync => DisplayPlaybackMode::SourcePaced,
             DisplayCliVsync::NoVsync => DisplayPlaybackMode::MaxSpeed,
-        }
-    }
-
-    fn backend_preference(&self) -> GpuBackendPreference {
-        match self.backend {
-            DisplayCliBackend::Gpu => GpuBackendPreference::VulkanOnly,
-            DisplayCliBackend::Cpu => GpuBackendPreference::Auto,
         }
     }
 
@@ -331,28 +319,20 @@ pub(crate) fn display_keyboard_action(
 pub fn run_display_window(config: DisplayCliRunConfig) -> Result<()> {
     config.validate_before_open()?;
 
-    let mut startup_timing = config.startup_timing.then(DisplayStartupTimings::new);
-    let surface_start = Instant::now();
     let mut surface = Sdl2WgpuSurface::new(display_surface_config(&config))?;
-    if let Some(timing) = startup_timing.as_mut() {
-        timing.record_phase("display.sdl_wgpu_surface_setup", surface_start);
-    }
     let mut event_pump = surface.event_pump()?;
     let initial_size = display_size_from_window_size(surface.size()).unwrap_or(DisplaySize {
         width: DEFAULT_STANDALONE_DISPLAY_WINDOW_WIDTH,
         height: DEFAULT_STANDALONE_DISPLAY_WINDOW_HEIGHT,
     });
-    let adapter_features = surface.adapter().features();
     let mut state = DisplayWindowState::create(
         config,
         DisplayWindowCreateContext {
             adapter_info: surface.adapter_info().clone(),
-            adapter_features,
             device: surface.device().clone(),
             queue: surface.queue().clone(),
             surface_format: surface.surface_format(),
             display_size: initial_size,
-            startup_timing,
         },
     )?;
     let mut fullscreen = false;
@@ -471,29 +451,8 @@ fn embedded_progress_from_display(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct EmbeddedDisplayPreviewCreateTimings {
-    pub display_source_from_prepared: Option<Duration>,
-    pub payload_feeder_spawn: Option<Duration>,
-    pub payload_chunk_plan_from_plan: Option<Duration>,
-    pub gpu_decode_backend_from_wgpu_device: Option<Duration>,
-    pub gpu_preview_texture_renderer_new: Option<Duration>,
-    pub display_texture_presenter_new: Option<Duration>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 pub struct EmbeddedDisplayPreviewFrameTimings {
-    pub frame_index_before: u64,
-    pub frame_index_after: u64,
-    pub frame_number: Option<u32>,
-    pub source_frame_duration: Option<Duration>,
-    pub repaint_after: Option<Duration>,
-    pub payload_receive_duration: Option<Duration>,
-    pub decode_upload_duration: Option<Duration>,
-    pub present_encode_duration: Option<Duration>,
     pub new_video_frame: bool,
-    pub reused_existing_frame: bool,
-    pub payload_pending: bool,
-    pub waiting_for_pacer: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,10 +515,12 @@ pub struct EmbeddedDisplayPreviewPrepared {
 }
 
 impl EmbeddedDisplayPreviewPrepared {
+    #[rustfmt::skip]
     pub fn prepare(config: DisplayCliRunConfig) -> Result<Self> {
         Self::prepare_cancellable(config, || false)
     }
 
+    #[rustfmt::skip]
     pub fn prepare_cancellable(
         config: DisplayCliRunConfig,
         cancelled: impl Fn() -> bool,
@@ -569,7 +530,10 @@ impl EmbeddedDisplayPreviewPrepared {
             bail!("display sound is only supported by standalone CLI display");
         }
         Ok(Self {
-            prepared: DisplayWindowPreparedState::prepare_with_cancel(config, None, cancelled)?,
+            prepared: DisplayWindowPreparedState::prepare_with_cancel(
+                config,
+                cancelled,
+            )?,
         })
     }
 
@@ -579,6 +543,7 @@ impl EmbeddedDisplayPreviewPrepared {
         Self::prepare_with_sound_plan_cancellable(config, || false)
     }
 
+    #[rustfmt::skip]
     pub fn prepare_with_sound_plan_cancellable(
         config: DisplayCliRunConfig,
         cancelled: impl Fn() -> bool,
@@ -587,17 +552,20 @@ impl EmbeddedDisplayPreviewPrepared {
         if !config.sound.enabled() {
             bail!("embedded display sound preparation requires sound-enabled config");
         }
-        let prepared = DisplayWindowPreparedState::prepare_with_cancel(config, None, cancelled)?;
+        let prepared = DisplayWindowPreparedState::prepare_with_cancel(
+                config,
+                cancelled,
+            )?;
         let sound_plan = DisplaySoundPlan::from_container(&prepared.source.container);
         Ok((Self { prepared }, sound_plan))
     }
 }
 
 impl EmbeddedDisplayPreview {
+    #[rustfmt::skip]
     pub fn create(
         config: DisplayCliRunConfig,
         adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
         device: wgpu::Device,
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
@@ -607,7 +575,6 @@ impl EmbeddedDisplayPreview {
         Self::from_prepared(
             prepared,
             adapter_info,
-            adapter_features,
             device,
             queue,
             surface_format,
@@ -615,10 +582,10 @@ impl EmbeddedDisplayPreview {
         )
     }
 
+    #[rustfmt::skip]
     pub fn from_prepared(
         prepared: EmbeddedDisplayPreviewPrepared,
         adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
         device: wgpu::Device,
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
@@ -628,44 +595,14 @@ impl EmbeddedDisplayPreview {
             prepared.prepared,
             DisplayWindowCreateContext {
                 adapter_info,
-                adapter_features,
                 device,
                 queue,
                 surface_format,
                 display_size: target.display_size(),
-                startup_timing: None,
             },
-            None,
             None,
         )?;
         Ok(Self { state })
-    }
-
-    pub fn from_prepared_with_timings(
-        prepared: EmbeddedDisplayPreviewPrepared,
-        adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        surface_format: wgpu::TextureFormat,
-        target: EmbeddedDisplayPreviewTarget,
-    ) -> Result<(Self, EmbeddedDisplayPreviewCreateTimings)> {
-        let mut timings = EmbeddedDisplayPreviewCreateTimings::default();
-        let state = DisplayWindowState::create_from_prepared(
-            prepared.prepared,
-            DisplayWindowCreateContext {
-                adapter_info,
-                adapter_features,
-                device,
-                queue,
-                surface_format,
-                display_size: target.display_size(),
-                startup_timing: None,
-            },
-            Some(&mut timings),
-            None,
-        )?;
-        Ok((Self { state }, timings))
     }
 
     pub fn resize(&mut self, target: EmbeddedDisplayPreviewTarget) {
@@ -713,19 +650,12 @@ impl EmbeddedDisplayPreview {
         preview_target: EmbeddedDisplayPreviewTarget,
     ) -> Result<EmbeddedDisplayPreviewFrameResult> {
         self.state.resize(preview_target.display_size());
-        let frame_index_before = self.state.source.next_frame_index as u64;
-        let source_frame_duration = self.state.source.source_frame_duration();
         self.state
             .present_existing_preview_if_available(target, preview_target.present_target()?)?;
         let repaint_after = self.state.cooperative_repaint_after(Instant::now());
         Ok(EmbeddedDisplayPreviewFrameResult {
             progress: EmbeddedDisplayPreviewProgress::Continue { repaint_after },
             timings: EmbeddedDisplayPreviewFrameTimings {
-                frame_index_before,
-                frame_index_after: self.state.source.next_frame_index as u64,
-                source_frame_duration,
-                repaint_after: Some(repaint_after),
-                reused_existing_frame: self.state.presented_frames > 0,
                 ..EmbeddedDisplayPreviewFrameTimings::default()
             },
         })
@@ -776,101 +706,19 @@ struct DisplayWindowState {
     current_frame_index: Option<usize>,
     presented_frames: u64,
     sound: Option<DisplaySoundSession>,
-    startup_timing: Option<DisplayStartupTimings>,
 }
 
 struct DisplayWindowPreparedState {
     config: DisplayCliRunConfig,
     source: DisplayWindowPreparedSource,
-    startup_timing: Option<DisplayStartupTimings>,
 }
 
 struct DisplayWindowCreateContext {
     adapter_info: wgpu::AdapterInfo,
-    adapter_features: wgpu::Features,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
     display_size: DisplaySize,
-    startup_timing: Option<DisplayStartupTimings>,
-}
-
-#[derive(Debug)]
-struct DisplayStartupTimingEvent {
-    phase: &'static str,
-    start_offset: Duration,
-    duration: Duration,
-}
-
-#[derive(Debug)]
-struct DisplayStartupTimings {
-    start: Instant,
-    events: Vec<DisplayStartupTimingEvent>,
-    first_payload_received: bool,
-    first_decode_upload: bool,
-    first_present_encode: bool,
-    first_surface_submit: bool,
-    emitted: bool,
-}
-
-impl DisplayStartupTimings {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-            events: Vec::new(),
-            first_payload_received: false,
-            first_decode_upload: false,
-            first_present_encode: false,
-            first_surface_submit: false,
-            emitted: false,
-        }
-    }
-
-    fn record_phase(&mut self, phase: &'static str, phase_start: Instant) {
-        self.events.push(DisplayStartupTimingEvent {
-            phase,
-            start_offset: phase_start.duration_since(self.start),
-            duration: phase_start.elapsed(),
-        });
-    }
-
-    fn record_nested_phase(
-        &mut self,
-        phase: &'static str,
-        parent_start: Instant,
-        nested_start_offset: Duration,
-        duration: Duration,
-    ) {
-        self.events.push(DisplayStartupTimingEvent {
-            phase,
-            start_offset: parent_start.duration_since(self.start) + nested_start_offset,
-            duration,
-        });
-    }
-
-    fn emit(&mut self, input_path: &Path) {
-        if self.emitted {
-            return;
-        }
-        self.emitted = true;
-        eprintln!(
-            "[display-startup-timing] file={} total_elapsed_ms={:.3}",
-            input_path.display(),
-            duration_ms(self.start.elapsed())
-        );
-        for event in &self.events {
-            eprintln!(
-                "[display-startup-timing] phase={} start_ms={:.3} duration_ms={:.3}",
-                event.phase,
-                duration_ms(event.start_offset),
-                duration_ms(event.duration)
-            );
-        }
-    }
-}
-
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 #[derive(Default)]
@@ -1028,106 +876,44 @@ fn display_fps_overlay_for_present(
 }
 
 impl DisplayWindowPreparedState {
+    #[rustfmt::skip]
     fn prepare(
         config: DisplayCliRunConfig,
-        startup_timing: Option<DisplayStartupTimings>,
     ) -> Result<Self> {
-        Self::prepare_with_cancel(config, startup_timing, || false)
+        Self::prepare_with_cancel(
+            config,
+            || false,
+        )
     }
 
+    #[rustfmt::skip]
     fn prepare_with_cancel(
         config: DisplayCliRunConfig,
-        mut startup_timing: Option<DisplayStartupTimings>,
         cancelled: impl Fn() -> bool,
     ) -> Result<Self> {
-        let container_start = Instant::now();
-        let mut container_timings = McrawContainerOpenTimings::default();
-        let container = match (startup_timing.is_some(), config.sound.enabled()) {
-            (true, true) => McrawContainer::open_for_display_with_audio_with_timing(
-                &config.input_path,
-                &mut container_timings,
-            ),
-            (true, false) => McrawContainer::open_for_display_with_timing(
-                &config.input_path,
-                &mut container_timings,
-            ),
-            (false, true) => McrawContainer::open_for_display_with_audio(&config.input_path),
-            (false, false) => McrawContainer::open_for_display(&config.input_path),
+        let container = match (
+            config.sound.enabled(),
+        ) {
+            (
+                true,
+            ) => McrawContainer::open_for_display_with_audio(&config.input_path),
+            (
+                false,
+            ) => McrawContainer::open_for_display(&config.input_path),
         }
         .with_context(|| format!("opening {}", config.input_path.display()))?;
         container.prepare_geometry_with_cancel(cancelled)?;
-        if let Some(timing) = startup_timing.as_mut() {
-            timing.record_phase("mcraw_container.open.total", container_start);
-            timing.record_nested_phase(
-                "mcraw_container.open.parse_clip",
-                container_start,
-                container_timings.parse_clip.start_offset,
-                container_timings.parse_clip.duration,
-            );
-            timing.record_nested_phase(
-                "mcraw_container.open.container_metadata_parse",
-                container_start,
-                container_timings.container_metadata_parse.start_offset,
-                container_timings.container_metadata_parse.duration,
-            );
-            let frame_metadata_phase = if container_timings.parsed_all_frame_metadata {
-                "mcraw_container.open.frame_metadata_json_parse_loop"
-            } else {
-                "mcraw_container.open.display_initial_frame_metadata_parse"
-            };
-            timing.record_nested_phase(
-                frame_metadata_phase,
-                container_start,
-                container_timings
-                    .frame_metadata_json_parse_loop
-                    .start_offset,
-                container_timings.frame_metadata_json_parse_loop.duration,
-            );
-            if !container_timings.parsed_all_frame_metadata {
-                timing.record_nested_phase(
-                    "mcraw_container.open.full_frame_metadata_deferred",
-                    container_start,
-                    container_timings
-                        .frame_metadata_json_parse_loop
-                        .start_offset
-                        + container_timings.frame_metadata_json_parse_loop.duration,
-                    Duration::ZERO,
-                );
-            }
-            if container_timings.parsed_audio_metadata {
-                timing.record_nested_phase(
-                    "mcraw_container.open.audio_metadata_index_sync_setup",
-                    container_start,
-                    container_timings
-                        .audio_metadata_index_sync_setup
-                        .start_offset,
-                    container_timings.audio_metadata_index_sync_setup.duration,
-                );
-            } else {
-                timing.record_nested_phase(
-                    "mcraw_container.open.audio_metadata_index_sync_skipped_for_display",
-                    container_start,
-                    container_timings
-                        .frame_metadata_json_parse_loop
-                        .start_offset
-                        + container_timings.frame_metadata_json_parse_loop.duration,
-                    Duration::ZERO,
-                );
-            }
-        }
 
         let source = DisplayWindowPreparedSource::prepare(
             &config.input_path,
             container,
             config.playback_mode(),
             config.payload_feeder_options,
-            startup_timing.as_mut(),
         )?;
 
         Ok(Self {
             config,
             source,
-            startup_timing,
         })
     }
 }
@@ -1135,94 +921,63 @@ impl DisplayWindowPreparedState {
 fn prepare_display_sound(
     config: &DisplayCliRunConfig,
     container: &McrawContainer,
-    startup_timing: Option<&mut DisplayStartupTimings>,
 ) -> Result<Option<DisplaySoundSession>> {
     if !config.sound.enabled() {
         return Ok(None);
     }
 
-    let audio_start = Instant::now();
     let sound = DisplaySoundSession::from_container(container)
         .context("preparing display audio for --with-sound")?;
-    if let Some(timing) = startup_timing {
-        timing.record_phase("display.audio.prepare", audio_start);
-    }
     Ok(Some(sound))
 }
 
 impl DisplayWindowState {
+    #[rustfmt::skip]
     fn create(
         config: DisplayCliRunConfig,
-        mut context: DisplayWindowCreateContext,
+        context: DisplayWindowCreateContext,
     ) -> Result<Self> {
-        let mut prepared =
-            DisplayWindowPreparedState::prepare(config, context.startup_timing.take())?;
+        let prepared = DisplayWindowPreparedState::prepare(
+            config,
+        )?;
         let sound = prepare_display_sound(
             &prepared.config,
             &prepared.source.container,
-            prepared.startup_timing.as_mut(),
         )?;
-        Self::create_from_prepared(prepared, context, None, sound)
+        Self::create_from_prepared(
+            prepared, context,
+            sound,
+        )
     }
 
+    #[rustfmt::skip]
     fn create_from_prepared(
         prepared: DisplayWindowPreparedState,
         context: DisplayWindowCreateContext,
-        mut embedded_timings: Option<&mut EmbeddedDisplayPreviewCreateTimings>,
         sound: Option<DisplaySoundSession>,
     ) -> Result<Self> {
         let DisplayWindowPreparedState {
             config,
             source,
-            mut startup_timing,
         } = prepared;
         let DisplayWindowCreateContext {
             adapter_info,
-            adapter_features,
             device,
             queue,
             surface_format,
             display_size,
-            startup_timing: _,
         } = context;
 
-        let source_start = Instant::now();
         let source = DisplayWindowSource::from_prepared(
             source,
-            startup_timing.as_mut(),
-            embedded_timings.as_deref_mut(),
         )?;
-        if let Some(timings) = embedded_timings.as_deref_mut() {
-            timings.display_source_from_prepared = Some(source_start.elapsed());
-        }
-
-        let backend_start = Instant::now();
         let backend = GpuDecodeBackend::from_wgpu_device(
             adapter_info,
-            adapter_features,
             device,
             queue,
-            GpuDecodeConfig {
-                backend_preference: config.backend_preference(),
-                enable_gpu_timestamps: false,
-            },
         )?;
-        if let Some(timing) = startup_timing.as_mut() {
-            timing.record_phase("gpu_decode_backend.from_wgpu_device", backend_start);
-        }
-        if let Some(timings) = embedded_timings.as_mut() {
-            timings.gpu_decode_backend_from_wgpu_device = Some(backend_start.elapsed());
-        }
-
-        let preview_renderer_start = Instant::now();
         let preview_renderer = GpuPreviewTextureRenderer::new(backend.device())
             .map_err(|error| anyhow!("creating display preview renderer: {error}"))?;
-        if let Some(timing) = startup_timing.as_mut() {
-            timing.record_phase("gpu_preview_texture_renderer.new", preview_renderer_start);
-        }
-        if let Some(timings) = embedded_timings.as_mut() {
-            timings.gpu_preview_texture_renderer_new = Some(preview_renderer_start.elapsed());
-        }
         let display_histogram = if config.vignette == DisplayCliVignette::WithCorrection {
             Some(
                 GpuDisplayP999Histogram::new(backend.device())
@@ -1236,18 +991,11 @@ impl DisplayWindowState {
             DisplayCliBackend::Gpu => None,
         };
 
-        let presenter_start = Instant::now();
         let presenter = DisplayTexturePresenter::new(
             backend.device(),
             surface_format,
             DisplayScaleMode::FitContain,
         );
-        if let Some(timing) = startup_timing.as_mut() {
-            timing.record_phase("display_texture_presenter.new", presenter_start);
-        }
-        if let Some(timings) = embedded_timings.as_mut() {
-            timings.display_texture_presenter_new = Some(presenter_start.elapsed());
-        }
         let vignette_corrector = if config.vignette == DisplayCliVignette::WithCorrection {
             Some(backend.create_vignette_corrector()?)
         } else {
@@ -1276,7 +1024,6 @@ impl DisplayWindowState {
             current_frame_index: None,
             presented_frames: 0,
             sound,
-            startup_timing,
         })
     }
 
@@ -1318,31 +1065,17 @@ impl DisplayWindowState {
     ) -> Result<DisplayWindowProgress> {
         self.resize(present_target.size);
 
-        let first_payload_start = self
-            .startup_timing
-            .as_ref()
-            .filter(|timing| !timing.first_payload_received)
-            .map(|_| Instant::now());
         let frame = self.source.next_payload_frame()?;
-        if frame.is_some() {
-            self.record_first_payload_received(first_payload_start);
-        }
         let Some(frame) = frame else {
             return Ok(DisplayWindowProgress::Finished);
         };
 
         let displayed_frame_index = self.source.next_frame_index;
         let facts = self.source.frame_facts(frame.frame_number_core()?)?;
-        let first_decode_upload_start = self
-            .startup_timing
-            .as_ref()
-            .filter(|timing| !timing.first_decode_upload)
-            .map(|_| Instant::now());
         match self.config.backend {
             DisplayCliBackend::Gpu => self.render_gpu_frame(&facts, &frame)?,
             DisplayCliBackend::Cpu => self.render_cpu_frame(&facts, &frame)?,
         }
-        self.record_first_decode_upload(first_decode_upload_start);
         self.source.advance_after_frame_blocking();
         self.present_preview_to(target, present_target, true)?;
         self.current_frame_index = Some(displayed_frame_index);
@@ -1353,6 +1086,7 @@ impl DisplayWindowState {
         })
     }
 
+    #[rustfmt::skip]
     fn render_next_frame_to_cooperative(
         &mut self,
         target: RenderFrameContext<'_>,
@@ -1362,25 +1096,16 @@ impl DisplayWindowState {
 
         let now = Instant::now();
         let displayed_frame_index = self.source.next_frame_index;
-        let frame_index_before = displayed_frame_index as u64;
-        let source_frame_duration = self.source.source_frame_duration();
         if let Some(repaint_after) = self.source.repaint_after_until_next_frame(now) {
             self.present_existing_preview_if_available(target, present_target)?;
             return Ok(DisplayWindowFrameResult {
                 progress: DisplayWindowProgress::Waiting { repaint_after },
                 timings: EmbeddedDisplayPreviewFrameTimings {
-                    frame_index_before,
-                    frame_index_after: self.source.next_frame_index as u64,
-                    source_frame_duration,
-                    repaint_after: Some(repaint_after),
-                    reused_existing_frame: self.presented_frames > 0,
-                    waiting_for_pacer: true,
                     ..EmbeddedDisplayPreviewFrameTimings::default()
                 },
             });
         }
 
-        let payload_start = Instant::now();
         let frame = match self.source.poll_next_payload_frame()? {
             DisplayPayloadFramePoll::Ready(frame) => frame,
             DisplayPayloadFramePoll::Pending => {
@@ -1390,12 +1115,6 @@ impl DisplayWindowState {
                         repaint_after: EMBEDDED_PREVIEW_PAYLOAD_RETRY_INTERVAL,
                     },
                     timings: EmbeddedDisplayPreviewFrameTimings {
-                        frame_index_before,
-                        frame_index_after: self.source.next_frame_index as u64,
-                        source_frame_duration,
-                        repaint_after: Some(EMBEDDED_PREVIEW_PAYLOAD_RETRY_INTERVAL),
-                        reused_existing_frame: self.presented_frames > 0,
-                        payload_pending: true,
                         ..EmbeddedDisplayPreviewFrameTimings::default()
                     },
                 });
@@ -1404,34 +1123,19 @@ impl DisplayWindowState {
                 return Ok(DisplayWindowFrameResult {
                     progress: DisplayWindowProgress::Finished,
                     timings: EmbeddedDisplayPreviewFrameTimings {
-                        frame_index_before,
-                        frame_index_after: self.source.next_frame_index as u64,
-                        source_frame_duration,
                         ..EmbeddedDisplayPreviewFrameTimings::default()
                     },
                 });
             }
         };
-        let payload_receive_duration = payload_start.elapsed();
-        self.record_first_payload_received(Some(payload_start));
 
         let facts = self.source.frame_facts(frame.frame_number_core()?)?;
-        let first_decode_upload_start = self
-            .startup_timing
-            .as_ref()
-            .filter(|timing| !timing.first_decode_upload)
-            .map(|_| Instant::now());
-        let decode_upload_start = Instant::now();
         match self.config.backend {
             DisplayCliBackend::Gpu => self.render_gpu_frame(&facts, &frame)?,
             DisplayCliBackend::Cpu => self.render_cpu_frame(&facts, &frame)?,
         }
-        let decode_upload_duration = decode_upload_start.elapsed();
-        self.record_first_decode_upload(first_decode_upload_start);
         self.source.advance_after_frame_cooperative();
-        let present_encode_start = Instant::now();
         self.present_preview_to(target, present_target, true)?;
-        let present_encode_duration = present_encode_start.elapsed();
         self.current_frame_index = Some(displayed_frame_index);
         self.presented_frames += 1;
         let repaint_after = self.cooperative_repaint_after(Instant::now());
@@ -1439,16 +1143,7 @@ impl DisplayWindowState {
         Ok(DisplayWindowFrameResult {
             progress: DisplayWindowProgress::Continue { repaint_after },
             timings: EmbeddedDisplayPreviewFrameTimings {
-                frame_index_before,
-                frame_index_after: self.source.next_frame_index as u64,
-                frame_number: Some(frame.frame_number_core()?.0),
-                source_frame_duration,
-                repaint_after: Some(repaint_after),
-                payload_receive_duration: Some(payload_receive_duration),
-                decode_upload_duration: Some(decode_upload_duration),
-                present_encode_duration: Some(present_encode_duration),
                 new_video_frame: true,
-                ..EmbeddedDisplayPreviewFrameTimings::default()
             },
         })
     }
@@ -1457,71 +1152,12 @@ impl DisplayWindowState {
         self.source.cooperative_repaint_after(now)
     }
 
-    fn record_first_payload_received(&mut self, phase_start: Option<Instant>) {
-        let Some(phase_start) = phase_start else {
-            return;
-        };
-        let Some(timing) = self.startup_timing.as_mut() else {
-            return;
-        };
-        if timing.first_payload_received {
-            return;
-        }
-        timing.first_payload_received = true;
-        timing.record_phase("display.first_payload_received", phase_start);
-    }
-
-    fn record_first_decode_upload(&mut self, phase_start: Option<Instant>) {
-        let Some(phase_start) = phase_start else {
-            return;
-        };
-        let Some(timing) = self.startup_timing.as_mut() else {
-            return;
-        };
-        if timing.first_decode_upload {
-            return;
-        }
-        timing.first_decode_upload = true;
-        timing.record_phase("display.first_decode_upload", phase_start);
-    }
-
-    fn record_first_present_encode(&mut self, phase_start: Option<Instant>) {
-        let Some(phase_start) = phase_start else {
-            return;
-        };
-        let Some(timing) = self.startup_timing.as_mut() else {
-            return;
-        };
-        if timing.first_present_encode {
-            return;
-        }
-        timing.first_present_encode = true;
-        timing.record_phase("display.first_present_encode", phase_start);
-    }
-
     fn after_surface_submit(&mut self) -> Result<()> {
-        self.record_first_surface_submit();
         if let Some(sound) = self.sound.as_mut() {
             sound.start_after_first_video_submit()?;
             sound.pump()?;
         }
         Ok(())
-    }
-
-    fn record_first_surface_submit(&mut self) {
-        let Some(timing) = self.startup_timing.as_mut() else {
-            return;
-        };
-        if timing.first_surface_submit {
-            return;
-        }
-        timing.first_surface_submit = true;
-        timing.events.push(DisplayStartupTimingEvent {
-            phase: "display.first_surface_submit",
-            start_offset: timing.start.elapsed(),
-            duration: Duration::ZERO,
-        });
-        timing.emit(&self.config.input_path);
     }
 
     fn render_gpu_frame(&mut self, facts: &DisplayFrameFacts, frame: &PayloadFrame) -> Result<()> {
@@ -1723,7 +1359,6 @@ impl DisplayWindowState {
         if self.preview_uploader.is_none() {
             bail!("CPU display upload buffer was not created");
         }
-        let mut timings = DecodeFrameTimings::default();
         self.source.cpu_decoder.prepare_compressed(frame.data.len());
         frame
             .data
@@ -1734,7 +1369,6 @@ impl DisplayWindowState {
             .decode_loaded_payload_to_decoded_bayer_u16_frame_with_layout(
                 facts.geometry.extraction(),
                 facts.payload_layout,
-                &mut timings,
             )
             .context("CPU decoding display frame")?;
         let bytes = decoded
@@ -1806,11 +1440,6 @@ impl DisplayWindowState {
         present_target: DisplayPresentTarget,
         record_presented: bool,
     ) -> Result<()> {
-        let first_present_encode_start = self
-            .startup_timing
-            .as_ref()
-            .filter(|timing| record_presented && !timing.first_present_encode)
-            .map(|_| Instant::now());
         let texture_view = self.preview_renderer.texture_view()?;
         let fps_overlay = display_fps_overlay_for_present(
             self.config.overlay,
@@ -1835,7 +1464,6 @@ impl DisplayWindowState {
             ),
             fps_overlay,
         })?;
-        self.record_first_present_encode(first_present_encode_start);
         if record_presented {
             self.fps_meter.record_presented(Instant::now());
         }
@@ -1858,9 +1486,6 @@ impl DisplayWindowState {
             sound.stop();
         }
         self.source.finish()?;
-        if let Some(timing) = self.startup_timing.as_mut() {
-            timing.emit(&self.config.input_path);
-        }
         if self.presented_frames > 0 {
             eprintln!("displayed {} frames", self.presented_frames);
         }
@@ -1913,18 +1538,16 @@ struct DisplayWindowPreparedSource {
     playback_mode: DisplayPlaybackMode,
     payload_feeder_options: PayloadFeederOptions,
     frame_rate_fps: f64,
-    source_create_start: Option<Instant>,
 }
 
 impl DisplayWindowPreparedSource {
+    #[rustfmt::skip]
     fn prepare(
         input_path: &Path,
         container: McrawContainer,
         playback_mode: DisplayPlaybackMode,
         payload_feeder_options: PayloadFeederOptions,
-        startup_timing: Option<&mut DisplayStartupTimings>,
     ) -> Result<Self> {
-        let source_create_start = startup_timing.as_ref().map(|_| Instant::now());
         let geometry = container.resolved_frame_geometry(FrameNumber(0))?;
         if let Some(message) = geometry.recovery_message() {
             tracing::warn!("{message}");
@@ -1941,12 +1564,8 @@ impl DisplayWindowPreparedSource {
                     .context("frame index does not fit in u32")
             })
             .collect::<Result<Vec<_>>>()?;
-        let plan_start = Instant::now();
         let payload_plan = PayloadReadPlan::from_core_frame_numbers(&container, &frames)
             .context("planning display payload reads")?;
-        if let Some(timing) = startup_timing {
-            timing.record_phase("payload_read_plan.from_core_frame_numbers", plan_start);
-        }
         let frame_rate_fps =
             display_source_frame_rate_fps(container.clip_info().frame_rate.as_f64());
 
@@ -1958,16 +1577,14 @@ impl DisplayWindowPreparedSource {
             playback_mode,
             payload_feeder_options,
             frame_rate_fps,
-            source_create_start,
         })
     }
 }
 
 impl DisplayWindowSource {
+    #[rustfmt::skip]
     fn from_prepared(
         prepared: DisplayWindowPreparedSource,
-        startup_timing: Option<&mut DisplayStartupTimings>,
-        embedded_timings: Option<&mut EmbeddedDisplayPreviewCreateTimings>,
     ) -> Result<Self> {
         let DisplayWindowPreparedSource {
             input_path,
@@ -1977,42 +1594,11 @@ impl DisplayWindowSource {
             playback_mode,
             payload_feeder_options,
             frame_rate_fps,
-            source_create_start,
         } = prepared;
-        let feeder_start = Instant::now();
-        let mut feeder_timings = PayloadFeederSpawnTimings::default();
-        let timing_payload_feeder = startup_timing.is_some() || embedded_timings.is_some();
-        let payload_feeder = if timing_payload_feeder {
-            PayloadFeeder::spawn_with_timing(
-                &input_path,
-                payload_plan,
-                payload_feeder_options,
-                &mut feeder_timings,
-            )
-        } else {
+        let payload_feeder = {
             PayloadFeeder::spawn(&input_path, payload_plan, payload_feeder_options)
         }
         .context("starting display payload reader")?;
-        if let Some(timing) = startup_timing {
-            timing.record_phase("payload_feeder.spawn.total", feeder_start);
-            if let Some(chunk_plan) = feeder_timings.chunk_plan_from_plan {
-                timing.record_nested_phase(
-                    "payload_feeder.spawn.payload_chunk_plan.from_plan",
-                    feeder_start,
-                    chunk_plan.start_offset,
-                    chunk_plan.duration,
-                );
-            }
-            if let Some(source_create_start) = source_create_start {
-                timing.record_phase("display_source.create.total", source_create_start);
-            }
-        }
-        if let Some(timings) = embedded_timings {
-            timings.payload_feeder_spawn = Some(feeder_start.elapsed());
-            if let Some(chunk_plan) = feeder_timings.chunk_plan_from_plan {
-                timings.payload_chunk_plan_from_plan = Some(chunk_plan.duration);
-            }
-        }
         let frame_pacer = playback_mode.create_frame_pacer(frame_rate_fps, Instant::now(), 0);
 
         Ok(Self {

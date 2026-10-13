@@ -8,15 +8,14 @@
 // this crate.
 
 pub mod frame_index;
+#[cfg(target_os = "macos")]
 pub mod macfuse_location;
 pub mod mount_naming;
 
-mod clip_id;
 mod decode_backend_choice;
 mod decoded_bayer_u16_frame;
 mod types;
 
-pub use clip_id::RegisteredClipId;
 pub use decode_backend_choice::{DecodeBackendChoice, ParseDecodeBackendChoiceError};
 pub use decoded_bayer_u16_frame::{DecodedBayerU16Frame, DecodedBayerU16FrameValidationError};
 pub use mount_naming::{

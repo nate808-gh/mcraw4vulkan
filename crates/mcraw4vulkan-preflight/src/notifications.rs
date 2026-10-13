@@ -76,8 +76,8 @@ pub fn missing_requirement_notification(
     match requirement {
         PreflightRequirement::MountBackend(MountBackendKind::MacosMacFuse) => {
             RequirementNotification {
-                title: "macFUSE is required".to_string(),
-                body: "https://macfuse.github.io/".to_string(),
+                title: "DNG mounting support is unavailable".to_string(),
+                body: "DNG mounting requires a usable macFUSE FSKit installation on this workstation. Install the official macFUSE 5.4.0 package and enable its File System Extension in macOS Settings. Other application features remain available.".to_string(),
             }
         }
         PreflightRequirement::MountBackend(MountBackendKind::LinuxFuse3) => {

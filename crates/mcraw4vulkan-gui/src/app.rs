@@ -1,3 +1,4 @@
+use mcraw4vulkan::movie_export::ExportOutputKind;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -533,9 +534,19 @@ impl GuiApp {
         self.quit_requested
             && self.pending_file_chooser.is_none()
             && !self.movie_export.needs_poll()
+            && (!cfg!(target_os = "macos") || !self.dng_processes.has_active_work())
     }
 
     fn request_close(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if !self.quit_requested && self.dng_processes.has_active_work() {
+            self.dng_processes.cancel_starting_mounts();
+            let spec = DngCommandSpec::unmount_all(self.dng_binary.clone());
+            if let Err(error) = self.dng_processes.start_unmount_all(&spec) {
+                self.set_status(format!("DNG cleanup needs attention: {error}"));
+                return false;
+            }
+        }
         self.quit_requested = true;
         if let Some(chooser) = &mut self.pending_file_chooser {
             chooser.cancel();
@@ -1069,7 +1080,11 @@ impl GuiApp {
                 false,
                 live_results || (available && !self.playlist.is_empty()),
             ),
-            ButtonCell::new("Pipe example", false, true),
+            ButtonCell::new(
+                "Export Proxies",
+                false,
+                live_results || (available && !self.playlist.is_empty()),
+            ),
         ];
         // Equal targets stay within the pane; below-envelope labels may clip,
         // but cannot enlarge a target beyond its parent allocation.
@@ -1077,41 +1092,71 @@ impl GuiApp {
             ui,
             ((ui.available_width() - 2.0 * gap) / 3.0).min(ordinary_width),
         );
+        // At the Compact floor, borrow a few pixels from the shorter Export All
+        // label so the full proxy label retains padding inside its hit target.
+        let proxy_minimum = ui
+            .painter()
+            .layout_no_wrap(
+                "Export Proxies".into(),
+                FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
+                style::body_text(),
+            )
+            .size()
+            .x
+            + 8.0;
+        let extra = (proxy_minimum - width).max(0.0).ceil().min(width / 4.0);
+        let widths = [width, width - extra, width + extra];
         let clicks = ui
             .horizontal(|ui| {
-                cells.map(|cell| {
+                std::array::from_fn::<_, 3, _>(|index| {
+                    let cell = cells[index];
                     let sense = if cell.enabled {
                         Sense::click()
                     } else {
                         Sense::hover()
                     };
-                    draw_button_cell_with_sense(ui, cell, width, sense).clicked()
+                    draw_button_cell_with_sense(ui, cell, widths[index], sense).clicked()
                 })
             })
             .inner;
-        let vignette_clicked = draw_button_cell_with_sense(
-            ui,
-            ButtonCell::new(
-                "Vignette Correction",
-                self.pipe_vignette,
-                !self.movie_export.options_locked(),
-            ),
-            ordinary_width,
-            if self.movie_export.options_locked() {
-                Sense::hover()
-            } else {
-                Sense::click()
-            },
-        )
-        .clicked();
+        let (vignette_clicked, example_clicked) = ui
+            .horizontal(|ui| {
+                let vignette = draw_button_cell_with_sense(
+                    ui,
+                    ButtonCell::new(
+                        "Vignette Correction",
+                        self.pipe_vignette,
+                        !self.movie_export.options_locked(),
+                    ),
+                    ordinary_width,
+                    if self.movie_export.options_locked() {
+                        Sense::hover()
+                    } else {
+                        Sense::click()
+                    },
+                )
+                .clicked();
+                let example = draw_button_cell_with_sense(
+                    ui,
+                    ButtonCell::new("Pipe example", false, true),
+                    width,
+                    Sense::click(),
+                )
+                .clicked();
+                (vignette, example)
+            })
+            .inner;
         ui.add_space(style::metrics(ui).space(16.0));
         if clicks[0] {
-            self.show_movie_export(false);
+            self.show_movie_export(false, ExportOutputKind::ProRes4444);
         }
         if clicks[1] {
-            self.show_movie_export(true);
+            self.show_movie_export(true, ExportOutputKind::ProRes4444);
         }
         if clicks[2] {
+            self.show_movie_export(true, ExportOutputKind::ProResProxy);
+        }
+        if example_clicked {
             self.show_pipe_example();
         }
         if vignette_clicked {
@@ -1119,7 +1164,7 @@ impl GuiApp {
         }
     }
 
-    fn show_movie_export(&mut self, all: bool) {
+    fn show_movie_export(&mut self, all: bool, output_kind: ExportOutputKind) {
         if self.movie_export.is_running() {
             if self.right_pane_owner == RightPaneOwner::PipeExample
                 && self.pending_right_pane_request.is_none()
@@ -1128,7 +1173,7 @@ impl GuiApp {
             }
             return;
         }
-        self.start_movie_export(all);
+        self.start_movie_export(all, output_kind);
     }
 
     fn toggle_pipe_vignette(&mut self) {
@@ -1162,7 +1207,7 @@ impl GuiApp {
         }
     }
 
-    fn start_movie_export(&mut self, all: bool) {
+    fn start_movie_export(&mut self, all: bool, output_kind: ExportOutputKind) {
         let paths = self.movie_export_paths(all);
         if paths.is_empty() {
             self.set_status("No playlist file is available for export.");
@@ -1173,7 +1218,8 @@ impl GuiApp {
             self.settings.optimizer_profile,
             self.pipe_vignette,
         );
-        let request = self.movie_export.new_request(paths, options);
+        let mut request = self.movie_export.new_request(paths, options);
+        request.output_kind = output_kind;
         self.admit_movie_export(request);
     }
 
@@ -2085,6 +2131,21 @@ impl GuiApp {
 
     fn handle_dng_process_event(&mut self, event: DngProcessEvent) {
         match event {
+            #[cfg(target_os = "macos")]
+            DngProcessEvent::MountFolderRetained { status } => {
+                eprintln!("{status}");
+                self.set_status(status);
+            }
+            DngProcessEvent::MountCleanupPending {
+                entry_id: _,
+                display_name,
+                status,
+            } => {
+                self.quit_requested = false;
+                self.set_status(format!(
+                    "DNG cleanup is still owned for {display_name}; Quit is waiting. {status}"
+                ));
+            }
             DngProcessEvent::MountBecameActive {
                 entry_id,
                 display_name,
@@ -2168,6 +2229,14 @@ impl GuiApp {
                 success,
                 status,
             } => {
+                #[cfg(target_os = "macos")]
+                if self.quit_requested && !success {
+                    self.quit_requested = false;
+                    self.set_status(format!(
+                        "DNG volume is still owned; close files and retry Quit. {status}"
+                    ));
+                    return;
+                }
                 let waiting_for_mount_all_unmount = self.mount_all_waiting_for_unmount_all();
                 if success {
                     self.playlist
@@ -2487,7 +2556,6 @@ impl GuiApp {
         frame: RenderFrameContext<'_>,
         target: Option<mcraw4vulkan::display_window::EmbeddedDisplayPreviewTarget>,
         adapter_info: wgpu::AdapterInfo,
-        adapter_features: wgpu::Features,
         advance: bool,
     ) -> PreviewRenderOutcome {
         let selected_source_path = self.playlist.selected_path().map(PathBuf::from);
@@ -2505,7 +2573,6 @@ impl GuiApp {
             frame,
             target,
             adapter_info,
-            adapter_features,
             advance,
         );
         let mut outcome = match status {
@@ -3358,6 +3425,7 @@ fn draw_pipe_about_panel(ui: &mut egui::Ui, rect: Rect) {
             for (label, remainder) in [
                 ("Export Movie", " - Quickly export a file from the playlist to a ProRes 4444 movie file"),
                 ("Export All", " - Quickly export all of the files in the playlist to ProRes 4444 movie files"),
+                ("Export Proxies", " - Export the entire playlist as full-resolution ProRes Proxy movies"),
                 ("Pipe Example", " - See how to use the mcraw4vulkan pipe video bytestream with the command line to customize the export into any format"),
             ] {
                 ui.add_space(style::metrics(ui).space(16.0));
@@ -5107,7 +5175,6 @@ fn render_splash_frame(
     handle_platform_output(surface, app, scheduler, platform_output);
     let paint_jobs = context.tessellate(shapes, pixels_per_point);
     let adapter_info = surface.adapter_info().clone();
-    let adapter_features = surface.adapter().features();
     let scheduler_decision = scheduler.frame_decision(now);
     let event_allows_preview_advance = app.take_preview_advance();
     let advance_preview =
@@ -5162,7 +5229,6 @@ fn render_splash_frame(
                 frame,
                 preview_target,
                 adapter_info,
-                adapter_features,
                 advance_preview,
             );
         }

@@ -1,26 +1,22 @@
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use mcraw4vulkan_dngwriter::DngSinkVignetteMode;
+use mcraw4vulkan_macfuse_ffi::MountDirectory;
+pub use mcraw4vulkan_macfuse_ffi::reusable_mount_directory;
 use mcraw4vulkan_macfuse_ffi::{MacFuseSession, UnmountOutcome};
 
-#[path = "../linux_fuse3/fuser_fs.rs"]
-mod fuser_fs;
+mod callback_fs;
+use mcraw4vulkan_core::macfuse_location;
 
 use crate::platform_lifecycle::{
     PlatformMountCapabilities, PlatformMountHandle, PlatformMountKind, PlatformMountRequest,
     PlatformMountStatus, PlatformUnmountOutcome,
 };
-use crate::shared_root::{
-    AddClipResult, SharedRootVirtualFileSystem, SingleClipRootVirtualFileSystem,
-};
+use crate::shared_root::SingleClipRootVirtualFileSystem;
 use crate::virtual_fs::{
     DngGenerationBackend, DngGenerationExecutionPolicy, VirtualFileSystem, VirtualFileSystemConfig,
-    VirtualFileSystemStatsSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +30,7 @@ pub struct MountRequest {
     pub max_cached_dng_frames: usize,
     pub prefetch_forward_frames: usize,
     pub worker_threads: usize,
+    pub cancellation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MountRequest {
@@ -50,6 +47,7 @@ impl MountRequest {
             max_cached_dng_frames: default_config.max_cached_dng_frames,
             prefetch_forward_frames: default_config.prefetch_forward_frames,
             worker_threads: 1,
+            cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -66,6 +64,7 @@ impl MountRequest {
             max_cached_dng_frames: config.max_cached_dng_frames,
             prefetch_forward_frames: config.prefetch_forward_frames,
             worker_threads: request.worker_threads,
+            cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -97,69 +96,7 @@ impl From<PlatformMountRequest> for MountRequest {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SharedRootMountRequest {
-    pub input_paths: Vec<PathBuf>,
-    pub mount_point: PathBuf,
-    pub mount_name: String,
-    pub dng_backend: DngGenerationBackend,
-    pub dng_vignette_mode: DngSinkVignetteMode,
-    pub dng_generation_execution_policy: DngGenerationExecutionPolicy,
-    pub max_cached_dng_frames: usize,
-    pub prefetch_forward_frames: usize,
-    pub worker_threads: usize,
-}
-
-impl SharedRootMountRequest {
-    pub fn new(input_paths: Vec<PathBuf>, mount_point: PathBuf, mount_name: String) -> Self {
-        let default_config = VirtualFileSystemConfig::default();
-
-        Self {
-            input_paths,
-            mount_point,
-            mount_name,
-            dng_backend: default_config.dng_backend,
-            dng_vignette_mode: default_config.dng_vignette_mode,
-            dng_generation_execution_policy: default_config.dng_generation_execution_policy,
-            max_cached_dng_frames: default_config.max_cached_dng_frames,
-            prefetch_forward_frames: default_config.prefetch_forward_frames,
-            worker_threads: 1,
-        }
-    }
-
-    pub fn with_config(mut self, config: VirtualFileSystemConfig) -> Self {
-        self.dng_backend = config.dng_backend;
-        self.dng_vignette_mode = config.dng_vignette_mode;
-        self.dng_generation_execution_policy = config.dng_generation_execution_policy;
-        self.max_cached_dng_frames = config.max_cached_dng_frames;
-        self.prefetch_forward_frames = config.prefetch_forward_frames;
-        self
-    }
-
-    pub fn with_worker_threads(mut self, worker_threads: usize) -> Self {
-        self.worker_threads = worker_threads;
-        self
-    }
-
-    pub fn virtual_file_system_config(&self) -> VirtualFileSystemConfig {
-        VirtualFileSystemConfig {
-            dng_backend: self.dng_backend,
-            dng_vignette_mode: self.dng_vignette_mode,
-            dng_generation_execution_policy: self.dng_generation_execution_policy,
-            max_cached_dng_frames: self.max_cached_dng_frames,
-            prefetch_forward_frames: self.prefetch_forward_frames,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedRootMountedClip {
-    pub input_path: PathBuf,
-    pub folder_name: String,
-    pub already_mounted: bool,
-}
-
-// Each returned handle owns the composite macFUSE/fuser session and its VFS
+// Each returned handle owns the provider-owned FUSE3 callback session and its VFS
 // allocation. A refused borrowed unmount keeps both available for retry;
 // successful teardown joins callbacks before releasing native state.
 pub struct MountManager;
@@ -178,123 +115,50 @@ impl MountManager {
     }
 
     pub fn mount(&self, request: MountRequest) -> Result<MountHandle> {
+        let directory = MountDirectory::prepare(&request.mount_point, &request.input_path)?;
         let fs = Arc::new(
             VirtualFileSystem::open_clip(&request.input_path, request.virtual_file_system_config())
                 .with_context(|| {
                     format!(
-                        "failed to create macFUSE filesystem for {}",
+                        "failed to prepare DNG filesystem for {}",
                         request.input_path.display()
                     )
                 })?,
         );
 
         let root_view = Arc::new(SingleClipRootVirtualFileSystem::new(fs.clone()));
-        let attr_owner = fuser_file_attr_owner_for_mountpoint(&request.mount_point)?;
-        let filesystem =
-            fuser_fs::LinuxSingleClipRootFuse3FileSystem::new_single_clip_root_with_owner(
-                root_view, attr_owner,
-            );
-        let session = spawn_macos_fuser_session(
+        let filesystem = Arc::new(callback_fs::CallbackView::new(root_view));
+        let (session, actual_path) = spawn_macos_session(
             filesystem,
-            &request.mount_point,
-            macos_fuser_config(&request.mount_name),
+            directory,
+            &request.mount_name,
+            request.cancellation.clone(),
         )
         .with_context(|| {
             format!(
-                "failed to mount macFUSE at {}",
+                "failed to mount DNG volume at {}",
                 request.mount_point.display()
             )
         })?;
 
         Ok(MountHandle {
             mount_name: request.mount_name,
-            mount_point: request.mount_point,
-            fs,
-            session,
-        })
-    }
-
-    pub fn mount_shared_root(
-        &self,
-        request: SharedRootMountRequest,
-    ) -> Result<SharedRootMountHandle> {
-        if request.input_paths.is_empty() {
-            bail!("shared-root macFUSE mount requires at least one input clip");
-        }
-
-        let virtual_config = request.virtual_file_system_config();
-        let mut shared_root = SharedRootVirtualFileSystem::new();
-        let mut mounted_clips = Vec::with_capacity(request.input_paths.len());
-
-        for input_path in &request.input_paths {
-            let clip_fs = Arc::new(
-                VirtualFileSystem::open_clip(input_path, virtual_config).with_context(|| {
-                    format!(
-                        "failed to create macFUSE filesystem for {}",
-                        input_path.display()
-                    )
-                })?,
-            );
-            let result = shared_root
-                .registry_mut()
-                .add_virtual_file_system_from_path(input_path.clone(), clip_fs)
-                .with_context(|| {
-                    format!(
-                        "failed to add {} to macOS shared-root filesystem",
-                        input_path.display()
-                    )
-                })?;
-            let already_mounted = matches!(result, AddClipResult::AlreadyMounted(_));
-            mounted_clips.push(SharedRootMountedClip {
-                input_path: input_path.clone(),
-                folder_name: result.folder_name().to_string(),
-                already_mounted,
-            });
-        }
-
-        let fs = Arc::new(shared_root);
-        let attr_owner = fuser_file_attr_owner_for_mountpoint(&request.mount_point)?;
-        let filesystem = fuser_fs::LinuxSharedRootFuse3FileSystem::new_shared_root_with_owner(
-            fs.clone(),
-            attr_owner,
-        );
-        let session = spawn_macos_fuser_session(
-            filesystem,
-            &request.mount_point,
-            macos_fuser_config(&request.mount_name),
-        )
-        .with_context(|| {
-            format!(
-                "failed to mount macFUSE at {}",
-                request.mount_point.display()
-            )
-        })?;
-
-        Ok(SharedRootMountHandle {
-            mount_name: request.mount_name,
-            mount_point: request.mount_point,
-            mounted_clips,
-            fs,
+            mount_point: actual_path,
             session,
         })
     }
 }
 
-fn spawn_macos_fuser_session<FS>(
-    filesystem: FS,
-    mount_point: &Path,
-    config: fuser::Config,
-) -> Result<MacFuseSession>
-where
-    FS: fuser::Filesystem + Send + 'static,
-{
-    let native_options = macos_native_mount_options(&config);
-    MacFuseSession::mount(filesystem, mount_point, &native_options, config).with_context(|| {
-        format!(
-            "safe macFUSE wrapper failed to mount {}",
-            mount_point.display()
-        )
-    })
+fn spawn_macos_session(
+    filesystem: Arc<dyn mcraw4vulkan_macfuse_ffi::CallbackFileSystem>,
+    directory: MountDirectory,
+    name: &str,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(MacFuseSession, PathBuf)> {
+    let runtime = macfuse_location::discover()?;
+    let session = MacFuseSession::mount(filesystem, directory, runtime, name, cancellation)?;
+    let actual = session.mountpoint().to_path_buf();
+    Ok((session, actual))
 }
 
 fn platform_status_from_mount_observation<E>(observation: Result<bool, E>) -> PlatformMountStatus {
@@ -321,21 +185,16 @@ impl Default for MountManager {
 pub struct MountHandle {
     pub mount_name: String,
     pub mount_point: PathBuf,
-    fs: Arc<VirtualFileSystem>,
     session: MacFuseSession,
 }
 
 impl MountHandle {
-    pub fn stats_snapshot(&self) -> Result<VirtualFileSystemStatsSnapshot> {
-        self.fs.stats_snapshot()
-    }
-
-    pub fn stats_summary_line(&self) -> Result<String> {
-        self.fs.stats_summary_line()
-    }
-
     pub fn kind(&self) -> PlatformMountKind {
         PlatformMountKind::MacosMacFuse
+    }
+
+    pub fn instance_id(&self) -> Result<String> {
+        self.session.instance_id().map_err(Into::into)
     }
 
     pub fn mountpoint(&self) -> &Path {
@@ -397,71 +256,8 @@ impl PlatformMountHandle for MountHandle {
         MountHandle::status(self)
     }
 
-    fn stats_snapshot(&self) -> Result<Option<VirtualFileSystemStatsSnapshot>> {
-        MountHandle::stats_snapshot(self).map(Some)
-    }
-
     fn capabilities(&self) -> PlatformMountCapabilities {
         PlatformMountCapabilities::macos_macfuse()
-    }
-}
-
-pub struct SharedRootMountHandle {
-    pub mount_name: String,
-    pub mount_point: PathBuf,
-    mounted_clips: Vec<SharedRootMountedClip>,
-    fs: Arc<SharedRootVirtualFileSystem>,
-    session: MacFuseSession,
-}
-
-impl SharedRootMountHandle {
-    pub fn kind(&self) -> PlatformMountKind {
-        PlatformMountKind::MacosMacFuse
-    }
-
-    pub fn mountpoint(&self) -> &Path {
-        &self.mount_point
-    }
-
-    pub fn mounted_clips(&self) -> &[SharedRootMountedClip] {
-        &self.mounted_clips
-    }
-
-    pub fn unique_clip_count(&self) -> usize {
-        self.fs.registry().len()
-    }
-
-    pub fn capabilities(&self) -> PlatformMountCapabilities {
-        PlatformMountCapabilities::macos_macfuse()
-    }
-
-    pub fn status(&self) -> PlatformMountStatus {
-        platform_status_from_mount_observation(self.session.is_mounted())
-    }
-
-    pub fn request_unmount(&mut self) -> Result<PlatformUnmountOutcome> {
-        self.session
-            .try_unmount()
-            .map(platform_unmount_outcome)
-            .with_context(|| format!("failed to unmount {}", self.mount_point.display()))
-    }
-
-    pub fn wait_until_unmounted_status(self) -> Result<PlatformMountStatus> {
-        self.wait_until_unmounted()?;
-        Ok(PlatformMountStatus::Unmounted)
-    }
-
-    pub fn unmount(&mut self) -> Result<()> {
-        self.request_unmount().map(|_| ())
-    }
-
-    pub fn wait_until_unmounted(self) -> Result<()> {
-        self.session.wait_until_unmounted().with_context(|| {
-            format!(
-                "mount session ended with an error for {}",
-                self.mount_point.display()
-            )
-        })
     }
 }
 
@@ -491,7 +287,7 @@ pub struct MacosMountInfo {
 impl MacosMountInfo {
     pub fn is_fuse_like(&self) -> bool {
         let filesystem_type = self.filesystem_type.to_ascii_lowercase();
-        filesystem_type.contains("fuse") || filesystem_type.contains("macfuse")
+        filesystem_type.contains("fuse")
     }
 }
 
@@ -502,8 +298,7 @@ pub enum MacosMountpointClassification {
 }
 
 pub fn classify_macos_mountpoint(path: &Path) -> Result<MacosMountpointClassification> {
-    let output = Command::new("mount")
-        .output()
+    let output = macfuse_location::bounded_command("/sbin/mount", &[])
         .context("failed to inspect macOS mount table with mount")?;
     if !output.status.success() {
         bail!(
@@ -518,141 +313,20 @@ pub fn classify_macos_mountpoint(path: &Path) -> Result<MacosMountpointClassific
 }
 
 pub fn unmount_owned_mountpoint(mount_point: &Path) -> Result<MountpointUnmountStatus> {
-    if mount_point.as_os_str().is_empty() {
-        bail!("refusing to unmount an empty mountpoint path");
-    }
-    if !mount_point.exists() {
+    if !mcraw4vulkan_macfuse_ffi::mounted(mount_point)? {
         return Ok(MountpointUnmountStatus::NotMounted);
     }
-
-    let commands: &[(&str, &[&str])] = &[("umount", &[]), ("diskutil", &["unmount"])];
-    let mut last_error = None::<String>;
-
-    for (program, args) in commands {
-        let output = Command::new(program).args(*args).arg(mount_point).output();
-        let Ok(output) = output else {
-            continue;
-        };
-
-        if output.status.success() {
-            return Ok(MountpointUnmountStatus::Unmounted);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-        if is_not_mounted_message(&combined) {
-            return Ok(MountpointUnmountStatus::NotMounted);
-        }
-
-        last_error = Some(format!(
-            "{program} failed to unmount {}: {}{}",
-            mount_point.display(),
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-
     bail!(
-        "{}",
-        last_error.unwrap_or_else(|| format!(
-            "no supported macOS unmount command was found for {}",
-            mount_point.display()
-        ))
+        "path occupancy does not establish DNG ownership; use the registered mount owner or Finder"
     )
 }
-
-fn macos_fuser_config(mount_name: &str) -> fuser::Config {
-    use fuser::MountOption;
-
-    let volume_name = macos_mount_option_value(mount_name);
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        MountOption::FSName(format!("mcraw4vulkan:{volume_name}")),
-        MountOption::RO,
-        MountOption::CUSTOM("rdonly".to_string()),
-        MountOption::CUSTOM("defer_permissions".to_string()),
-        // Bound macFUSE's synchronous FUSE_INIT handshake. Readiness after
-        // INIT remains a separate wrapper-side observation.
-        MountOption::CUSTOM("init_timeout=5".to_string()),
-        MountOption::CUSTOM("noappledouble".to_string()),
-        // Current macOS can reject client opens under privacy policy before a
-        // request reaches the provider unless this source-media volume is local.
-        MountOption::CUSTOM("local".to_string()),
-        MountOption::CUSTOM(format!("volname={volume_name}")),
-        MountOption::NoDev,
-        MountOption::NoSuid,
-        MountOption::NoExec,
-    ];
-    config.n_threads = Some(1);
-    config
-}
-
-fn macos_native_mount_options(config: &fuser::Config) -> Vec<String> {
-    use fuser::MountOption;
-
-    // fuser's direct mount path synthesizes user_id/group_id as kernel mount
-    // data; they are not libfuse3 session options. The accepted filesystem
-    // adapter continues to put the prepared mountpoint owner in every FileAttr.
-    let mut options = config
-        .mount_options
-        .iter()
-        .map(|option| match option {
-            MountOption::FSName(value) => format!("fsname={value}"),
-            MountOption::Subtype(value) => format!("subtype={value}"),
-            MountOption::CUSTOM(value) => value.clone(),
-            MountOption::AutoUnmount => "auto_unmount".to_string(),
-            MountOption::DefaultPermissions => "default_permissions".to_string(),
-            MountOption::Dev => "dev".to_string(),
-            MountOption::NoDev => "nodev".to_string(),
-            MountOption::Suid => "suid".to_string(),
-            MountOption::NoSuid => "nosuid".to_string(),
-            MountOption::RO => "ro".to_string(),
-            MountOption::RW => "rw".to_string(),
-            MountOption::Exec => "exec".to_string(),
-            MountOption::NoExec => "noexec".to_string(),
-            MountOption::Atime => "atime".to_string(),
-            MountOption::NoAtime => "noatime".to_string(),
-            MountOption::DirSync => "dirsync".to_string(),
-            MountOption::Sync => "sync".to_string(),
-            MountOption::Async => "async".to_string(),
-        })
-        .collect::<Vec<_>>();
-    if matches!(
-        config.acl,
-        fuser::SessionACL::All | fuser::SessionACL::RootAndOwner
-    ) {
-        options.push("allow_other".to_string());
-    }
-    options
-}
-
-fn fuser_file_attr_owner_for_mountpoint(path: &Path) -> Result<fuser_fs::FuserFileAttrOwner> {
-    // macFUSE attributes follow the prepared mountpoint's owner rather than
-    // assuming the provider process identity owns the virtual files.
-    let metadata = fs::metadata(path).with_context(|| {
-        format!(
-            "failed to read owner metadata for macFUSE mountpoint {}",
-            path.display()
-        )
-    })?;
-    Ok(fuser_fs::FuserFileAttrOwner::new(
-        metadata.uid(),
-        metadata.gid(),
-    ))
-}
-
-fn macos_mount_option_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|value| {
-            if value == ',' || value == '\0' || value.is_control() {
-                '_'
-            } else {
-                value
-            }
-        })
-        .collect()
+pub fn unmount_registered_instance(
+    mount_point: &Path,
+    identity: &str,
+) -> Result<PlatformUnmountOutcome> {
+    mcraw4vulkan_macfuse_ffi::unmount_instance(mount_point, identity)
+        .map(platform_unmount_outcome)
+        .map_err(Into::into)
 }
 
 fn classify_macos_mountpoint_from_output(
@@ -706,11 +380,6 @@ fn normalized_mount_path_string(path: &Path) -> String {
     }
 }
 
-fn is_not_mounted_message(message: &str) -> bool {
-    message.contains("not mounted")
-        || message.contains("not currently mounted")
-        || message.contains("not a mount point")
-        || message.contains("not a mountpoint")
-        || message.contains("no such file")
-        || message.contains("not found")
+pub fn macos_mount_instance_id(path: &Path) -> Result<Option<String>> {
+    Ok(mcraw4vulkan_macfuse_ffi::mount_instance_id(path)?)
 }

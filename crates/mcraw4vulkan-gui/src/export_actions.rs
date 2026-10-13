@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mcraw4vulkan::movie_export::{
-    ExportHandle, ExportInputs, ExportOptions, ExportRequest, ExportResult, ExportSnapshot,
-    ProducerLocation,
+    ExportHandle, ExportInputs, ExportOptions, ExportOutputKind, ExportRequest, ExportResult,
+    ExportSnapshot, ProducerLocation,
 };
 
 use crate::file_chooser::{
@@ -39,6 +39,7 @@ impl GuiMovieExport {
     }
     pub fn new_request(&self, paths: Vec<PathBuf>, options: ExportOptions) -> ExportRequest {
         ExportRequest {
+            output_kind: ExportOutputKind::ProRes4444,
             inputs: ExportInputs::Files(paths),
             options,
             producer: ProducerLocation::GuiCompanion,

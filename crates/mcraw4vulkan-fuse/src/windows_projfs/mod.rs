@@ -28,12 +28,11 @@ use crate::platform_lifecycle::{
     PlatformMountRequest, PlatformMountStatus, PlatformUnmountOutcome,
 };
 use crate::shared_root::{
-    AddClipResult, SHARED_ROOT_INODE, SharedRootVirtualFileSystem, SingleClipRootVirtualFileSystem,
+    SHARED_ROOT_INODE, SharedRootVirtualFileSystem, SingleClipRootVirtualFileSystem,
 };
 use crate::virtual_fs::{
     DngGenerationBackend, DngGenerationExecutionPolicy, VirtualDirEntry, VirtualFileKind,
-    VirtualFileMetadata, VirtualFileSystem, VirtualFileSystemConfig,
-    VirtualFileSystemStatsSnapshot, VirtualTimestamp,
+    VirtualFileMetadata, VirtualFileSystem, VirtualFileSystemConfig, VirtualTimestamp,
 };
 
 const STOP_REQUEST_DIR_NAME: &str = "dng-stop-requests";
@@ -119,69 +118,6 @@ impl From<PlatformMountRequest> for MountRequest {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SharedRootMountRequest {
-    pub input_paths: Vec<PathBuf>,
-    pub mount_point: PathBuf,
-    pub mount_name: String,
-    pub dng_backend: DngGenerationBackend,
-    pub dng_vignette_mode: DngSinkVignetteMode,
-    pub dng_generation_execution_policy: DngGenerationExecutionPolicy,
-    pub max_cached_dng_frames: usize,
-    pub prefetch_forward_frames: usize,
-    pub worker_threads: usize,
-}
-
-impl SharedRootMountRequest {
-    pub fn new(input_paths: Vec<PathBuf>, mount_point: PathBuf, mount_name: String) -> Self {
-        let default_config = VirtualFileSystemConfig::default();
-
-        Self {
-            input_paths,
-            mount_point,
-            mount_name,
-            dng_backend: default_config.dng_backend,
-            dng_vignette_mode: default_config.dng_vignette_mode,
-            dng_generation_execution_policy: default_config.dng_generation_execution_policy,
-            max_cached_dng_frames: default_config.max_cached_dng_frames,
-            prefetch_forward_frames: default_config.prefetch_forward_frames,
-            worker_threads: 1,
-        }
-    }
-
-    pub fn with_config(mut self, config: VirtualFileSystemConfig) -> Self {
-        self.dng_backend = config.dng_backend;
-        self.dng_vignette_mode = config.dng_vignette_mode;
-        self.dng_generation_execution_policy = config.dng_generation_execution_policy;
-        self.max_cached_dng_frames = config.max_cached_dng_frames;
-        self.prefetch_forward_frames = config.prefetch_forward_frames;
-        self
-    }
-
-    pub fn with_worker_threads(mut self, worker_threads: usize) -> Self {
-        self.worker_threads = worker_threads;
-        self
-    }
-
-    pub fn virtual_file_system_config(&self) -> VirtualFileSystemConfig {
-        VirtualFileSystemConfig {
-            dng_backend: self.dng_backend,
-            dng_vignette_mode: self.dng_vignette_mode,
-            dng_generation_execution_policy: self.dng_generation_execution_policy,
-            max_cached_dng_frames: self.max_cached_dng_frames,
-            prefetch_forward_frames: self.prefetch_forward_frames,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedRootMountedClip {
-    pub input_path: PathBuf,
-    pub folder_name: String,
-    pub already_mounted: bool,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
 pub struct MountManager;
 
 impl MountManager {
@@ -197,6 +133,7 @@ impl MountManager {
         self.mount(request.into())
     }
 
+    #[rustfmt::skip]
     pub fn mount(&self, request: MountRequest) -> Result<MountHandle> {
         let clip_fs = Arc::new(
             VirtualFileSystem::open_clip(&request.input_path, request.virtual_file_system_config())
@@ -211,8 +148,6 @@ impl MountManager {
         let session = WindowsProjfsMountSession::start(
             request.mount_point.clone(),
             root_view,
-            Some(clip_fs),
-            1,
         )?;
 
         Ok(MountHandle {
@@ -222,37 +157,13 @@ impl MountManager {
             session: Some(session),
         })
     }
-
-    pub fn mount_shared_root(
-        &self,
-        request: SharedRootMountRequest,
-    ) -> Result<SharedRootMountHandle> {
-        let build = build_shared_root_virtual_file_system(
-            &request.input_paths,
-            request.virtual_file_system_config(),
-        )?;
-        let unique_clip_count = build.fs.registry().len();
-        let session = WindowsProjfsMountSession::start(
-            request.mount_point.clone(),
-            build.fs,
-            None,
-            unique_clip_count,
-        )?;
-
-        Ok(SharedRootMountHandle {
-            mount_name: request.mount_name,
-            mount_point: request.mount_point,
-            mounted_clips: build.mounted_clips,
-            session: Some(session),
-        })
-    }
 }
 
 struct SharedRootBuild {
     fs: Arc<SharedRootVirtualFileSystem>,
-    mounted_clips: Vec<SharedRootMountedClip>,
 }
 
+#[rustfmt::skip]
 fn build_shared_root_virtual_file_system(
     input_paths: &[PathBuf],
     virtual_config: VirtualFileSystemConfig,
@@ -262,7 +173,6 @@ fn build_shared_root_virtual_file_system(
     }
 
     let mut shared_root = SharedRootVirtualFileSystem::new();
-    let mut mounted_clips = Vec::with_capacity(input_paths.len());
 
     for input_path in input_paths {
         let clip_fs = Arc::new(
@@ -273,7 +183,7 @@ fn build_shared_root_virtual_file_system(
                 )
             })?,
         );
-        let result = shared_root
+        shared_root
             .registry_mut()
             .add_virtual_file_system_from_path(input_path.clone(), clip_fs)
             .with_context(|| {
@@ -282,17 +192,10 @@ fn build_shared_root_virtual_file_system(
                     input_path.display()
                 )
             })?;
-        let already_mounted = matches!(result, AddClipResult::AlreadyMounted(_));
-        mounted_clips.push(SharedRootMountedClip {
-            input_path: input_path.clone(),
-            folder_name: result.folder_name().to_string(),
-            already_mounted,
-        });
     }
 
     Ok(SharedRootBuild {
         fs: Arc::new(shared_root),
-        mounted_clips,
     })
 }
 
@@ -702,17 +605,14 @@ fn request_foreground_stop_and_wait(
 struct WindowsProjfsMountSession {
     projection: mcraw4vulkan_projfs_ffi::Projection,
     fs: Arc<dyn WindowsProjFsVirtualFileSystem>,
-    stats_fs: Option<Arc<VirtualFileSystem>>,
-    unique_clip_count: usize,
     mount_root: PathBuf,
 }
 
 impl WindowsProjfsMountSession {
+    #[rustfmt::skip]
     fn start(
         mount_root: PathBuf,
         fs: Arc<dyn WindowsProjFsVirtualFileSystem>,
-        stats_fs: Option<Arc<VirtualFileSystem>>,
-        unique_clip_count: usize,
     ) -> Result<Self> {
         let provider = VirtualFileSystemProjectionProvider::new(fs.clone());
         let projection = mcraw4vulkan_projfs_ffi::start_projection(&mount_root, provider)
@@ -726,8 +626,6 @@ impl WindowsProjfsMountSession {
         let session = Self {
             projection,
             fs,
-            stats_fs,
-            unique_clip_count,
             mount_root,
         };
         session.clear_stale_stop_request_files();
@@ -772,17 +670,6 @@ impl WindowsProjfsMountSession {
                 }
             }
         }
-    }
-
-    fn stats_snapshot(&self) -> Result<Option<VirtualFileSystemStatsSnapshot>> {
-        self.stats_fs
-            .as_ref()
-            .map(|fs| fs.stats_snapshot())
-            .transpose()
-    }
-
-    fn unique_clip_count(&self) -> usize {
-        self.unique_clip_count
     }
 
     fn instance_id(&self) -> ProjectionInstanceId {
@@ -900,108 +787,6 @@ impl Drop for MountHandle {
     }
 }
 
-pub struct SharedRootMountHandle {
-    pub mount_name: String,
-    pub mount_point: PathBuf,
-    mounted_clips: Vec<SharedRootMountedClip>,
-    session: Option<WindowsProjfsMountSession>,
-}
-
-impl fmt::Debug for SharedRootMountHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SharedRootMountHandle")
-            .field("mount_name", &self.mount_name)
-            .field("mount_point", &self.mount_point)
-            .field("mounted_clips", &self.mounted_clips)
-            .field("status", &self.status())
-            .finish()
-    }
-}
-
-impl SharedRootMountHandle {
-    pub fn kind(&self) -> PlatformMountKind {
-        PlatformMountKind::WindowsProjFs
-    }
-
-    pub fn mountpoint(&self) -> &Path {
-        &self.mount_point
-    }
-
-    pub fn mounted_clips(&self) -> &[SharedRootMountedClip] {
-        &self.mounted_clips
-    }
-
-    pub fn unique_clip_count(&self) -> usize {
-        self.session
-            .as_ref()
-            .map(WindowsProjfsMountSession::unique_clip_count)
-            .unwrap_or(0)
-    }
-
-    pub fn capabilities(&self) -> PlatformMountCapabilities {
-        PlatformMountCapabilities::windows_projfs()
-    }
-
-    pub fn status(&self) -> PlatformMountStatus {
-        if self.session.is_some() {
-            PlatformMountStatus::Mounted
-        } else {
-            PlatformMountStatus::Unmounted
-        }
-    }
-
-    pub fn request_unmount(mut self) -> Result<PlatformUnmountOutcome> {
-        let Some(mut session) = self.session.take() else {
-            return Ok(PlatformUnmountOutcome::NotMounted);
-        };
-
-        session.stop_and_cleanup_projection_root()?;
-        Ok(PlatformUnmountOutcome::Unmounted)
-    }
-
-    pub fn wait_until_unmounted_status(mut self) -> Result<PlatformMountStatus> {
-        let Some(mut session) = self.session.take() else {
-            return Ok(PlatformMountStatus::Unmounted);
-        };
-
-        session.wait_until_mount_root_removed()
-    }
-
-    pub fn unmount(self) -> Result<()> {
-        match self.request_unmount()? {
-            PlatformUnmountOutcome::Unmounted | PlatformUnmountOutcome::NotMounted => Ok(()),
-            PlatformUnmountOutcome::Unsupported => Err(PlatformMountError::unsupported(
-                PlatformMountKind::WindowsProjFs,
-                "Windows ProjFS DNG mounting is not implemented",
-            )
-            .into()),
-            PlatformUnmountOutcome::Failed => Err(PlatformMountError::Internal {
-                message: "Windows ProjFS unmount failed".to_string(),
-            }
-            .into()),
-        }
-    }
-
-    pub fn wait_until_unmounted(self) -> Result<()> {
-        match self.wait_until_unmounted_status()? {
-            PlatformMountStatus::Unmounted => Ok(()),
-            status => Err(PlatformMountError::Internal {
-                message: format!("Windows ProjFS mount did not unmount cleanly: {status:?}"),
-            }
-            .into()),
-        }
-    }
-}
-
-impl Drop for SharedRootMountHandle {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            session.stop();
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountpointUnmountStatus {
     Unmounted,
@@ -1040,13 +825,6 @@ impl PlatformMountHandle for MountHandle {
 
     fn status(&self) -> PlatformMountStatus {
         MountHandle::status(self)
-    }
-
-    fn stats_snapshot(&self) -> Result<Option<VirtualFileSystemStatsSnapshot>> {
-        self.session
-            .as_ref()
-            .map(WindowsProjfsMountSession::stats_snapshot)
-            .unwrap_or(Ok(None))
     }
 
     fn capabilities(&self) -> PlatformMountCapabilities {

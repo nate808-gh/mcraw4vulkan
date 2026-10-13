@@ -18,10 +18,10 @@ pub(crate) fn collect() -> (PlatformSummary, HardwareSummary) {
         });
     // Share the mount-side location policy without loading the native library.
     let (mount_backend_status, mount_backend_detail) =
-        match mcraw4vulkan_core::macfuse_location::library_from_environment() {
+        match mcraw4vulkan_core::macfuse_location::discover() {
             Ok(_) => (
                 crate::PreflightRequirementStatus::Available,
-                "macFUSE FUSE3 installation artifacts are present without attempting a mount"
+                "Verified macFUSE components are present; FSKit activation and mounting are checked only on request"
                     .to_string(),
             ),
             Err(error) => (

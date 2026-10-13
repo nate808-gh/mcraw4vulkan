@@ -33,7 +33,7 @@ fuser = "0.17"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.17", default-features = false, features = ["macos-no-mount", "macfuse-4-compat"] }
+libc = "0.2"
 mcraw4vulkan-macfuse-ffi = { path = "../mcraw4vulkan-macfuse-ffi" }
 
 [target.'cfg(target_os = "windows")'.dependencies]

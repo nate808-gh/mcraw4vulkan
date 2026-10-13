@@ -1,0 +1,15 @@
+#!/bin/sh
+# Existing package producer: include this as its preinstall script (or call it
+# from that owner). This guard observes only; it never kills or unmounts anything.
+set -eu
+target_root=${3:-/}
+target_root=${target_root%/}
+owned_prefix="$target_root/Applications/mcraw4vulkan.app/"
+if /bin/ps -axo comm= | /usr/bin/awk -v prefix="$owned_prefix" '
+    index($0, prefix) == 1 { busy = 1 }
+    END { exit !busy }
+'; then
+    echo 'mcraw4vulkan is running. Eject its DNG volumes and close the application, then retry the installation.' >&2
+    exit 1
+fi
+exit 0
