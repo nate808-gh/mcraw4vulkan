@@ -26,6 +26,7 @@ pub enum ContainerItemType {
     AudioIndex = 4,
     AudioData = 5,
     AudioDataMetadata = 6,
+    AudioDataF32 = 7,
 }
 
 impl ContainerItemType {
@@ -38,6 +39,7 @@ impl ContainerItemType {
             4 => Some(Self::AudioIndex),
             5 => Some(Self::AudioData),
             6 => Some(Self::AudioDataMetadata),
+            7 => Some(Self::AudioDataF32),
             _ => None,
         }
     }
@@ -50,11 +52,14 @@ pub struct Header {
     pub version: u8,
 }
 
-// Fixed 8-byte item header used throughout the .mcraw container.
+// Decoded 8-byte item header plus its checked payload endpoint.
 #[derive(Debug, Clone, Copy)]
 pub struct Item {
-    pub item_type: ContainerItemType,
+    // Container item IDs are independent of frame compressionType. Unknown IDs
+    // remain available to context-specific consumers and diagnostics.
+    pub item_type: u32,
     pub size: u32,
+    pub payload_end: u64,
 }
 
 // Entry from the buffer offset table.
@@ -132,8 +137,8 @@ impl ParsedAudioChunk {
 
 // Cached file location for one AUDIO_INDEX payload.
 //
-// PCM range reads use AUDIO_DATA records. AUDIO_INDEX spans remain available as
-// container facts without interpreting their payload in this layer.
+// PCM range reads use AUDIO_DATA records. AUDIO_INDEX counts and targets are
+// checked against walked audio boundaries; its timing fields remain unused.
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedAudioIndex {
     pub payload_offset: u64,
@@ -324,13 +329,13 @@ fn parse_clip_inner(path: &Path, include_audio_records: bool) -> Result<ParsedCl
         .map_err(|err| DecodeError::Io(err.to_string()))?
         .len();
 
+    ensure_range(file_len, 0, 8)?;
     let header = read_header(&file)?;
     if header.ident != CONTAINER_ID {
         return Err(DecodeError::UnsupportedFormat(
-            "invalid container id".to_string(),
+            "invalid container id".into(),
         ));
     }
-
     if header.version != CONTAINER_VERSION {
         return Err(DecodeError::UnsupportedFormat(format!(
             "invalid container version: {}",
@@ -338,43 +343,44 @@ fn parse_clip_inner(path: &Path, include_audio_records: bool) -> Result<ParsedCl
         )));
     }
 
-    let (metadata_item, metadata_cursor) = read_item_at(&file, 8)?;
-    if metadata_item.item_type != ContainerItemType::Metadata {
-        return Err(DecodeError::UnsupportedFormat(
-            "first item is not METADATA".to_string(),
-        ));
-    }
-
-    let metadata_len = usize::try_from(metadata_item.size)
-        .map_err(|_| DecodeError::UnsupportedFormat("invalid metadata size".to_string()))?;
-
-    ensure_range(file_len, metadata_cursor, metadata_len)?;
-    let metadata_bytes = read_vec_at(&file, metadata_cursor, metadata_len)?;
-    let container_metadata_json = String::from_utf8(metadata_bytes).map_err(|_| {
-        DecodeError::UnsupportedFormat("container metadata is not valid UTF-8".to_string())
-    })?;
-
     let buffer_index = read_buffer_index_from_trailer(&file, file_len)?;
     let mut frame_offsets = read_buffer_offsets(&file, file_len, buffer_index)?;
+    let item_stream_end = item_stream_end_before_buffer_index_data(&file, file_len, buffer_index)?;
+    let (metadata_item, metadata_cursor) = read_item_at(&file, file_len, 8, 8..item_stream_end)?;
+    require_item_type(
+        metadata_item,
+        ContainerItemType::Metadata,
+        8,
+        "camera metadata",
+    )?;
+    let metadata_bytes = read_vec_at(&file, metadata_cursor, metadata_item.size as usize)?;
+    let container_metadata_json = String::from_utf8(metadata_bytes).map_err(|_| {
+        DecodeError::UnsupportedFormat("container metadata is not valid UTF-8".into())
+    })?;
+    let item_stream_start = metadata_item.payload_end;
 
-    frame_offsets.sort_by(|a, b| match a.timestamp.cmp(&b.timestamp) {
-        Ordering::Equal => a.offset.cmp(&b.offset),
-        other => other,
-    });
-
-    let frames = read_frame_records(&file, file_len, &frame_offsets)?;
-
+    // Validate indexed groups in physical order. Timestamp order is only for
+    // playback and cannot protect the item walk from overlapping/fabricated spans.
+    frame_offsets.sort_by_key(|entry| entry.offset);
+    let mut frames = read_frame_records(
+        &file,
+        file_len,
+        item_stream_start..item_stream_end,
+        &frame_offsets,
+    )?;
     let parsed_audio = if include_audio_records {
-        let item_stream_start = metadata_cursor
-            .checked_add(u64::from(metadata_item.size))
-            .ok_or_else(|| DecodeError::UnsupportedFormat("metadata end overflow".to_string()))?;
-
-        let item_stream_end =
-            item_stream_end_before_buffer_index_data(&file, file_len, buffer_index)?;
-        read_audio_records(&file, file_len, item_stream_start, item_stream_end)?
+        read_audio_records(&file, file_len, item_stream_start, item_stream_end, &frames)?
     } else {
         ParsedAudioRecords::default()
     };
+    // Diagnostics share the application's stderr channel, never PIPE/JSON stdout.
+    let _ = parsed_audio
+        .unknown
+        .write_summary(&mut std::io::stderr().lock());
+    frames.sort_by(|a, b| match a.timestamp_ns.cmp(&b.timestamp_ns) {
+        Ordering::Equal => a.payload_offset.cmp(&b.payload_offset),
+        other => other,
+    });
 
     Ok(ParsedClip {
         file,
@@ -399,20 +405,79 @@ fn read_header(file: &File) -> Result<Header, DecodeError> {
     })
 }
 
-fn read_item_at(file: &File, offset: u64) -> Result<(Item, u64), DecodeError> {
+// Read only the common envelope. Interpretation belongs to the caller; an
+// unfamiliar ID is not itself a malformed record in an optional scan position.
+fn read_item_at(
+    file: &File,
+    file_len: u64,
+    offset: u64,
+    region: std::ops::Range<u64>,
+) -> Result<(Item, u64), DecodeError> {
+    let header_end = checked_item_end(file_len, &region, offset, ITEM_HEADER_SIZE, None)?;
     let raw = read_array_at::<8>(file, offset)?;
-    let item_type_raw = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let item_type = u32::from_le_bytes(raw[..4].try_into().unwrap());
+    let size = u32::from_le_bytes(raw[4..].try_into().unwrap());
+    let payload_end = checked_item_end(
+        file_len,
+        &region,
+        offset,
+        ITEM_HEADER_SIZE + u64::from(size),
+        Some(item_type),
+    )?;
+    Ok((
+        Item {
+            item_type,
+            size,
+            payload_end,
+        },
+        header_end,
+    ))
+}
 
-    let item_type = ContainerItemType::from_u32(item_type_raw).ok_or_else(|| {
-        DecodeError::UnsupportedFormat(format!("unknown item type: {item_type_raw}"))
-    })?;
+fn checked_item_end(
+    file_len: u64,
+    region: &std::ops::Range<u64>,
+    offset: u64,
+    length: u64,
+    item_type: Option<u32>,
+) -> Result<u64, DecodeError> {
+    let error = |reason| {
+        DecodeError::InvalidPayloadSpan(format!(
+            "item type {item_type:?} at offset {offset}: {reason}; region {}..{}, file length {file_len}",
+            region.start, region.end,
+        ))
+    };
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| error("offset overflow"))?;
+    if region.start > region.end
+        || region.end > file_len
+        || offset < region.start
+        || end > file_len
+        || end > region.end
+    {
+        return Err(error(if item_type.is_none() {
+            "truncated or out-of-range item header"
+        } else {
+            "payload exceeds permitted region or file"
+        }));
+    }
+    Ok(end)
+}
 
-    let cursor = offset
-        .checked_add(ITEM_HEADER_SIZE)
-        .ok_or_else(|| DecodeError::UnsupportedFormat("item cursor overflow".to_string()))?;
-
-    Ok((Item { item_type, size }, cursor))
+fn require_item_type(
+    item: Item,
+    expected: ContainerItemType,
+    offset: u64,
+    context: &str,
+) -> Result<(), DecodeError> {
+    if item.item_type != expected as u32 {
+        return Err(DecodeError::UnsupportedFormat(format!(
+            "{context} at offset {offset}: expected {expected:?}, found item type {}",
+            item.item_type,
+        )));
+    }
+    Ok(())
 }
 
 fn read_buffer_index_from_trailer(file: &File, file_len: u64) -> Result<BufferIndex, DecodeError> {
@@ -425,13 +490,14 @@ fn read_buffer_index_from_trailer(file: &File, file_len: u64) -> Result<BufferIn
     }
 
     let trailer_offset = file_len - trailer_size;
-    let (item, cursor) = read_item_at(file, trailer_offset)?;
+    let (item, cursor) = read_item_at(file, file_len, trailer_offset, trailer_offset..file_len)?;
 
-    if item.item_type != ContainerItemType::BufferIndex {
-        return Err(DecodeError::UnsupportedFormat(
-            "trailer item is not BUFFER_INDEX".to_string(),
-        ));
-    }
+    require_item_type(
+        item,
+        ContainerItemType::BufferIndex,
+        trailer_offset,
+        "video index trailer",
+    )?;
 
     if item.size as usize != BUFFER_INDEX_SIZE {
         return Err(DecodeError::UnsupportedFormat(
@@ -472,7 +538,14 @@ fn read_buffer_offsets(
         .checked_mul(16)
         .ok_or_else(|| DecodeError::UnsupportedFormat("offset table size overflow".to_string()))?;
 
-    ensure_range(file_len, index.index_data_offset, total_len)?;
+    let trailer_offset = buffer_index_trailer_offset(file_len)?;
+    ensure_range(trailer_offset, index.index_data_offset, total_len)
+        .map_err(|e| DecodeError::InvalidIndex(format!("video offset table: {e}")))?;
+    if index.index_data_offset < 8 {
+        return Err(DecodeError::InvalidIndex(
+            "video offset table precedes item stream".into(),
+        ));
+    }
     let raw = read_vec_at(file, index.index_data_offset, total_len)?;
 
     let mut offsets = Vec::with_capacity(count);
@@ -495,59 +568,88 @@ fn read_buffer_offsets(
 fn read_frame_records(
     file: &File,
     file_len: u64,
+    region: std::ops::Range<u64>,
     frame_offsets: &[BufferOffset],
 ) -> Result<Vec<ParsedFrame>, DecodeError> {
     let mut frames = Vec::with_capacity(frame_offsets.len());
-
+    let mut previous_end = region.start;
     for frame_offset in frame_offsets {
-        let item_offset = u64::try_from(frame_offset.offset).map_err(|_| {
-            DecodeError::UnsupportedFormat("negative frame buffer offset".to_string())
-        })?;
-
-        let (buffer_item, payload_offset) = read_item_at(file, item_offset)?;
-        if buffer_item.item_type != ContainerItemType::Buffer {
-            return Err(DecodeError::UnsupportedFormat(
-                "frame offset does not point to a BUFFER item".to_string(),
-            ));
+        let item_offset = u64::try_from(frame_offset.offset)
+            .map_err(|_| DecodeError::InvalidIndex("negative frame buffer offset".into()))?;
+        if item_offset < previous_end {
+            return Err(DecodeError::InvalidIndex(format!(
+                "indexed BUFFER at {item_offset} overlaps preceding required media ending at {previous_end}"
+            )));
         }
-
-        let payload_len = buffer_item.size;
-        let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
-            DecodeError::UnsupportedFormat("frame payload length overflows usize".to_string())
-        })?;
-
-        ensure_range(file_len, payload_offset, payload_len_usize)?;
-
-        let metadata_item_offset = payload_offset
-            .checked_add(u64::from(payload_len))
-            .ok_or_else(|| {
-                DecodeError::UnsupportedFormat("metadata offset overflow".to_string())
-            })?;
-
-        let (metadata_item, metadata_offset) = read_item_at(file, metadata_item_offset)?;
-        if metadata_item.item_type != ContainerItemType::Metadata {
-            return Err(DecodeError::UnsupportedFormat(
-                "BUFFER item is not followed by METADATA".to_string(),
-            ));
-        }
-
-        let metadata_len = metadata_item.size;
-        let metadata_len_usize = usize::try_from(metadata_len).map_err(|_| {
-            DecodeError::UnsupportedFormat("frame metadata length overflows usize".to_string())
-        })?;
-
-        ensure_range(file_len, metadata_offset, metadata_len_usize)?;
-
+        let (buffer, payload_offset) = read_item_at(file, file_len, item_offset, region.clone())?;
+        require_item_type(
+            buffer,
+            ContainerItemType::Buffer,
+            item_offset,
+            "indexed video buffer",
+        )?;
+        let (metadata, metadata_offset) =
+            read_item_at(file, file_len, buffer.payload_end, region.clone())?;
+        require_item_type(
+            metadata,
+            ContainerItemType::Metadata,
+            buffer.payload_end,
+            "BUFFER/METADATA association",
+        )?;
+        previous_end = metadata.payload_end;
         frames.push(ParsedFrame {
             payload_offset,
-            payload_len,
+            payload_len: buffer.size,
             metadata_offset,
-            metadata_len,
+            metadata_len: metadata.size,
             timestamp_ns: frame_offset.timestamp,
         });
     }
-
     Ok(frames)
+}
+
+// Fixed storage and a single diagnostic per completed ancillary walk. IDs 8..13
+// are known gyro/OIS/accelerometer records, intentionally unused and quiet.
+#[derive(Debug, Default)]
+struct UnknownRecordSummary {
+    types: [Option<(u32, u64)>; 8],
+    total: u64,
+    unlisted: u64,
+}
+
+impl UnknownRecordSummary {
+    fn record(&mut self, id: u32) {
+        self.total += 1;
+        for slot in &mut self.types {
+            match slot {
+                Some((known, count)) if *known == id => {
+                    *count += 1;
+                    return;
+                }
+                None => {
+                    *slot = Some((id, 1));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.unlisted += 1;
+    }
+
+    fn write_summary(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        if self.total != 0 {
+            write!(
+                output,
+                "Unrecognized ancillary container records were not interpreted: {} records; types/counts",
+                self.total
+            )?;
+            for (id, count) in self.types.iter().flatten() {
+                write!(output, " {id}:{count}")?;
+            }
+            writeln!(output, "; other records={}", self.unlisted)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -555,6 +657,7 @@ struct ParsedAudioRecords {
     chunks: Vec<ParsedAudioChunk>,
     index_items: Vec<ParsedAudioIndex>,
     metadata_jsons: Vec<String>,
+    unknown: UnknownRecordSummary,
 }
 
 fn read_audio_records(
@@ -562,53 +665,59 @@ fn read_audio_records(
     file_len: u64,
     start: u64,
     end: u64,
+    physical_frames: &[ParsedFrame],
 ) -> Result<ParsedAudioRecords, DecodeError> {
-    if end < start {
-        return Ok(ParsedAudioRecords::default());
+    if end < start || end > file_len {
+        return Err(DecodeError::InvalidPayloadSpan(
+            "invalid ordinary item region".into(),
+        ));
     }
-
     let mut cursor = start;
+    let mut frames = physical_frames.iter().peekable();
     let mut records = ParsedAudioRecords::default();
-
-    while cursor
-        .checked_add(ITEM_HEADER_SIZE)
-        .is_some_and(|next| next <= end)
-    {
-        let item_offset = cursor;
-        let (item, payload_offset) = read_item_at(file, item_offset)?;
-        let payload_len = usize::try_from(item.size).map_err(|_| {
-            DecodeError::UnsupportedFormat("container item length overflows usize".to_string())
-        })?;
-
-        ensure_range(file_len, payload_offset, payload_len)?;
-
-        let next_cursor = payload_offset
-            .checked_add(u64::from(item.size))
-            .ok_or_else(|| DecodeError::UnsupportedFormat("item end overflow".to_string()))?;
-
-        if next_cursor > end {
-            return Err(DecodeError::UnsupportedFormat(
-                "container item extends beyond indexed item stream".to_string(),
-            ));
+    while cursor < end {
+        // Reuse both validated headers of each indexed group. All other spans
+        // must end before the next group, not merely somewhere inside the file.
+        if let Some(frame) = frames.peek() {
+            let frame_start = frame.payload_offset - ITEM_HEADER_SIZE;
+            if cursor == frame_start {
+                cursor = frame.metadata_offset + u64::from(frame.metadata_len);
+                frames.next();
+                continue;
+            }
+            if cursor > frame_start {
+                return Err(DecodeError::InvalidIndex(format!(
+                    "walk passed indexed BUFFER at {frame_start}"
+                )));
+            }
         }
-
-        match item.item_type {
-            ContainerItemType::AudioIndex => {
-                records.index_items.push(ParsedAudioIndex {
-                    payload_offset,
-                    payload_len: item.size,
-                });
+        let (item, payload_offset) = read_item_at(file, file_len, cursor, start..end)?;
+        if let Some(frame) = frames.peek() {
+            let frame_start = frame.payload_offset - ITEM_HEADER_SIZE;
+            if item.payload_end > frame_start {
+                return Err(DecodeError::InvalidIndex(format!(
+                    "item type {} at {cursor} crosses indexed BUFFER boundary {frame_start}",
+                    item.item_type,
+                )));
             }
-            ContainerItemType::AudioData => {
-                records.chunks.push(ParsedAudioChunk {
-                    payload_offset,
-                    payload_len: item.size,
-                    timestamp_ns: None,
-                });
+        }
+        match ContainerItemType::from_u32(item.item_type) {
+            Some(ContainerItemType::AudioIndex) => records.index_items.push(ParsedAudioIndex {
+                payload_offset,
+                payload_len: item.size,
+            }),
+            Some(ContainerItemType::AudioData) => records.chunks.push(ParsedAudioChunk {
+                payload_offset,
+                payload_len: item.size,
+                timestamp_ns: None,
+            }),
+            Some(ContainerItemType::AudioDataF32) => {
+                return Err(DecodeError::UnsupportedFormat(format!(
+                    "unsupported floating-point audio (item type 7) at offset {cursor}; only 16-bit PCM audio is supported"
+                )));
             }
-            ContainerItemType::AudioDataMetadata => {
-                let bytes = read_vec_at(file, payload_offset, payload_len)?;
-
+            Some(ContainerItemType::AudioDataMetadata) => {
+                let bytes = read_vec_at(file, payload_offset, item.size as usize)?;
                 if let Some(timestamp_ns) = parse_audio_timestamp_ns(&bytes) {
                     if let Some(chunk) = records
                         .chunks
@@ -619,10 +728,8 @@ fn read_audio_records(
                         chunk.timestamp_ns = Some(timestamp_ns);
                     }
                 }
-
-                // Keep JSON metadata only when the payload actually looks like
-                // JSON. Real AUDIO_DATA_METADATA payloads are commonly binary
-                // timestamp structs, so non-JSON must remain non-fatal.
+                // Preserve the existing optional JSON/binary audio-metadata
+                // policy. AudioDataMetadata's consumer validates audio facts.
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     let trimmed = text.trim_start();
                     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -630,16 +737,77 @@ fn read_audio_records(
                     }
                 }
             }
-            ContainerItemType::BufferIndex
-            | ContainerItemType::BufferIndexData
-            | ContainerItemType::Buffer
-            | ContainerItemType::Metadata => {}
+            Some(
+                ContainerItemType::Buffer
+                | ContainerItemType::BufferIndex
+                | ContainerItemType::BufferIndexData
+                | ContainerItemType::Metadata,
+            ) => {
+                // The final trailer/index alone selects video frames. Bounded
+                // unreferenced media and stale index records are unused here;
+                // do not expose them or follow their pointers. The span guard
+                // above still prevents hiding an authoritative indexed group.
+            }
+            None => {
+                // No payload reads, allocation, telemetry version/count checks,
+                // or unused-index dereferences. Forward acceptance is best effort
+                // within the supported outer format, not semantic validation.
+                if !(8..=13).contains(&item.item_type) {
+                    records.unknown.record(item.item_type);
+                }
+            }
         }
-
-        cursor = next_cursor;
+        cursor = item.payload_end;
     }
-
+    if frames.next().is_some() {
+        return Err(DecodeError::InvalidIndex(
+            "walk did not reach all indexed video groups".into(),
+        ));
+    }
+    validate_audio_indexes(file, &records)?;
     Ok(records)
+}
+
+// Audio is consumed, unlike telemetry. Index targets must be actual walked PCM
+// records, not plausible headers found by seeking into a skipped payload.
+fn validate_audio_indexes(file: &File, records: &ParsedAudioRecords) -> Result<(), DecodeError> {
+    for index in &records.index_items {
+        let invalid = |reason: &str| {
+            DecodeError::InvalidIndex(format!(
+                "AUDIO_INDEX at {}: {reason}",
+                index.payload_offset - ITEM_HEADER_SIZE,
+            ))
+        };
+        if index.payload_len < 16 {
+            return Err(invalid("truncated index header"));
+        }
+        let raw = read_array_at::<16>(file, index.payload_offset)?;
+        let count = u64::try_from(i64::from_le_bytes(raw[..8].try_into().unwrap()))
+            .map_err(|_| invalid("negative offset count"))?;
+        let expected = count
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(|| invalid("offset count overflow"))?;
+        if expected != u64::from(index.payload_len) {
+            return Err(invalid("inconsistent offset count/length"));
+        }
+        for i in 0..count {
+            // Count-derived length and the entire outer span were checked above.
+            let raw = read_array_at::<16>(file, index.payload_offset + 16 + i * 16)?;
+            let offset = u64::try_from(i64::from_le_bytes(raw[..8].try_into().unwrap()))
+                .map_err(|_| invalid("negative audio offset"))?;
+            if records
+                .chunks
+                .binary_search_by_key(&offset, |chunk| chunk.payload_offset - ITEM_HEADER_SIZE)
+                .is_err()
+            {
+                return Err(invalid(
+                    "offset does not target a walked AUDIO_DATA boundary",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_audio_timestamp_ns(bytes: &[u8]) -> Option<i64> {
@@ -673,11 +841,13 @@ fn item_stream_end_before_buffer_index_data(
     };
 
     let possible_header_offset = index.index_data_offset - ITEM_HEADER_SIZE;
-    let Ok((item, payload_offset)) = read_item_at(file, possible_header_offset) else {
+    let Ok((item, payload_offset)) =
+        read_item_at(file, file_len, possible_header_offset, 8..trailer_offset)
+    else {
         return Ok(default_end);
     };
 
-    if item.item_type == ContainerItemType::BufferIndexData
+    if item.item_type == ContainerItemType::BufferIndexData as u32
         && payload_offset == index.index_data_offset
         && item.size as usize == index_payload_len
     {

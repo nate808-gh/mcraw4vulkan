@@ -376,17 +376,44 @@ fn build_ifd_entries(
     push_optional_matrix(
         &mut entries,
         TAG_FORWARD_MATRIX1,
-        description.forward_matrix1,
+        description
+            .forward_matrix1
+            .map(normalize_forward_matrix)
+            .transpose()?,
     )?;
     push_optional_matrix(
         &mut entries,
         TAG_FORWARD_MATRIX2,
-        description.forward_matrix2,
+        description
+            .forward_matrix2
+            .map(normalize_forward_matrix)
+            .transpose()?,
     )?;
 
     entries.sort_by_key(|entry| entry.tag);
 
     Ok(entries)
+}
+
+// ForwardMatrix maps white-balanced camera values to XYZ D50. Source matrices
+// can carry row scale factors; remove those before serializing the DNG profile,
+// as the existing color preparation and Adobe's DNG color specification do.
+// This changes neither the source calibration slots nor the Bayer sample domain.
+fn normalize_forward_matrix(mut matrix: ColorMatrix) -> Result<ColorMatrix, DngWriterError> {
+    // DNG PCS D50 xy = (0.3457, 0.3585), expressed as XYZ with Y = 1.
+    const PCS: [f64; 3] = [0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585];
+    for (row, target) in matrix.values.chunks_exact_mut(3).zip(PCS) {
+        let sum: f64 = row.iter().sum();
+        if row.iter().any(|value| !value.is_finite()) || !sum.is_finite() || sum.abs() <= 1.0e-12 {
+            return Err(DngWriterError::InvalidMetadata(
+                "ForwardMatrix has a nonfinite or zero normalization row sum".to_owned(),
+            ));
+        }
+        for value in row {
+            *value *= target / sum;
+        }
+    }
+    Ok(matrix)
 }
 
 // Add the CinemaDNG/DNG video frame-rate tag as an exact signed rational.

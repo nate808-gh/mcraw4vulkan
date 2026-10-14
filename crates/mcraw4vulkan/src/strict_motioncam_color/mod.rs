@@ -44,6 +44,7 @@ enum Illuminant {
     StandardA,
     D65,
     D50,
+    D55,
 }
 
 impl Illuminant {
@@ -52,6 +53,9 @@ impl Illuminant {
             Self::StandardA => STANDARD_A_TEMPERATURE,
             Self::D65 => D65_TEMPERATURE,
             Self::D50 => 5000.0,
+            // DNG SDK dng_camera_profile::IlluminantToTemperature(lsD55).
+            // This is a calibration interpolation temperature, not scene WB.
+            Self::D55 => 5500.0,
         }
     }
 }
@@ -408,13 +412,26 @@ impl StrictMotionCamForwardMatrixColorV2 {
         &self,
         profile: &StrictMotionCamColorProfile,
     ) -> StrictColorPolicyDigestV2 {
-        if profile.is_color_matrix_only() {
-            let mut record = policy_record();
-            record.extend_from_slice(b"StrictMotionCamColorMatrixColorV1:inverse(AB*CC*CM);Bradford-white-to-D50;D50=5000K");
-            StrictColorPolicyDigestV2(Sha256::digest(&record))
-        } else {
-            self.policy_digest()
+        let uses_d55 = profile.raw.slots.iter().any(|slot| {
+            slot.illuminant
+                .as_ref()
+                .and_then(RawIlluminantToken::dng_code)
+                == Some(20)
+        });
+        if !profile.is_color_matrix_only() && !uses_d55 {
+            return self.policy_digest();
         }
+        let mut record = policy_record();
+        if profile.is_color_matrix_only() {
+            record.extend_from_slice(b"StrictMotionCamColorMatrixColorV1:inverse(AB*CC*CM);Bradford-white-to-D50;D50=5000K");
+        }
+        if uses_d55 {
+            // Extend only the newly supported semantic domain; preserve every
+            // existing profile's policy/context identity and frozen V2 vectors.
+            record.extend_from_slice(b"CalibrationIlluminantD55:code=20;temperature=");
+            policy::push_f64(&mut record, Illuminant::D55.temperature());
+        }
+        StrictColorPolicyDigestV2(Sha256::digest(&record))
     }
 
     pub fn parse_frame_input(
@@ -632,6 +649,7 @@ fn parse_illuminant(
         Some(Some(17)) => Ok(Illuminant::StandardA),
         Some(Some(21)) => Ok(Illuminant::D65),
         Some(Some(23)) => Ok(Illuminant::D50),
+        Some(Some(20)) => Ok(Illuminant::D55),
         Some(_) => Err(StrictMotionCamColorError::UnknownIlluminant { source_slot }),
         None => Err(StrictMotionCamColorError::IncompleteColorSlot { source_slot }),
     }

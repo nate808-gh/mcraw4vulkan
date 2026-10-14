@@ -159,7 +159,13 @@ impl DngFrameDescription {
                                  light: &Option<mcraw4vulkan_mcrawcontainer::ColorIlluminant>,
                                  default| {
             if !source_calibration {
-                return Ok(default);
+                // Newly supported D55 must retain its source-slot identity,
+                // including ForwardMatrix profiles. Keep the established
+                // legacy tag policy for previously supported profiles.
+                return Ok(match light.as_ref().and_then(|v| v.dng_code()) {
+                    Some(20) => 20,
+                    _ => default,
+                });
             }
             if matrix.is_none() {
                 return Ok(0);

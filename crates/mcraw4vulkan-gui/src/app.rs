@@ -1067,93 +1067,115 @@ impl GuiApp {
         let available = self.movie_export_admission().is_ok();
         let live_results = self.movie_export.is_running();
         let gap = ui.spacing().item_spacing.x;
-        let ordinary_width = main_view::ordinary_primary_three_button_width(gap);
-        let cells = [
-            ButtonCell::new(
-                "Export Movie",
-                false,
-                live_results || (available && self.playlist.selected_path().is_some()),
-            )
-            .orange_emphasis(),
-            ButtonCell::new(
-                "Export All",
-                false,
-                live_results || (available && !self.playlist.is_empty()),
-            ),
-            ButtonCell::new(
-                "Export Proxies",
-                false,
-                live_results || (available && !self.playlist.is_empty()),
-            ),
+        let rows = [
+            [
+                ButtonCell::new(
+                    "Export Movie",
+                    false,
+                    live_results || (available && self.playlist.selected_path().is_some()),
+                )
+                .orange_emphasis(),
+                ButtonCell::new(
+                    "Vignette Correction",
+                    self.pipe_vignette,
+                    !self.movie_export.options_locked(),
+                ),
+                ButtonCell::new("Pipe Example", false, true),
+            ],
+            [
+                ButtonCell::new(
+                    "Export All 4444",
+                    false,
+                    live_results || (available && !self.playlist.is_empty()),
+                ),
+                ButtonCell::new(
+                    "Export All 422",
+                    false,
+                    live_results || (available && !self.playlist.is_empty()),
+                ),
+                ButtonCell::new(
+                    "Export Proxies",
+                    false,
+                    live_results || (available && !self.playlist.is_empty()),
+                ),
+            ],
         ];
-        // Equal targets stay within the pane; below-envelope labels may clip,
-        // but cannot enlarge a target beyond its parent allocation.
+        let font = FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE));
+        let widest_label = rows
+            .iter()
+            .flatten()
+            .map(|cell| {
+                ui.painter()
+                    .layout_no_wrap(cell.label.to_owned(), font.clone(), style::body_text())
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max);
+        let scale = ui.ctx().pixels_per_point();
+        let label_width = ((widest_label + 8.0) * scale).ceil() / scale;
         let width = grid_width(
             ui,
-            ((ui.available_width() - 2.0 * gap) / 3.0).min(ordinary_width),
+            main_view::ordinary_primary_three_button_width(gap)
+                .max(label_width)
+                .min((ui.available_width() - gap * 2.0) / 3.0),
         );
-        // At the Compact floor, borrow a few pixels from the shorter Export All
-        // label so the full proxy label retains padding inside its hit target.
-        let proxy_minimum = ui
-            .painter()
-            .layout_no_wrap(
-                "Export Proxies".into(),
-                FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
-                style::body_text(),
-            )
-            .size()
-            .x
-            + 8.0;
-        let extra = (proxy_minimum - width).max(0.0).ceil().min(width / 4.0);
-        let widths = [width, width - extra, width + extra];
-        let clicks = ui
-            .horizontal(|ui| {
-                std::array::from_fn::<_, 3, _>(|index| {
-                    let cell = cells[index];
+        // One size for the entire grid. Wrap only when the existing pane cannot
+        // fit a full label on one line; retain its font and every label character.
+        let rows = rows.map(|row| {
+            row.map(|cell| {
+                let mut job = egui::text::LayoutJob::simple(
+                    cell.label.to_owned(),
+                    font.clone(),
+                    visual_button_paint(cell.selected, cell.stroke_style).text_color,
+                    (width - 8.0).max(0.0),
+                );
+                job.halign = Align::Center;
+                (cell, ui.painter().layout_job(job))
+            })
+        });
+        let height = rows
+            .iter()
+            .flatten()
+            .map(|(_, galley)| galley.size().y + 8.0)
+            .fold(style::metrics(ui).font(ordinary_button_height()), f32::max);
+        let [
+            [movie_clicked, vignette_clicked, example_clicked],
+            [all_clicked, standard_clicked, proxy_clicked],
+        ] = rows.map(|row| {
+            ui.horizontal(|ui| {
+                row.map(|(cell, galley)| {
                     let sense = if cell.enabled {
                         Sense::click()
                     } else {
                         Sense::hover()
                     };
-                    draw_button_cell_with_sense(ui, cell, widths[index], sense).clicked()
+                    ui.push_id(cell.label, |ui| {
+                        draw_visual_button_with_layout(
+                            ui,
+                            cell.selected,
+                            vec2(width, height),
+                            sense,
+                            cell.stroke_style,
+                            galley,
+                        )
+                        .clicked()
+                    })
+                    .inner
                 })
             })
-            .inner;
-        let (vignette_clicked, example_clicked) = ui
-            .horizontal(|ui| {
-                let vignette = draw_button_cell_with_sense(
-                    ui,
-                    ButtonCell::new(
-                        "Vignette Correction",
-                        self.pipe_vignette,
-                        !self.movie_export.options_locked(),
-                    ),
-                    ordinary_width,
-                    if self.movie_export.options_locked() {
-                        Sense::hover()
-                    } else {
-                        Sense::click()
-                    },
-                )
-                .clicked();
-                let example = draw_button_cell_with_sense(
-                    ui,
-                    ButtonCell::new("Pipe example", false, true),
-                    width,
-                    Sense::click(),
-                )
-                .clicked();
-                (vignette, example)
-            })
-            .inner;
+            .inner
+        });
         ui.add_space(style::metrics(ui).space(16.0));
-        if clicks[0] {
+        if movie_clicked {
             self.show_movie_export(false, ExportOutputKind::ProRes4444);
         }
-        if clicks[1] {
+        if all_clicked {
             self.show_movie_export(true, ExportOutputKind::ProRes4444);
         }
-        if clicks[2] {
+        if standard_clicked {
+            self.show_movie_export(true, ExportOutputKind::ProRes422);
+        }
+        if proxy_clicked {
             self.show_movie_export(true, ExportOutputKind::ProResProxy);
         }
         if example_clicked {
@@ -3424,7 +3446,8 @@ fn draw_pipe_about_panel(ui: &mut egui::Ui, rect: Rect) {
             ).size(style::metrics(ui).font(style::LINE_FONT_SIZE)).color(style::body_text())).selectable(true).wrap());
             for (label, remainder) in [
                 ("Export Movie", " - Quickly export a file from the playlist to a ProRes 4444 movie file"),
-                ("Export All", " - Quickly export all of the files in the playlist to ProRes 4444 movie files"),
+                ("Export All 4444", " - Quickly export all of the files in the playlist to ProRes 4444 movie files"),
+                ("Export All 422", " - Export the entire playlist as Standard ProRes 422 movies"),
                 ("Export Proxies", " - Export the entire playlist as full-resolution ProRes Proxy movies"),
                 ("Pipe Example", " - See how to use the mcraw4vulkan pipe video bytestream with the command line to customize the export into any format"),
             ] {
@@ -4680,21 +4703,36 @@ fn draw_visual_button_with_stroke_style(
     sense: Sense,
     stroke_style: VisualButtonStrokeStyle,
 ) -> egui::Response {
-    let height = style::metrics(ui).font(ordinary_button_height());
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), sense);
-    let paint = visual_button_paint(selected, stroke_style);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
+        visual_button_paint(selected, stroke_style).text_color,
+    );
+    draw_visual_button_with_layout(
+        ui,
+        selected,
+        vec2(width, style::metrics(ui).font(ordinary_button_height())),
+        sense,
+        stroke_style,
+        galley,
+    )
+}
 
+fn draw_visual_button_with_layout(
+    ui: &mut egui::Ui,
+    selected: bool,
+    size: Vec2,
+    sense: Sense,
+    stroke_style: VisualButtonStrokeStyle,
+    galley: std::sync::Arc<egui::Galley>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let paint = visual_button_paint(selected, stroke_style);
     ui.painter().rect_filled(rect, 3, paint.fill);
     ui.painter()
         .rect_stroke(rect, 3, paint.stroke, StrokeKind::Inside);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
-        paint.text_color,
-    );
-
+    let position = rect.center() - galley.rect.center().to_vec2();
+    ui.painter().galley(position, galley, paint.text_color);
     response
 }
 

@@ -36,6 +36,7 @@ impl RawIlluminantToken {
     pub fn dng_code(&self) -> Option<u16> {
         match self {
             Self::Integer(17) => Some(17),
+            Self::Integer(20) => Some(20),
             Self::Integer(21) => Some(21),
             Self::Integer(23) => Some(23),
             Self::String(s) => match s
@@ -45,6 +46,7 @@ impl RawIlluminantToken {
                 .as_str()
             {
                 "standarda" | "standard-a" | "standard-light-a" | "std-a" | "a" => Some(17),
+                "d55" => Some(20),
                 "d65" => Some(21),
                 "d50" => Some(23),
                 _ => None,

@@ -428,8 +428,8 @@ pub(crate) fn encoder_args_for(
     } else {
         vulkan_prores_filter(&aspect, output_kind)
     });
-    let proxy = output_kind == ExportOutputKind::ProResProxy;
-    let profile = if proxy { "0" } else { "4" };
+    let uses_422_input = output_kind.uses_422_input();
+    let profile = output_kind.encoder_profile();
     args.extend(["-an", "-c:v"].into_iter().map(str::to_owned));
     args.extend(
         if encoder == ProresEncoder::VideoToolbox {
@@ -438,7 +438,7 @@ pub(crate) fn encoder_args_for(
                 "-profile:v",
                 profile,
                 "-pix_fmt",
-                if proxy { "p210le" } else { "p410le" },
+                if uses_422_input { "p210le" } else { "p410le" },
             ]
         } else {
             [
@@ -530,17 +530,17 @@ fn render_remux_tail(facts: &PipeExampleFacts) -> String {
 
 // Explicit same-size conversion is required with Vulkan's noauto_conversion_filters.
 // Pin matrix and range on both sides; this only subsamples/reduces precision.
-const PROXY_CONVERSION: &str =
+const PRORES_422_CONVERSION: &str =
     "scale=w=iw:h=ih:in_color_matrix=bt2020:out_color_matrix=bt2020:in_range=tv:out_range=tv,";
 
 fn vulkan_prores_filter(aspect: &str, output_kind: ExportOutputKind) -> String {
-    let conversion = if output_kind == ExportOutputKind::ProResProxy {
+    let conversion = if output_kind.uses_422_input() {
         "yuv422p10le"
     } else {
         "yuv444p12le"
     };
-    let scale = if output_kind == ExportOutputKind::ProResProxy {
-        PROXY_CONVERSION
+    let scale = if output_kind.uses_422_input() {
+        PRORES_422_CONVERSION
     } else {
         ""
     };
@@ -550,13 +550,13 @@ fn vulkan_prores_filter(aspect: &str, output_kind: ExportOutputKind) -> String {
 }
 
 fn videotoolbox_prores_filter(aspect: &str, output_kind: ExportOutputKind) -> String {
-    let conversion = if output_kind == ExportOutputKind::ProResProxy {
+    let conversion = if output_kind.uses_422_input() {
         "p210le"
     } else {
         "p410le"
     };
-    let scale = if output_kind == ExportOutputKind::ProResProxy {
-        PROXY_CONVERSION
+    let scale = if output_kind.uses_422_input() {
+        PRORES_422_CONVERSION
     } else {
         ""
     };

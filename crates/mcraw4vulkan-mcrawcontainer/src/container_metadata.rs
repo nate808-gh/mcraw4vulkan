@@ -58,6 +58,7 @@ pub enum ColorIlluminant {
     StandardA,
     D65,
     D50,
+    D55,
     Other(String),
 }
 
@@ -67,6 +68,7 @@ impl ColorIlluminant {
             Some(17) => Self::StandardA,
             Some(21) => Self::D65,
             Some(23) => Self::D50,
+            Some(20) => Self::D55,
             _ => Self::Other(match token {
                 crate::RawIlluminantToken::String(s) => s.clone(),
                 crate::RawIlluminantToken::Integer(n) => format!("code:{n}"),
@@ -79,6 +81,7 @@ impl ColorIlluminant {
             Self::StandardA => Some(17),
             Self::D65 => Some(21),
             Self::D50 => Some(23),
+            Self::D55 => Some(20),
             Self::Other(_) => None,
         }
     }
@@ -88,6 +91,7 @@ impl ColorIlluminant {
             Self::StandardA => "standard-a",
             Self::D65 => "d65",
             Self::D50 => "d50",
+            Self::D55 => "d55",
             Self::Other(value) => value.as_str(),
         }
     }

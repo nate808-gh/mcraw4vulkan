@@ -31,12 +31,25 @@ pub enum ExportOutputKind {
     #[default]
     ProRes4444,
     ProResProxy,
+    ProRes422,
 }
 
 impl ExportOutputKind {
+    pub(crate) fn uses_422_input(self) -> bool {
+        matches!(self, Self::ProResProxy | Self::ProRes422)
+    }
+
+    pub(crate) fn encoder_profile(self) -> &'static str {
+        match self {
+            Self::ProRes4444 => "4",
+            Self::ProResProxy => "0",
+            Self::ProRes422 => "2",
+        }
+    }
+
     pub fn directory_name(self) -> &'static str {
         match self {
-            Self::ProRes4444 => "exported_movies",
+            Self::ProRes4444 | Self::ProRes422 => "exported_movies",
             Self::ProResProxy => "exported_proxies",
         }
     }
@@ -45,6 +58,7 @@ impl ExportOutputKind {
         match self {
             Self::ProRes4444 => PIPE_PRORES_FILE_SUFFIX,
             Self::ProResProxy => "_prores_proxy_bt2020_applelog.mov",
+            Self::ProRes422 => "_prores422_bt2020_applelog.mov",
         }
     }
 
@@ -52,6 +66,7 @@ impl ExportOutputKind {
         match self {
             Self::ProRes4444 => PIPE_PRORES_SIDECAR_SUFFIX,
             Self::ProResProxy => "_prores_proxy_bt2020_applelog.json",
+            Self::ProRes422 => "_prores422_bt2020_applelog.json",
         }
     }
 }
