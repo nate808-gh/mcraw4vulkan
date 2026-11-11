@@ -15,6 +15,7 @@ use crate::file_chooser::{
 pub struct GuiMovieExport {
     handle: Option<ExportHandle>,
     request: Option<ExportRequest>,
+    project: bool,
     ffmpeg: Option<PathBuf>,
     chooser: Option<PendingFileChooser>,
     recovery: bool,
@@ -46,6 +47,42 @@ impl GuiMovieExport {
             ffmpeg: self.ffmpeg.clone(),
         }
     }
+    pub fn new_project_request(
+        &self,
+        paths: Vec<PathBuf>,
+        lens_profile: PathBuf,
+        rolling_shutter_ms: f64,
+        settings: mcraw4vulkan::cli::SettingsSourceChoice,
+    ) -> mcraw4vulkan::movie_export::gyroflow_project::ProjectRequest {
+        mcraw4vulkan::movie_export::gyroflow_project::ProjectRequest {
+            inputs: ExportInputs::Files(paths),
+            lens_profile,
+            rolling_shutter_ms,
+            producer: ProducerLocation::GuiCompanion,
+            settings,
+            ffmpeg: self.ffmpeg.clone(),
+        }
+    }
+    pub fn is_project(&self) -> bool {
+        self.project
+    }
+    pub fn start_project_snapshot(
+        &mut self,
+        request: mcraw4vulkan::movie_export::gyroflow_project::ProjectRequest,
+    ) -> Result<(), String> {
+        if !self.can_start() {
+            return Err("An export or executable choice is already pending.".into());
+        }
+        let handle = ExportHandle::start_project(request, Arc::new(AtomicBool::new(false)))
+            .map_err(|e| e.to_string())?;
+        self.handle = Some(handle);
+        self.request = None;
+        self.project = true;
+        self.result = None;
+        self.message = None;
+        self.recovery = false;
+        Ok(())
+    }
     // GuiApp owns admission for both new requests and retries. This second guard
     // protects handle/request ownership against accidental reentrant callers.
     pub fn start_snapshot(&mut self, request: ExportRequest) -> Result<(), String> {
@@ -56,6 +93,7 @@ impl GuiMovieExport {
             .map_err(|e| e.to_string())?;
         self.handle = Some(handle);
         self.request = Some(request);
+        self.project = false;
         self.result = None;
         self.message = None;
         self.recovery = false;
@@ -183,5 +221,50 @@ impl GuiMovieExport {
                     }
                 });
             });
+    }
+}
+
+/// Session-only controls; the shared worker remains the profile validator.
+pub struct GyroflowControls {
+    pub lens_profile: Option<PathBuf>,
+    pub rolling_shutter: bool,
+    pub readout: String,
+}
+impl Default for GyroflowControls {
+    fn default() -> Self {
+        Self {
+            lens_profile: None,
+            rolling_shutter: false,
+            readout: "0".into(),
+        }
+    }
+}
+impl GyroflowControls {
+    pub fn effective_readout(&self) -> Result<f64, &'static str> {
+        if !self.rolling_shutter {
+            return Ok(0.0);
+        }
+        let value = self.readout.trim().parse::<f64>().ok();
+        match value {
+            Some(value)
+                if value.is_finite()
+                    && (0.0..=999.0).contains(&value)
+                    && !self.readout.trim().starts_with('-') =>
+            {
+                Ok(value.round())
+            }
+            _ => Err("Enter a readout from 0 to 999 ms."),
+        }
+    }
+    pub fn commit_readout(&mut self) -> Result<f64, &'static str> {
+        let value = self.effective_readout()?;
+        self.readout = format!("{value:.0}");
+        Ok(value)
+    }
+    pub fn toggle_readout(&mut self) {
+        self.rolling_shutter = !self.rolling_shutter;
+        if !self.rolling_shutter {
+            self.readout = "0".into();
+        }
     }
 }

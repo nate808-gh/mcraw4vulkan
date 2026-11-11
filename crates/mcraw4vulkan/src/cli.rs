@@ -32,6 +32,7 @@ pub enum Mcraw4VulkanCommand {
     PipeHelp,
     PipeMetadata(PipeMetadataCommand),
     PipeAction(PipeAction, PipeCommand),
+    GyroflowProject(GyroflowProjectCommand),
     Optimizer(OptimizerCommand),
 }
 
@@ -78,6 +79,15 @@ pub struct PipeCommand {
     pub settings: SettingsSourceChoice,
     pub output: PipeOutputChoice,
     pub(crate) internal_measurement: Option<InternalMeasurementConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GyroflowProjectCommand {
+    pub input: PathBuf,
+    pub folder: bool,
+    pub lens_profile: PathBuf,
+    // Validated decimal text preserves Eq for the existing command model.
+    pub rolling_shutter_ms: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,11 +198,11 @@ impl Cli {
     }
 
     pub fn usage() -> &'static str {
-        "mcraw4vulkan\n\nUsage:\n  mcraw4vulkan display [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--vsync|--no-vsync] [--with-sound] [--default|--optimized] [--with-overlay|--no-overlay] FILE.mcraw\n  mcraw4vulkan dng [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nCommands:\n  display     show the 8-bit preview in a window; press F to toggle fullscreen\n  dng         mount or unmount mcraw4vulkan-owned virtual DNG plus audio folders\n  pipe        write direct yuv444p12le rawvideo or print PIPE metadata JSON\n  optimizer   measure and optionally save optimized settings\n\nDefaults:\n  display:   --gpu --no-vig-correction --vsync --default --with-overlay\n  dng:       --gpu --with-vig-correction --default\n  pipe:      --gpu --with-vig-correction --default\n\nPIPE output contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n  Diagnostics, progress, and warnings use stderr only.\n\nDisplay audio:\n  display --with-sound plays synced clip audio and is valid only with Vsync display.\n  display --with-sound cannot be combined with --no-vsync.\n\nDNG mounts:\n  dng FILE.mcraw mounts one virtual DNG and audio folder; it does not export DNGs directly.\n  The command serves one foreground mount per clip. macOS uses macFUSE FSKit at $HOME/mcraw4vulkan/<clip>; the actual path is reported.\n  Start one dng command per mounted clip; press Ctrl-C to stop a foreground mount.\n\nDNG unmounts:\n  dng unmount FILE.mcraw  unmount the per-file DNG mount for FILE.mcraw\n  dng unmount all         unmount all mcraw4vulkan-owned DNG mounts\n\nExamples:\n  mcraw4vulkan display --gpu --no-vig-correction --vsync --with-overlay --default FILE.mcraw\n  mcraw4vulkan display --with-sound FILE.mcraw\n  mcraw4vulkan display --cpu --no-vsync --no-overlay FILE.mcraw\n  mcraw4vulkan dng --gpu --with-vig-correction --default FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe --gpu --with-vig-correction --output clip.yuv444p12le FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
+        "mcraw4vulkan\n\nUsage:\n  mcraw4vulkan display [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--vsync|--no-vsync] [--with-sound] [--default|--optimized] [--with-overlay|--no-overlay] FILE.mcraw\n  mcraw4vulkan dng [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n  mcraw4vulkan pipe --gyroflow-project --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FILE.mcraw\n  mcraw4vulkan pipe --gyroflow-project-folder --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nCommands:\n  display     show the 8-bit preview in a window; press F to toggle fullscreen\n  dng         mount or unmount mcraw4vulkan-owned virtual DNG plus audio folders\n  pipe        write direct yuv444p12le rawvideo or print PIPE metadata JSON\n  optimizer   measure and optionally save optimized settings\n\nDefaults:\n  display:   --gpu --no-vig-correction --vsync --default --with-overlay\n  dng:       --gpu --with-vig-correction --default\n  pipe:      --gpu --with-vig-correction --default\n\nPIPE output contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n  Diagnostics, progress, and warnings use stderr only.\n\nDisplay audio:\n  display --with-sound plays synced clip audio and is valid only with Vsync display.\n  display --with-sound cannot be combined with --no-vsync.\n\nDNG mounts:\n  dng FILE.mcraw mounts one virtual DNG and audio folder; it does not export DNGs directly.\n  The command serves one foreground mount per clip. macOS uses macFUSE FSKit at $HOME/mcraw4vulkan/<clip>; the actual path is reported.\n  Start one dng command per mounted clip; press Ctrl-C to stop a foreground mount.\n\nDNG unmounts:\n  dng unmount FILE.mcraw  unmount the per-file DNG mount for FILE.mcraw\n  dng unmount all         unmount all mcraw4vulkan-owned DNG mounts\n\nExamples:\n  mcraw4vulkan display --gpu --no-vig-correction --vsync --with-overlay --default FILE.mcraw\n  mcraw4vulkan display --with-sound FILE.mcraw\n  mcraw4vulkan display --cpu --no-vsync --no-overlay FILE.mcraw\n  mcraw4vulkan dng --gpu --with-vig-correction --default FILE.mcraw\n  mcraw4vulkan dng unmount FILE.mcraw\n  mcraw4vulkan dng unmount all\n  mcraw4vulkan pipe --gpu --with-vig-correction --output clip.yuv444p12le FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n  mcraw4vulkan pipe --gyroflow-project --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FILE.mcraw\n  mcraw4vulkan pipe --gyroflow-project-folder --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FOLDER\n  mcraw4vulkan optimizer FILE.mcraw\n  mcraw4vulkan optimizer --restore-defaults\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
     }
 
     pub fn pipe_usage() -> &'static str {
-        "mcraw4vulkan pipe\n\nUsage:\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n\nOptions:\n  --pipe-example   print the existing complete FFmpeg recipe only\n  --export         export one movie to home/mcraw4vulkan/exported_movies\n  --export-folder  export direct .mcraw files from FOLDER to the same home destination\n  --export-proxy   export one full-resolution ProRes Proxy movie to home/mcraw4vulkan/exported_proxies\n  --export-proxy-folder  export direct .mcraw files from FOLDER as ProRes Proxy movies\n  --export-422     export one Standard ProRes 422 movie to home/mcraw4vulkan/exported_movies\n  --export-422-folder  export direct .mcraw files from FOLDER as Standard ProRes 422 movies\n  --metadata   print strict PIPE sidecar version 4 JSON without rendering video\n  --output     write raw yuv444p12le video bytes to FILE\n\nOutput contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
+        "mcraw4vulkan pipe\n\nUsage:\n  mcraw4vulkan pipe [--gpu|--cpu] [--no-vig-correction|--with-vig-correction] [--default|--optimized] [--output FILE] FILE.mcraw\n  mcraw4vulkan pipe --metadata FILE.mcraw\n  mcraw4vulkan pipe --pipe-example FILE.mcraw\n  mcraw4vulkan pipe --export FILE.mcraw\n  mcraw4vulkan pipe --export-folder FOLDER\n  mcraw4vulkan pipe --export-proxy FILE.mcraw\n  mcraw4vulkan pipe --export-proxy-folder FOLDER\n  mcraw4vulkan pipe --export-422 FILE.mcraw\n  mcraw4vulkan pipe --export-422-folder FOLDER\n  mcraw4vulkan pipe --gyroflow-project --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FILE.mcraw\n  mcraw4vulkan pipe --gyroflow-project-folder --lensprofile PROFILE.json [--rolling-shutter MILLISECONDS] FOLDER\n\nOptions:\n  --pipe-example   print the existing complete FFmpeg recipe only\n  --export         export one movie to home/mcraw4vulkan/exported_movies\n  --export-folder  export direct .mcraw files from FOLDER to the same home destination\n  --export-proxy   export one full-resolution ProRes Proxy movie to home/mcraw4vulkan/exported_proxies\n  --export-proxy-folder  export direct .mcraw files from FOLDER as ProRes Proxy movies\n  --export-422     export one Standard ProRes 422 movie to home/mcraw4vulkan/exported_movies\n  --export-422-folder  export direct .mcraw files from FOLDER as Standard ProRes 422 movies\n  --metadata   print strict PIPE sidecar version 4 JSON without rendering video\n  --output     write raw yuv444p12le video bytes to FILE\n\nGyroflow projects:\n  Mandatory lens JSON and same-directory, exact same-stem .gcsv for each recording.\n  Readout defaults to 0 ms with per-frame optical correction; a measured positive\n  readout uses row-aware correction and requires profile readout direction.\n  Gyroflow CLI: PATH first, then the exact installation locations below.\n  macOS: /Applications/Gyroflow.app, ~/Applications/Gyroflow.app,\n  then ~/Desktop/Gyroflow.app.\n  Windows: Gyroflow/Gyroflow.exe under Program Files, LocalAppData/Programs,\n  or the home Desktop (conventional location only, without folder scanning).\n  Linux PATH names: gyroflow, then Gyroflow. No --gcsv option.\n  Projects go to home/mcraw4vulkan/gyroflow_projects, without overwrite.\n  Folder mode is direct-only; any skip/failure returns nonzero.\n  Apply projects only to the same source frames, order, cadence and geometry.\n\nOutput contract:\n  stdout is planar yuv444p12le: full Y, Cb, then Cr planes; six bytes per pixel. Samples are little-endian 16-bit words with 12 meaningful low bits. Color is TV-range BT.2020/D65, original Apple Log, BT.2020 NCL, no alpha channel. To correctly display the output file in another app, you may have to manually assign BT2020 AppleLog in that app\n\nPIPE stdout safety:\n  pipe without --output writes raw bytes to stdout only when stdout is not a terminal.\n  Diagnostics, progress, and warnings use stderr."
     }
 }
 
@@ -254,7 +264,91 @@ pub fn run_production_command(command: Mcraw4VulkanCommand) -> Result<()> {
             write_pipe_metadata_json_for_config(&config, &mut writer)
         }
         Mcraw4VulkanCommand::PipeAction(action, command) => run_pipe_action(action, command),
+        Mcraw4VulkanCommand::GyroflowProject(command) => run_gyroflow_project(command),
         Mcraw4VulkanCommand::Optimizer(command) => run_optimizer_command(command),
+    }
+}
+
+fn run_gyroflow_project(command: GyroflowProjectCommand) -> Result<()> {
+    use crate::movie_export::gyroflow_project::{ProjectRequest, ProjectStage};
+    use crate::movie_export::{ExportHandle, ExportInputs, ExportSnapshot};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let cancel = Arc::new(AtomicBool::new(false));
+    let token = Arc::clone(&cancel);
+    ctrlc::try_set_handler(move || token.store(true, std::sync::atomic::Ordering::Relaxed))?;
+    let mut handle = ExportHandle::start_project(
+        ProjectRequest {
+            inputs: if command.folder {
+                ExportInputs::Folder(command.input)
+            } else {
+                ExportInputs::Files(vec![command.input])
+            },
+            lens_profile: command.lens_profile,
+            rolling_shutter_ms: command.rolling_shutter_ms.parse()?,
+            producer: crate::movie_export::ProducerLocation::ThisCli,
+            settings: SettingsSourceChoice::Default,
+            ffmpeg: None,
+        },
+        cancel,
+    )?;
+    let mut events = 0;
+    let mut reported = std::collections::HashSet::new();
+    let mut print = |snapshot: &ExportSnapshot| {
+        for event in snapshot.project_events.get(events..).unwrap_or_default() {
+            let row = &snapshot.rows[event.row];
+            eprintln!(
+                "[{}/{}] {}",
+                event.row + 1,
+                snapshot.total,
+                row.source.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let mut name = row.source.file_stem().unwrap_or_default().to_os_string();
+            name.push(".gyroflow");
+            let destination = snapshot.destination.join(name);
+            match event.stage {
+                ProjectStage::Checking => eprintln!("Checking source and matching GCSV"),
+                ProjectStage::Encoding => eprintln!("Encoding input file for Gyroflow"),
+                ProjectStage::Preparing => {
+                    eprintln!("Synchronizing and preparing Gyroflow project")
+                }
+                ProjectStage::Creating => eprintln!(
+                    "Creating Gyroflow project file at {}",
+                    destination.display()
+                ),
+                ProjectStage::Created => {
+                    eprintln!("Gyroflow project created: {}", destination.display())
+                }
+            }
+        }
+        events = snapshot.project_events.len();
+        for (index, row) in snapshot.rows.iter().enumerate() {
+            if let Some(outcome) = row.outcome {
+                if reported.insert(index) && outcome != crate::movie_export::Outcome::Succeeded {
+                    eprintln!(
+                        "[{}/{}] {}",
+                        index + 1,
+                        snapshot.total,
+                        row.source.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    eprintln!("{}", row.reason);
+                }
+            }
+        }
+    };
+    loop {
+        if let Some(result) = handle.poll() {
+            print(&result.snapshot);
+            eprintln!("{}", result.snapshot.counts_text());
+            if let Some(problem) = &result.problem {
+                eprintln!("{problem}");
+            }
+            if !result.is_success() {
+                bail!("Gyroflow project command completed with skipped, failed or canceled files");
+            }
+            return Ok(());
+        }
+        print(&handle.snapshot());
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -738,6 +832,15 @@ fn parse_pipe_command(args: &[String]) -> Result<Mcraw4VulkanCommand> {
         return Ok(Mcraw4VulkanCommand::PipeHelp);
     }
 
+    if args.iter().take_while(|a| a.as_str() != "--").any(|a| {
+        matches!(
+            a.as_str(),
+            "--gyroflow-project" | "--gyroflow-project-folder"
+        )
+    }) {
+        return parse_gyroflow_project(args).map(Mcraw4VulkanCommand::GyroflowProject);
+    }
+
     let options = args.iter().take_while(|arg| arg.as_str() != "--");
     let actions: Vec<_> = options
         .clone()
@@ -778,6 +881,63 @@ fn parse_pipe_command(args: &[String]) -> Result<Mcraw4VulkanCommand> {
     }
 
     parse_pipe(args).map(Mcraw4VulkanCommand::Pipe)
+}
+
+fn parse_gyroflow_project(args: &[String]) -> Result<GyroflowProjectCommand> {
+    let mut folder = None;
+    let mut profile = None;
+    let mut readout = None;
+    let mut input = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--gyroflow-project" | "--gyroflow-project-folder" => {
+                if folder.is_some() {
+                    bail!("PIPE action selectors are mutually exclusive and may appear only once");
+                }
+                folder = Some(args[index] == "--gyroflow-project-folder");
+            }
+            "--lensprofile" => {
+                if profile.is_some() {
+                    bail!("--lensprofile was supplied more than once");
+                }
+                index += 1;
+                profile = Some(PathBuf::from(next_value(args, index, "--lensprofile")?));
+            }
+            "--rolling-shutter" => {
+                if readout.is_some() {
+                    bail!("--rolling-shutter was supplied more than once");
+                }
+                index += 1;
+                let text = next_value(args, index, "--rolling-shutter")?;
+                let value: f64 = text.parse().map_err(|_| {
+                    anyhow!(
+                        "--rolling-shutter requires milliseconds as a finite nonnegative decimal"
+                    )
+                })?;
+                crate::movie_export::gyroflow_project::validate_readout(value)?;
+                readout = Some(text.to_owned());
+            }
+            "--" => {
+                for value in &args[index + 1..] {
+                    set_input(&mut input, value, "pipe project")?;
+                }
+                break;
+            }
+            value if value.starts_with('-') => bail!(
+                "unknown Gyroflow project option {value:?}; motion is always the same-stem sibling .gcsv"
+            ),
+            value => set_input(&mut input, value, "pipe project")?,
+        }
+        index += 1;
+    }
+    Ok(GyroflowProjectCommand {
+        input: input.ok_or_else(|| anyhow!("project command requires a source file or folder"))?,
+        folder: folder.unwrap_or(false),
+        lens_profile: profile
+            .ok_or_else(|| anyhow!("project command requires --lensprofile PROFILE.json"))?,
+        rolling_shutter_ms: readout.unwrap_or_else(|| "0".into()),
+    })
 }
 
 fn parse_pipe_metadata(args: &[String]) -> Result<PipeMetadataCommand> {

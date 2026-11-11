@@ -468,7 +468,7 @@ pub fn default_dng_shared_mount_root() -> Result<PathBuf> {
     default_dng_shared_mount_root_from_home_env(home.as_deref())
 }
 
-fn default_dng_home_env() -> Option<OsString> {
+pub(crate) fn default_dng_home_env() -> Option<OsString> {
     if cfg!(target_os = "windows") {
         std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
     } else {

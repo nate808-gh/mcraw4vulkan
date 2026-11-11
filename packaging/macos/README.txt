@@ -1,4 +1,4 @@
-mcraw4vulkan 0.9.5 macOS — FSKit DNG mounts
+mcraw4vulkan 0.9.7 Beta macOS — FSKit DNG mounts
 
 End-user setup
 Install the official macFUSE 5.4.0 package from https://macfuse.github.io/, then

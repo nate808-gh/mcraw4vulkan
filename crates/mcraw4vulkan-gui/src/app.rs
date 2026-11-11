@@ -257,6 +257,8 @@ struct GuiApp {
     optimizer: GuiOptimizer,
     optimizer_binary: PathBuf,
     movie_export: crate::export_actions::GuiMovieExport,
+    gyroflow: crate::export_actions::GyroflowControls,
+    choosing_lens_profile: bool,
     preview_area: Option<PreviewLogicalRect>,
     preview_fullscreen: bool,
     preview_fullscreen_exit_pending: bool,
@@ -478,6 +480,8 @@ impl GuiApp {
             optimizer: GuiOptimizer::default(),
             optimizer_binary: resolve_mcraw4vulkan_binary(),
             movie_export: crate::export_actions::GuiMovieExport::default(),
+            gyroflow: crate::export_actions::GyroflowControls::default(),
+            choosing_lens_profile: false,
             preview_area: None,
             preview_fullscreen: false,
             preview_fullscreen_exit_pending: false,
@@ -1165,6 +1169,11 @@ impl GuiApp {
             })
             .inner
         });
+        draw_divider(ui);
+        ui.add_space(style::metrics(ui).space(8.0));
+        draw_section_title(ui, "Gyroflow Options");
+        ui.add_space(style::metrics(ui).space(8.0));
+        self.draw_gyroflow_actions(ui, width, height, gap);
         ui.add_space(style::metrics(ui).space(16.0));
         if movie_clicked {
             self.show_movie_export(false, ExportOutputKind::ProRes4444);
@@ -1183,6 +1192,141 @@ impl GuiApp {
         }
         if vignette_clicked {
             self.toggle_pipe_vignette();
+        }
+    }
+
+    fn draw_gyroflow_actions(&mut self, ui: &mut egui::Ui, width: f32, height: f32, gap: f32) {
+        let available = self.movie_export_admission().is_ok();
+        let editable = !self.movie_export.options_locked() && !self.quit_requested;
+        ui.horizontal(|ui| {
+            if gyroflow_button(ui, "Gyroflow Lens Profile", false,
+                editable && self.pending_file_chooser.is_none(), width, height)
+                .on_hover_text("Select lens calibration JSON. Each recording needs its own same-stem GCSV beside it.")
+                .clicked() && self.admit_file_chooser() {
+                self.choosing_lens_profile = true;
+                self.apply_file_chooser_start(file_chooser::start_lens_profile_chooser());
+            }
+            if gyroflow_button(ui, "Rolling Shutter", self.gyroflow.rolling_shutter,
+                editable, width, height)
+                .on_hover_text("Measured readout in milliseconds. OFF uses the default 0-ms / per-frame mode.")
+                .clicked() {
+                self.gyroflow.toggle_readout();
+            }
+            ui.allocate_ui_with_layout(vec2(width, height), Layout::left_to_right(Align::Center), |ui| {
+                let unit_width = ui.painter().layout_no_wrap("ms".into(),
+                    egui::TextStyle::Body.resolve(ui.style()), style::body_text()).size().x;
+                let entry_width = (width - gap - unit_width).max(0.0);
+                let previous_readout = self.gyroflow.readout.clone();
+                let response = ui.add_enabled(editable && self.gyroflow.rolling_shutter,
+                    egui::TextEdit::singleline(&mut self.gyroflow.readout)
+                        .char_limit(3)
+                        .desired_width((entry_width - ui.spacing().button_padding.x * 2.0).max(0.0)));
+                if response.changed() && !self.gyroflow.readout.bytes().all(|b| b.is_ascii_digit()) {
+                    self.gyroflow.readout = previous_readout;
+                }
+                if response.lost_focus() || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    let _ = self.gyroflow.commit_readout();
+                }
+                if let Err(message) = self.gyroflow.effective_readout() {
+                    ui.painter().rect_stroke(response.rect, 2, egui::Stroke::new(1.0, ui.visuals().error_fg_color), StrokeKind::Inside);
+                    response.on_hover_text(message);
+                }
+                ui.label("ms");
+            });
+        });
+        let filename = self
+            .gyroflow
+            .lens_profile
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .unwrap_or_default()
+            .to_string_lossy();
+        let full_path = self
+            .gyroflow
+            .lens_profile
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let field_height = ui.spacing().interact_size.y;
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(3.0 * width + 2.0 * gap, field_height), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 2, ui.visuals().extreme_bg_color);
+        let mut job = egui::text::LayoutJob::simple(
+            filename.into_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            style::body_text(),
+            (rect.width() - 8.0).max(0.0),
+        );
+        job.wrap.max_rows = 1;
+        let galley = ui.painter().layout_job(job);
+        ui.painter().with_clip_rect(rect).galley(
+            rect.left_center() + vec2(4.0, -galley.size().y / 2.0),
+            galley,
+            style::body_text(),
+        );
+        response.on_hover_text(full_path);
+        let ready = available
+            && self.gyroflow.lens_profile.is_some()
+            && self.gyroflow.effective_readout().is_ok();
+        let guidance = if self.gyroflow.lens_profile.is_none() {
+            "Select a Gyroflow lens profile first."
+        } else {
+            self.gyroflow.effective_readout().err().unwrap_or("")
+        };
+        let [single, all] = ui.horizontal(|ui| {
+            let single = gyroflow_button(ui, "Gyroflow Movie", false,
+                ready && self.playlist.selected_path().is_some(), width, height)
+                .on_hover_text(format!("Creates a .gyroflow project for the highlighted recording for the editor’s OFX plugin. Each recording needs its own sibling GCSV. Temporary analysis media is removed automatically. {guidance}"))
+                .clicked();
+            let all = gyroflow_button(ui, "Gyroflow All Movies", false,
+                ready && !self.playlist.is_empty(), width, height)
+                .on_hover_text(format!("Creates .gyroflow projects for all playlist recordings, even across directories. Each recording needs its own sibling GCSV. Temporary analysis media is removed automatically. {guidance}"))
+                .clicked();
+            ui.allocate_exact_size(vec2(width, height), Sense::empty());
+            [single, all]
+        }).inner;
+        if single {
+            self.start_gyroflow_export(false);
+        }
+        if all {
+            self.start_gyroflow_export(true);
+        }
+    }
+
+    fn gyroflow_request(
+        &mut self,
+        all: bool,
+    ) -> Result<mcraw4vulkan::movie_export::gyroflow_project::ProjectRequest, String> {
+        self.movie_export_admission().map_err(str::to_owned)?;
+        let readout = self.gyroflow.commit_readout()?;
+        let profile = self
+            .gyroflow
+            .lens_profile
+            .clone()
+            .ok_or("Select a Gyroflow lens profile first.")?;
+        let paths = self.movie_export_paths(all);
+        if paths.is_empty() {
+            return Err("No playlist file is available for export.".into());
+        }
+        Ok(self.movie_export.new_project_request(
+            paths,
+            profile,
+            readout,
+            pipe_example::export_settings(self.settings.optimizer_profile),
+        ))
+    }
+
+    fn start_gyroflow_export(&mut self, all: bool) {
+        let result = self
+            .gyroflow_request(all)
+            .and_then(|request| self.movie_export.start_project_snapshot(request));
+        match result {
+            Ok(()) => self.pipe_body = PipeBody::Export,
+            Err(error) => {
+                self.movie_export.message = Some(error.clone());
+                self.set_status(error);
+            }
         }
     }
 
@@ -2521,6 +2665,18 @@ impl GuiApp {
     }
 
     fn apply_file_chooser_outcome(&mut self, outcome: FileChooserOutcome) -> bool {
+        if std::mem::take(&mut self.choosing_lens_profile) {
+            match outcome {
+                FileChooserOutcome::Selected(paths) if !self.quit_requested && paths.len() == 1 => {
+                    self.gyroflow.lens_profile = paths.into_iter().next();
+                }
+                FileChooserOutcome::Failed(message) | FileChooserOutcome::Unavailable(message) => {
+                    self.set_status(message)
+                }
+                _ => {}
+            }
+            return true;
+        }
         match outcome {
             FileChooserOutcome::Selected(paths) if !self.quit_requested => {
                 self.add_dropped_paths(paths)
@@ -3227,6 +3383,11 @@ fn draw_movie_export_panel(
             } else if export.message.is_none() {
                 draw_export_line(ui, &[("Preparing export…", gray)]);
             }
+            if export.is_project() {
+                ui.label("Stabilized .gyroflow project files are created with 1 click and may be used by your OFX plugin");
+                ui.add_space(ui.text_style_height(&egui::TextStyle::Body));
+                draw_progress_bar(ui, content_rect.width(), gyroflow_progress(&snapshot));
+            }
             ui.add_space(style::metrics(ui).space(12.0));
             use mcraw4vulkan::movie_export::ExportActivity;
             draw_export_line(
@@ -3281,6 +3442,9 @@ fn draw_movie_export_panel(
                         (&status, gray),
                     ],
                 );
+                if export.is_project() && !row.reason.is_empty() {
+                    draw_export_line(ui, &[(&row.reason, gray)]);
+                }
                 if !row.reason.is_empty() || row.duplicate_selections > 0 {
                     response.on_hover_ui(|ui| {
                         if !row.reason.is_empty() {
@@ -3296,6 +3460,36 @@ fn draw_movie_export_panel(
                 }
             }
         });
+}
+
+// Four existing processing events per recording; admission checks start at zero.
+// Terminal skips/failures finish their share without changing the result counts.
+fn gyroflow_progress(snapshot: &mcraw4vulkan::movie_export::ExportSnapshot) -> f32 {
+    use mcraw4vulkan::movie_export::{Outcome, gyroflow_project::ProjectStage};
+    if snapshot.total == 0 {
+        return 0.0;
+    }
+    let mut steps = vec![0u8; snapshot.total];
+    for event in &snapshot.project_events {
+        if let Some(step) = steps.get_mut(event.row) {
+            *step = (*step).max(match event.stage {
+                ProjectStage::Checking => 0,
+                ProjectStage::Encoding => 1,
+                ProjectStage::Preparing => 2,
+                ProjectStage::Creating => 3,
+                ProjectStage::Created => 4,
+            });
+        }
+    }
+    for (step, row) in steps.iter_mut().zip(&snapshot.rows) {
+        if matches!(
+            row.outcome,
+            Some(Outcome::Succeeded | Outcome::Skipped | Outcome::Failed)
+        ) {
+            *step = 4;
+        }
+    }
+    steps.iter().map(|&step| step as f32).sum::<f32>() / (snapshot.total as f32 * 4.0)
 }
 
 fn draw_export_line(ui: &mut egui::Ui, spans: &[(&str, egui::Color32)]) -> egui::Response {
@@ -3369,7 +3563,7 @@ fn draw_optimizer_panel(ui: &mut egui::Ui, rect: Rect, optimizer: &GuiOptimizer)
     }
 
     let width = child_ui.available_width().max(0.0);
-    draw_optimizer_progress_bar(&mut child_ui, width, optimizer.progress());
+    draw_progress_bar(&mut child_ui, width, optimizer.progress());
     child_ui.add_space(style::metrics(ui).space(10.0));
     draw_divider(&mut child_ui);
     child_ui.add_space(style::metrics(ui).space(10.0));
@@ -3400,7 +3594,7 @@ fn draw_optimizer_panel(ui: &mut egui::Ui, rect: Rect, optimizer: &GuiOptimizer)
     );
 }
 
-fn draw_optimizer_progress_bar(ui: &mut egui::Ui, width: f32, progress: f32) {
+fn draw_progress_bar(ui: &mut egui::Ui, width: f32, progress: f32) {
     let width = width.max(48.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
     ui.painter().rect_filled(rect, 4, style::button_dark());
@@ -3450,6 +3644,8 @@ fn draw_pipe_about_panel(ui: &mut egui::Ui, rect: Rect) {
                 ("Export All 422", " - Export the entire playlist as Standard ProRes 422 movies"),
                 ("Export Proxies", " - Export the entire playlist as full-resolution ProRes Proxy movies"),
                 ("Pipe Example", " - See how to use the mcraw4vulkan pipe video bytestream with the command line to customize the export into any format"),
+                ("Gyroflow Movie", " - Creates a .gyroflow project for the highlighted recording for the editor’s OFX plugin"),
+                ("Gyroflow All Movies", " - Uses every playlist recording, even across directories. Each needs its own same-stem GCSV beside it. Select lens calibration JSON above; temporary analysis media is removed automatically"),
             ] {
                 ui.add_space(style::metrics(ui).space(16.0));
                 let mut job = egui::text::LayoutJob::default();
@@ -4657,6 +4853,36 @@ fn draw_button_cell_with_sense(
             draw_orange_emphasis_button_with_sense(ui, cell.label, cell.selected, width, sense)
         }
     }
+}
+
+fn gyroflow_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    enabled: bool,
+    width: f32,
+    height: f32,
+) -> egui::Response {
+    let mut job = egui::text::LayoutJob::simple(
+        label.to_owned(),
+        FontId::proportional(style::metrics(ui).font(style::BUTTON_FONT_SIZE)),
+        visual_button_paint(selected, VisualButtonStrokeStyle::Normal).text_color,
+        (width - 8.0).max(0.0),
+    );
+    job.halign = Align::Center;
+    let galley = ui.painter().layout_job(job);
+    draw_visual_button_with_layout(
+        ui,
+        selected,
+        vec2(width, height),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+        VisualButtonStrokeStyle::Normal,
+        galley,
+    )
 }
 
 fn draw_visual_button_with_sense(

@@ -365,16 +365,12 @@ pub(crate) fn encoder_args(facts: &PipeExampleFacts, target: CommandTarget) -> V
     )
 }
 
-pub(crate) fn encoder_args_for(
-    facts: &PipeExampleFacts,
-    encoder: ProresEncoder,
-    output_kind: ExportOutputKind,
-) -> Vec<String> {
+fn raw_input_args(facts: &PipeExampleFacts, vulkan: bool) -> Vec<String> {
     let mut args: Vec<String> = ["-nostdin", "-hide_banner", "-y"]
         .into_iter()
         .map(str::to_owned)
         .collect();
-    if encoder == ProresEncoder::Vulkan {
+    if vulkan {
         args.extend(
             [
                 "-noauto_conversion_filters",
@@ -422,6 +418,15 @@ pub(crate) fn encoder_args_for(
         .into_iter()
         .map(str::to_owned),
     );
+    args
+}
+
+pub(crate) fn encoder_args_for(
+    facts: &PipeExampleFacts,
+    encoder: ProresEncoder,
+    output_kind: ExportOutputKind,
+) -> Vec<String> {
+    let mut args = raw_input_args(facts, encoder == ProresEncoder::Vulkan);
     let aspect = display_aspect_ratio_text(facts);
     args.push(if encoder == ProresEncoder::VideoToolbox {
         videotoolbox_prores_filter(&aspect, output_kind)
@@ -453,6 +458,64 @@ pub(crate) fn encoder_args_for(
         .map(str::to_owned),
     );
     args.extend(output_args(facts));
+    args
+}
+
+/// Fixed, silent Main10 analysis proxy. Shares the RAW input/color/cadence contract.
+pub(crate) fn analysis_hevc_args(facts: &PipeExampleFacts, target: CommandTarget) -> Vec<String> {
+    let vulkan = target != CommandTarget::Macos;
+    let mut args = raw_input_args(facts, vulkan);
+    args.push(format!(
+        "setsar=1,setdar={},{PRORES_422_CONVERSION}format=p010le{}",
+        display_aspect_ratio_text(facts),
+        if vulkan { ",hwupload" } else { "" }
+    ));
+    args.extend(
+        [
+            "-an",
+            "-c:v",
+            if vulkan {
+                "hevc_vulkan"
+            } else {
+                "hevc_videotoolbox"
+            },
+            "-profile:v",
+            "main10",
+        ]
+        .map(str::to_owned),
+    );
+    if vulkan {
+        args.extend(["-rc_mode", "vbr", "-maxrate", "16M", "-bufsize", "24M"].map(str::to_owned));
+        if target == CommandTarget::Windows {
+            // Bound outstanding encode work inside FFmpeg's existing Vulkan
+            // command/query pool; the shared RAW pipe remains unpaced.
+            args.extend(["-async_depth", "1"].map(str::to_owned));
+        }
+    } else {
+        args.extend(["-allow_sw", "0", "-pix_fmt", "p010le"].map(str::to_owned));
+    }
+    args.extend(
+        [
+            "-b:v",
+            "12M",
+            "-g",
+            "60",
+            "-bf",
+            "0",
+            "-color_range",
+            "tv",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "2",
+            "-colorspace",
+            "bt2020nc",
+            "-video_track_timescale",
+        ]
+        .map(str::to_owned),
+    );
+    args.push(facts.cadence.video_track_timescale.to_string());
+    args.extend(["-movflags", "+faststart", "-fps_mode", "passthrough"].map(str::to_owned));
     args
 }
 

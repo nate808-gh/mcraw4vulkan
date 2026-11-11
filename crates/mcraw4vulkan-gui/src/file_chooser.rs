@@ -178,6 +178,74 @@ fn start_ffmpeg_platform_chooser() -> FileChooserStart {
     }
 }
 
+pub fn start_lens_profile_chooser() -> FileChooserStart {
+    #[cfg(target_os = "linux")]
+    {
+        let zenity = ChooserCommand {
+            program: "zenity",
+            args: vec![
+                "--file-selection",
+                "--title=Select Gyroflow lens calibration JSON",
+                "--file-filter=JSON lens profiles | *.json *.JSON",
+            ],
+            kind: ChooserKind::Zenity,
+        };
+        match start_one_chooser(&zenity, &mut spawn_command) {
+            FileChooserStart::Ready(FileChooserOutcome::Unavailable(_)) => start_one_chooser(
+                &ChooserCommand {
+                    program: "kdialog",
+                    args: vec![
+                        "--getopenfilename",
+                        ".",
+                        "*.json *.JSON",
+                        "--title",
+                        "Select Gyroflow lens calibration JSON",
+                    ],
+                    kind: ChooserKind::Kdialog,
+                },
+                &mut spawn_command,
+            ),
+            outcome => outcome,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        start_one_chooser(
+            &ChooserCommand {
+                program: "powershell.exe",
+                kind: ChooserKind::PowerShell,
+                args: vec![
+                    "-NoProfile",
+                    "-STA",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; try { $d.Title = 'Select Gyroflow lens calibration JSON'; $d.Filter = 'JSON lens profiles (*.json)|*.json'; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.WriteLine($d.FileName) } else { [Console]::Out.WriteLine('__MCRAW4VULKAN_CHOOSER_CANCELLED__') } } finally { $d.Dispose() }",
+                ],
+            },
+            &mut spawn_command,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        start_one_chooser(
+            &ChooserCommand {
+                program: "osascript",
+                kind: ChooserKind::Osascript,
+                args: vec![
+                    "-e",
+                    "POSIX path of (choose file with prompt \"Select Gyroflow lens calibration JSON\" of type {\"public.json\"})",
+                ],
+            },
+            &mut spawn_command,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        FileChooserStart::Ready(FileChooserOutcome::Unavailable(
+            "Lens profile chooser unavailable on this platform.".into(),
+        ))
+    }
+}
+
 fn start_mcraw_file_chooser_with_spawner(
     spawner: &mut impl FnMut(&ChooserCommand) -> io::Result<ProcessHandle>,
 ) -> FileChooserStart {

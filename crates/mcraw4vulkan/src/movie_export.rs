@@ -17,6 +17,9 @@ use crate::cli::{ComputeBackendChoice, SettingsSourceChoice};
 use crate::pipe_example::{self, CommandTarget, ProresEncoder};
 use crate::{PIPE_PRORES_FILE_SUFFIX, PIPE_PRORES_SIDECAR_SUFFIX, PipeExampleFacts};
 
+pub mod gyroflow_project;
+use gyroflow_project::{ProjectJob, ProjectSettings};
+
 pub const FFMPEG_PRORES_UNAVAILABLE: &str = "FFmpeg ProRes Encoding not found on this system. \"Export Movie\" will not function without FFmpeg Vulkan or VideoToolbox Encoding.";
 
 const LOG_LIMIT: usize = 64 * 1024;
@@ -168,6 +171,8 @@ impl ExportActivity {
 
 #[derive(Debug, Clone, Default)]
 pub struct ExportSnapshot {
+    /// Project-only stage transitions; consumers retain their last event index.
+    pub project_events: Vec<gyroflow_project::ProjectEvent>,
     pub activity: ExportActivity,
     pub destination: PathBuf,
     pub rows: Vec<ExportRow>,
@@ -311,12 +316,37 @@ pub struct ExportHandle {
 
 impl ExportHandle {
     pub fn start(request: ExportRequest, cancel: Arc<AtomicBool>) -> Result<Self> {
+        Self::start_worker(cancel, move |token, state| run_batch(request, token, state))
+    }
+    pub fn start_project(
+        mut request: gyroflow_project::ProjectRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        // Resolve the admitted snapshot before the worker starts. Later CWD or
+        // playlist changes cannot redirect sibling-motion or profile lookup.
+        let cwd = std::env::current_dir()?;
+        request.lens_profile = absolute(&request.lens_profile, &cwd);
+        request.inputs = match request.inputs {
+            ExportInputs::Files(paths) => {
+                ExportInputs::Files(paths.into_iter().map(|p| absolute(&p, &cwd)).collect())
+            }
+            ExportInputs::Folder(path) => ExportInputs::Folder(absolute(&path, &cwd)),
+        };
+        request.ffmpeg = request.ffmpeg.map(|p| absolute(&p, &cwd));
+        Self::start_worker(cancel, move |token, state| {
+            gyroflow_project::run_batch(request, token, state)
+        })
+    }
+    fn start_worker(
+        cancel: Arc<AtomicBool>,
+        run: impl FnOnce(Arc<AtomicBool>, Arc<Mutex<ExportSnapshot>>) -> ExportResult + Send + 'static,
+    ) -> Result<Self> {
         let snapshot = Arc::new(Mutex::new(ExportSnapshot::default()));
         let state = Arc::clone(&snapshot);
         let token = Arc::clone(&cancel);
         let worker = thread::Builder::new()
             .name("movie-export".into())
-            .spawn(move || run_batch(request, token, state))
+            .spawn(move || run(token, state))
             .context("could not start export worker")?;
         Ok(Self {
             cancel,
@@ -397,16 +427,40 @@ fn discover(inputs: ExportInputs, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
 }
 
 #[derive(Debug)]
+enum JobOutput {
+    Movie {
+        kind: ExportOutputKind,
+        movie: PathBuf,
+        json: PathBuf,
+    },
+    Project(ProjectJob),
+}
+
+#[derive(Debug)]
 struct Job {
-    output_kind: ExportOutputKind,
+    output: JobOutput,
     geometry_handoff: Option<String>,
     row: usize,
     source: PathBuf,
     facts: PipeExampleFacts,
     frames: u64,
     has_audio: bool,
-    movie: PathBuf,
-    json: PathBuf,
+}
+
+impl Job {
+    fn project(&self) -> Option<&ProjectJob> {
+        if let JobOutput::Project(project) = &self.output {
+            Some(project)
+        } else {
+            None
+        }
+    }
+    fn movie_paths(&self) -> (&Path, &Path) {
+        match &self.output {
+            JobOutput::Movie { movie, json, .. } => (movie, json),
+            JobOutput::Project(_) => unreachable!("project has a single publication"),
+        }
+    }
 }
 
 fn absolute(path: &Path, cwd: &Path) -> PathBuf {
@@ -478,15 +532,17 @@ fn plan(
             result.snapshot.rows[row].reason = recovery_message.unwrap_or_default();
             *names.entry(stem.to_uppercase()).or_default() += 1;
             Ok(Some(Job {
-                output_kind,
+                output: JobOutput::Movie {
+                    kind: output_kind,
+                    movie,
+                    json,
+                },
                 geometry_handoff,
                 row,
                 source: source.clone(),
                 facts,
                 frames,
                 has_audio,
-                movie,
-                json,
             }))
         })();
         match candidate {
@@ -507,7 +563,7 @@ fn plan(
             let conflict = if names[&key] > 1 {
                 Some("distinct sources have colliding output stems".to_owned())
             } else {
-                [job.movie.as_path(), job.json.as_path()]
+                [job.movie_paths().0, job.movie_paths().1]
                     .iter()
                     .find_map(|path| match fs::symlink_metadata(path) {
                         Ok(_) => Some(format!("output already exists: {}", path.display())),
@@ -1079,15 +1135,81 @@ struct JobFiles {
     mux: PathBuf,
     wav: PathBuf,
     sidecar: PathBuf,
+    #[cfg(windows)]
+    directory_created: Option<std::time::SystemTime>,
+    #[cfg(windows)]
+    directory_guard: Mutex<Option<fs::File>>,
+    #[cfg(unix)]
+    directory_node: (u64, u64),
 }
 
 impl JobFiles {
     fn create(job: Job, destination: &Path) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let directory =
+            Self::allocate_directory(&job, destination, gyroflow_project::owned_job_directory)?;
+        #[cfg(not(target_os = "macos"))]
         let directory = owned_directory(destination)?;
+        Self::from_directory(job, directory)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn allocate_directory(
+        job: &Job,
+        destination: &Path,
+        project_directory: impl FnOnce() -> Result<PathBuf>,
+    ) -> Result<PathBuf> {
+        if job.project().is_some() {
+            project_directory()
+        } else {
+            owned_directory(destination)
+        }
+    }
+
+    // The caller transfers an exclusively created leaf, never a shared parent.
+    fn from_directory(job: Job, directory: PathBuf) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&directory).with_context(|| {
+            format!(
+                "cannot inspect owned export directory; cleanup required at {}",
+                directory.display()
+            )
+        })?;
+        ensure!(
+            metadata.file_type().is_dir(),
+            "owned export directory was replaced: {}",
+            directory.display()
+        );
         let paths = crate::pipe_cli::pipe_sidecar_paths(&job.source, &directory);
         match paths {
             Ok((wav, sidecar)) => Ok(Self {
-                video: directory.join("video.mov"),
+                video: if job.project().is_some() {
+                    directory
+                        .join(job.source.file_name().expect("validated name"))
+                        .with_extension("mp4")
+                } else {
+                    directory.join("video.mov")
+                },
+                #[cfg(windows)]
+                directory_guard: Mutex::new(if job.project().is_some() {
+                    Some(gyroflow_project::guard_directory(&directory)?)
+                } else {
+                    None
+                }),
+                #[cfg(windows)]
+                directory_created: if job.project().is_some() {
+                    metadata.created().ok()
+                } else {
+                    None
+                },
+                #[cfg(unix)]
+                directory_node: {
+                    use std::os::unix::fs::MetadataExt;
+                    if job.project().is_some() {
+                        (metadata.dev(), metadata.ino())
+                    } else {
+                        (0, 0)
+                    }
+                },
                 mux: directory.join("mux.mov"),
                 wav,
                 sidecar,
@@ -1095,13 +1217,41 @@ impl JobFiles {
                 directory,
             }),
             Err(e) => {
-                fs::remove_dir_all(&directory)
-                    .context("failed to clean export directory after layout error")?;
+                let cleanup = (|| -> Result<()> {
+                    let current = fs::symlink_metadata(&directory)?;
+                    ensure!(current.file_type().is_dir(), "owned directory was replaced");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        ensure!(
+                            (current.dev(), current.ino()) == (metadata.dev(), metadata.ino()),
+                            "owned directory identity changed"
+                        );
+                    }
+                    #[cfg(windows)]
+                    ensure!(
+                        current.created()? == metadata.created()?,
+                        "owned directory identity changed"
+                    );
+                    // Layout failed before any output was created. Never clear
+                    // unexpected entries, even inside this newly allocated leaf.
+                    fs::remove_dir(&directory)?;
+                    Ok(())
+                })();
+                if let Err(cleanup) = cleanup {
+                    bail!(
+                        "{e:#}; cleanup failed; owned directory remains at {}: {cleanup:#}",
+                        directory.display()
+                    );
+                }
                 Err(e)
             }
         }
     }
     fn cleanup(&self) -> Result<()> {
+        if self.job.project().is_some() {
+            return gyroflow_project::cleanup(self);
+        }
         fs::remove_dir_all(&self.directory).with_context(|| {
             format!(
                 "cleanup failed; owned files remain in {}",
@@ -1130,6 +1280,12 @@ impl JobFiles {
                 self.job.frames
             );
         }
+        if self.job.project().is_some() {
+            ensure!(
+                encoded_frames.is_some(),
+                "analysis encoder did not report its completed frame count"
+            );
+        }
         ensure!(
             contract.audio.present == self.job.has_audio,
             "producer JSON audio presence differs from indexed source"
@@ -1155,6 +1311,7 @@ impl JobFiles {
         Ok(())
     }
     fn publish(&self) -> Result<()> {
+        let (final_movie, final_json) = self.job.movie_paths();
         let movie = if self.job.has_audio {
             &self.mux
         } else {
@@ -1167,21 +1324,28 @@ impl JobFiles {
         // Once JSON belongs to this attempt, finish the short publication step
         // even if Cancel arrives. Two links are not an atomic pair. Never remove
         // either final name on failure: a competing writer must not be harmed.
-        crate::pipe_cli::publish_movie_no_replace(&self.sidecar, &self.job.json)?;
-        crate::pipe_cli::publish_movie_no_replace(movie, &self.job.movie).with_context(|| {
+        crate::pipe_cli::publish_movie_no_replace(&self.sidecar, final_json)?;
+        crate::pipe_cli::publish_movie_no_replace(movie, final_movie).with_context(|| {
             format!(
                 "JSON was published at {}; MOV publication failed, leaving an incomplete pair",
-                self.job.json.display()
+                final_json.display()
             )
         })?;
         Ok(())
     }
 }
 
+enum VideoEncoding {
+    Prores(ProresEncoder),
+    AnalysisHevc,
+}
+
 struct RunnerConfig {
     producer: PathBuf,
     ffmpeg: PathBuf,
-    encoder: ProresEncoder,
+    encoder: VideoEncoding,
+    project: Option<ProjectSettings>,
+    cancel: Arc<AtomicBool>,
     cwd: PathBuf,
     options: ExportOptions,
     overlap_remux: bool,
@@ -1274,11 +1438,18 @@ impl VideoSlot {
                 .ok_or_else(|| anyhow!("producer stdout pipe missing"))?;
             let mut command = ffmpeg_command(&config.ffmpeg, &config.producer);
             command
-                .args(pipe_example::encoder_args_for(
-                    &slot.files.job.facts,
-                    config.encoder,
-                    slot.files.job.output_kind,
-                ))
+                .args(match (&config.encoder, &slot.files.job.output) {
+                    (VideoEncoding::Prores(encoder), JobOutput::Movie { kind, .. }) => {
+                        pipe_example::encoder_args_for(&slot.files.job.facts, *encoder, *kind)
+                    }
+                    (VideoEncoding::AnalysisHevc, JobOutput::Project(_)) => {
+                        pipe_example::analysis_hevc_args(
+                            &slot.files.job.facts,
+                            pipe_example::current_command_target(),
+                        )
+                    }
+                    _ => bail!("export request/encoder mismatch"),
+                })
                 .args(["-progress", "pipe:1", "-nostats"])
                 .arg(&slot.files.video)
                 .stdin(reader)
@@ -1351,6 +1522,21 @@ impl VideoSlot {
         let p = producer.poll()?;
         let e = encoder.poll()?;
         if p.is_some_and(|s| !s.success()) || e.is_some_and(|s| !s.success()) {
+            #[cfg(windows)]
+            if self.files.job.project().is_some() && p.is_none() && e.is_some_and(|s| !s.success())
+            {
+                // The exited encoder closed the pipe's only reader. Allow PIPE
+                // to unwind on broken pipe and clean its own transaction. The
+                // deadline bounds a stuck GPU/hash worker; stop still kills and
+                // reaps it. This is exit polling, not a synchronization delay.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if producer.poll()?.is_some() {
+                        break;
+                    }
+                    thread::sleep(POLL);
+                }
+            }
             self.stop()?;
             bail!(
                 "video stage failed (producer {p:?}, encoder {e:?})\n{}\n{}",
@@ -1387,6 +1573,8 @@ impl VideoSlot {
 struct FinalizerSlot {
     files: JobFiles,
     process: Option<ExportProcess>,
+    project: Option<ProjectSettings>,
+    started: Instant,
 }
 
 impl FinalizerSlot {
@@ -1394,8 +1582,20 @@ impl FinalizerSlot {
         let mut slot = Self {
             files,
             process: None,
+            project: config.project.clone(),
+            started: Instant::now(),
         };
-        if slot.files.job.has_audio {
+        if let Some(settings) = &slot.project {
+            match gyroflow_project::start(&slot.files, settings, config) {
+                Ok(process) => slot.process = Some(process),
+                Err(error) => {
+                    slot.files
+                        .cleanup()
+                        .context(format!("{error:#}; project startup cleanup failed"))?;
+                    return Err(error);
+                }
+            }
+        } else if slot.files.job.has_audio {
             let mut command = ffmpeg_command(&config.ffmpeg, &config.producer);
             command
                 .args(pipe_example::remux_args(
@@ -1437,18 +1637,41 @@ impl FinalizerSlot {
     }
     fn poll(&mut self, after_remux: impl FnOnce()) -> Result<bool> {
         if let Some(process) = &mut self.process {
+            if self.project.is_some() {
+                let duration = self.files.job.frames as f64
+                    * self.files.job.facts.cadence.fps_den as f64
+                    / self.files.job.facts.cadence.fps_num as f64;
+                ensure!(
+                    self.started.elapsed().as_secs_f64() <= (duration * 20.0 + 180.0).max(300.0),
+                    "Gyroflow preparation watchdog expired"
+                );
+            }
             let Some(status) = process.poll()? else {
                 return Ok(false);
             };
             process.finish(false)?;
             ensure!(
                 status.success(),
-                "FFmpeg remux failed: {status}\n{}",
+                "finalizer failed: {status}\n{}",
                 process.diagnostics()
             );
         }
-        after_remux();
-        self.files.publish()?;
+        if let Some(settings) = &self.project {
+            if let Err(error) = gyroflow_project::validate_project(&self.files, settings) {
+                bail!(
+                    "{error:#}\n{}",
+                    self.process
+                        .as_ref()
+                        .map(ExportProcess::diagnostics)
+                        .unwrap_or_default()
+                );
+            }
+            after_remux();
+            gyroflow_project::publish(&self.files)?;
+        } else {
+            after_remux();
+            self.files.publish()?;
+        }
         self.files.cleanup()?;
         Ok(true)
     }
@@ -1522,7 +1745,9 @@ fn run_batch(
             RunnerConfig {
                 producer,
                 ffmpeg,
-                encoder,
+                encoder: VideoEncoding::Prores(encoder),
+                project: None,
+                cancel: Arc::clone(&cancel),
                 cwd,
                 options: request.options,
                 overlap_remux: true,
@@ -1583,19 +1808,36 @@ fn run_schedule(
             break;
         }
         if let Some(slot) = &mut finalizer {
+            let project_row = slot.files.job.project().map(|_| slot.files.job.row);
             match slot.poll(|| {
                 // Publication/cleanup still own this slot; the remux stage has ended.
+                if let Some(row) = project_row {
+                    gyroflow_project::event(
+                        &mut result.snapshot,
+                        row,
+                        gyroflow_project::ProjectStage::Creating,
+                    );
+                }
                 result.snapshot.activity.remuxing = false;
                 *lock(&state) = result.snapshot.clone();
             }) {
                 Ok(false) => {}
                 Ok(true) => {
                     let slot = finalizer.take().unwrap();
-                    result.record(
-                        slot.files.job.row,
-                        Outcome::Succeeded,
-                        "MOV and JSON published; temporary files cleaned".into(),
-                    );
+                    let reason = if let Some(project) = slot.files.job.project() {
+                        gyroflow_project::event(
+                            &mut result.snapshot,
+                            slot.files.job.row,
+                            gyroflow_project::ProjectStage::Created,
+                        );
+                        format!(
+                            "Gyroflow project created: {}",
+                            project.destination.display()
+                        )
+                    } else {
+                        "MOV and JSON published; temporary files cleaned".into()
+                    };
+                    result.record(slot.files.job.row, Outcome::Succeeded, reason);
                 }
                 Err(error) => {
                     let mut slot = finalizer.take().unwrap();
@@ -1647,10 +1889,21 @@ fn run_schedule(
         if finalizer.is_none() && video.as_ref().is_some_and(|v| v.ready) {
             let slot = video.take().unwrap();
             let row = slot.files.job.row;
+            let project_job = slot.files.job.project().is_some();
+            if project_job {
+                gyroflow_project::event(
+                    &mut result.snapshot,
+                    row,
+                    gyroflow_project::ProjectStage::Preparing,
+                );
+                *lock(&state) = result.snapshot.clone();
+            }
             match FinalizerSlot::start(slot.files, &config) {
                 Ok(slot) => finalizer = Some(slot),
                 Err(error) => {
-                    result.problem = Some(format!("{error:#}"));
+                    if !project_job || batch_blocker(&error) {
+                        result.problem = Some(format!("{error:#}"));
+                    }
                     result.record(row, Outcome::Failed, format!("{error:#}"));
                 }
             }
@@ -1662,6 +1915,14 @@ fn run_schedule(
             if let Some(job) = jobs.pop_front() {
                 let row = job.row;
                 result.snapshot.rows[row].started = true;
+                if job.project().is_some() {
+                    gyroflow_project::event(
+                        &mut result.snapshot,
+                        row,
+                        gyroflow_project::ProjectStage::Encoding,
+                    );
+                    *lock(&state) = result.snapshot.clone();
+                }
                 match JobFiles::create(job, &result.snapshot.destination)
                     .and_then(|files| VideoSlot::start(files, &config))
                 {

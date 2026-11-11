@@ -12,11 +12,15 @@ pub fn export_options(
             DecodeMode::Gpu => mcraw4vulkan::cli::ComputeBackendChoice::Gpu,
             DecodeMode::Cpu => mcraw4vulkan::cli::ComputeBackendChoice::Cpu,
         },
-        settings: match profile {
-            OptimizerProfile::Default => mcraw4vulkan::cli::SettingsSourceChoice::Default,
-            OptimizerProfile::Optimized => mcraw4vulkan::cli::SettingsSourceChoice::Optimized,
-        },
+        settings: export_settings(profile),
         vignette,
+    }
+}
+
+pub fn export_settings(profile: OptimizerProfile) -> mcraw4vulkan::cli::SettingsSourceChoice {
+    match profile {
+        OptimizerProfile::Default => mcraw4vulkan::cli::SettingsSourceChoice::Default,
+        OptimizerProfile::Optimized => mcraw4vulkan::cli::SettingsSourceChoice::Optimized,
     }
 }
 

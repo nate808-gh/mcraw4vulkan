@@ -7,7 +7,7 @@ mcraw4vulkan is a Rust application for displaying and processing MotionCam RAW
 
 ## Public Beta status
 
-This source tree is Beta 0.9.2. Preserve original recordings and validate
+This source tree is Beta 0.9.7. Preserve original recordings and validate
 outputs before relying on them in a production workflow. Interfaces and package
 details may change as Beta feedback is incorporated.
 
@@ -103,12 +103,6 @@ The examples set `-color_primaries bt2020 -colorspace bt2020nc -color_range tv
 it does not automatically identify Apple Log. Neither the sidecar nor the
 filename guarantees automatic editor recognition.
 
-Version 0.9.1 replaces the previous half-scale linear transfer function. Sidecars use
-`metadata_version=4` and algorithm
-`mcraw-yuv444p12le-tv-bt2020-apple-log-original-ncl-v1`; video, JSON and audio
-names share `-BT2020-AppleLog-original-tv`. Display, RAW decoding and
-camera-domain DNG remain unchanged; Apple Log assignment is only for PIPE YUV444 video,
-not DNG files.
 
 ### PIPE numerical contract
 
@@ -131,28 +125,6 @@ The physical gray target in a recording is not automatically normalized to
 excursions are retained until terminal packing. NaN, infinity and arithmetic
 overflow fail the frame. Apple Log and integer packing are not lossless, and
 shadow code spacing is not constant throughout the toe.
-
-For transferred components `R',G',B'`, `Y'=0.2627R'+0.6780G'+0.0593B'`,
-`Cb=(B'-Y')/1.8814`, `Cr=(R'-Y')/1.4746`. Map Y with `256+3504Y'` and chroma
-with `2048+3584C`. Clamp each plane to 16..4079, then round with
-`floor(value+0.5)`; no dithering. Nominal Y is 256..3760 and nominal chroma
-256..3840, centered at 2048. Colored components may saturate a chroma plane
-before neutral luma reaches its limit.
-
-To reconstruct, remove the limited-range offsets/scales, invert BT.2020 NCL,
-then apply the original component inverse. With `Pt=c*(Rt-R0)^2`:
-
-```text
-G(v) = R0                                 v < 0
-       sqrt(v/c)+R0                       0 <= v < Pt
-       exp2((v-delta)/gamma)-beta          v >= Pt
-```
-
-Do not subtract F(0), add one stop, or insert an ACES gamut conversion.
-The sidecar records the constants, domain, packing and reconstruction order.
-The reference and its revision are attributed in `NOTICE`.
-
-Run `mcraw4vulkan --help` for the complete current command syntax.
 
 ## DNG mounting
 
@@ -221,6 +193,8 @@ requirements.
 - A working platform Vulkan stack is required for the primary decode path.
 - Native package installation and first-launch approval behavior depends on the
   operating system and package format.
+- FFmpeg is required for automatic output to ProRes-compatible files
+- FFmpeg and Gyroflow are required for automatic output to Gyroflow project files
 
 ## macOS signing status
 
